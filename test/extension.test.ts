@@ -50,7 +50,7 @@ test("worker process never registers a second bot listener command", () => {
 test("untrusted project commands are rejected and unknown commands show help", async () => {
   const h = harness("/does-not-exist");
   h.ctx.isProjectTrusted = () => false;
-  await h.commands.get("lark-bot").handler("start", h.ctx);
+  await h.commands.get("lark-bot").handler("on", h.ctx);
   assert(h.messages.at(-1)?.includes("Trust"));
   await h.commands.get("lark-bot").handler("unknown", h.ctx);
   assert(h.messages.at(-1)?.includes("/lark-bot connect"));

@@ -4,12 +4,12 @@ import { realpath } from "node:fs/promises";
 import { acquireLock, inspectLock, loadConfig, prepareState, writePrivateJson } from "./storage.ts";
 import type { BotController } from "./controller.ts";
 
-const commands = ["status", "connect", "start", "stop", "help"];
+const commands = ["status", "connect", "on", "off", "help"];
 const help = [
   "/lark-bot [status] — Show project configuration, listener and sessions",
   "/lark-bot connect — Register a bot or enter existing app credentials",
-  "/lark-bot start — Enable listening manually (requires tmux)",
-  "/lark-bot stop — Stop listening and close panes, preserving history",
+  "/lark-bot on — Enable listening manually (requires tmux)",
+  "/lark-bot off — Stop listening and close panes, preserving history",
 ].join("\n");
 
 /** Loading only registers a command: no sockets, timers, subprocesses or auth. */
@@ -31,7 +31,7 @@ export default function larkBot(pi: ExtensionAPI): void {
     await stop();
   });
   pi.registerCommand("lark-bot", {
-    description: "Project-local Feishu/Lark bot: connect, start, stop, status (default)",
+    description: "Project-local Feishu/Lark bot: connect, on, off, status (default)",
     getArgumentCompletions(prefix) {
       return commands.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
     },
@@ -63,12 +63,12 @@ export default function larkBot(pi: ExtensionAPI): void {
           ].join("\n"), "info");
           return;
         }
-        if (command === "stop") {
-          if (!controller && (await inspectLock(stateDir)).state === "running") throw new Error("Another pi holds the project lock. Run /lark-bot stop in that pi session.");
+        if (command === "off") {
+          if (!controller && (await inspectLock(stateDir)).state === "running") throw new Error("Another pi holds the project lock. Run /lark-bot off in that pi session.");
           await stop(); ctx.ui.setStatus("lark-bot", undefined);
           ctx.ui.notify("Lark bot stopped. Session history preserved.", "info"); return;
         }
-        if (controller) { ctx.ui.notify("Run /lark-bot stop before changing configuration or restarting.", "warning"); return; }
+        if (controller) { ctx.ui.notify("Run /lark-bot off before changing configuration or restarting.", "warning"); return; }
         await prepareState(cwd, CONFIG_DIR_NAME);
         if (command === "connect") {
           const unlock = await acquireLock(stateDir);
@@ -78,13 +78,13 @@ export default function larkBot(pi: ExtensionAPI): void {
             const config = await connectBot(ctx, setupAbort.signal);
             if (!config || shuttingDown) return;
             await writePrivateJson(join(stateDir, "config.json"), config);
-            ctx.ui.notify("Credentials saved in project .pi/lark-bot/. Enable the bot, long-connection events and required permissions, then run /lark-bot start.", "info");
+            ctx.ui.notify("Credentials saved in project .pi/lark-bot/. Enable the bot, long-connection events and required permissions, then run /lark-bot on.", "info");
           } finally { await unlock(); }
           return;
         }
         let config = await loadConfig(stateDir);
         if (!config) throw new Error("Run /lark-bot connect first.");
-        if (!process.env.TMUX || !/^%\d+$/.test(process.env.TMUX_PANE ?? "")) throw new Error("Start pi inside tmux before running /lark-bot start.");
+        if (!process.env.TMUX || !/^%\d+$/.test(process.env.TMUX_PANE ?? "")) throw new Error("Start pi inside tmux before running /lark-bot on.");
         const tmux = await pi.exec("tmux", ["-V"], { timeout: 5000 });
         const version = tmux.stdout.match(/tmux\s+(\d+)\.(\d+)/);
         if (tmux.code !== 0 || !version || Number(version[1]) < 3 || Number(version[1]) === 3 && Number(version[2]) < 2) throw new Error("tmux 3.2 or newer is required.");
@@ -108,18 +108,22 @@ export default function larkBot(pi: ExtensionAPI): void {
               ? ` (${error.message.slice(0, 240)})` : "";
             ctx.ui.notify(`Lark bot operation failed${detail}. Check connectivity, app permissions and the session pane. Generated history is preserved locally.`, "error");
           };
-          const instance = new BotController({ config, stateDir, transport: new LarkTransport(config, onError),
+          const transport = new LarkTransport(config, onError);
+          const instance = new BotController({ config, stateDir, transport,
             workers: new TmuxWorkers({ cwd, stateDir, appId: config.appId,
               model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
               thinkingLevel: pi.getThinkingLevel() }),
+            defaultModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+            availableModels: ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id })),
             onError, onStatus: () => {
               if (!shuttingDown) ctx.ui.setStatus("lark-bot", controller?.status.active ? `Lark ● ${controller.status.queued} running/queued` : undefined);
             },
           });
+          transport.setCardActionHandler((messageId, chatId, operatorId, value) => instance.handleModelCardAction(messageId, chatId, operatorId, value));
           controller = instance;
           await instance.start();
           if (shuttingDown) { await stop(); return; }
-          ctx.ui.notify("Lark bot enabled: direct messages and group @mentions. Run /lark-bot stop to disable.", "info");
+          ctx.ui.notify("Lark bot enabled: direct messages and group @mentions. Run /lark-bot off to disable.", "info");
         } catch (error) { await stop(); throw error; }
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : "Lark bot operation failed", "error");

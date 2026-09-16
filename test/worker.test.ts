@@ -68,7 +68,7 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
 
 test("worker authenticates IPC, coalesces text and forces its final snapshot", { timeout: 3000 }, async (t) => {
   const h = await harness(t); h.prompt();
-  assert.deepEqual(await h.next(), { type: "progress", text: "Working…", id: "p1" });
+  assert.deepEqual(await h.next(), { type: "progress", text: "正在处理中…", id: "p1" });
   for (let i = 0; i < 100; i++) h.emit("message_update", { message: { role: "assistant", content: [{ type: "text", text: `draft-${i}` }] } });
   h.finish("Hi");
   assert.deepEqual(await h.until("text"), { type: "text", text: "Hi", id: "p1" });
@@ -76,13 +76,31 @@ test("worker authenticates IPC, coalesces text and forces its final snapshot", {
   assert.equal(h.messages.filter((event) => event.type === "text").length, 1);
 });
 
+test("forwards later non-interactive extension turns through the original remote channel", { timeout: 3000 }, async (t) => {
+  const h = await harness(t); h.prompt(); await h.until("progress"); h.finish("初始回复"); await h.until("done");
+  h.emit("before_agent_start", { prompt: "extension continuation" });
+  h.finish("后续回复");
+  assert.equal((await h.until("done")).text, "后续回复");
+});
+
+test("keeps the remote reply open until a spawned subagent's steered result settles", { timeout: 3000 }, async (t) => {
+  const h = await harness(t); h.prompt(); await h.until("progress");
+  h.emit("tool_execution_start", { toolName: "subagent" });
+  await h.until("progress");
+  h.emit("agent_settled");
+  assert.equal((await h.until("progress")).text, "正在等待子代理完成…");
+  h.emit("before_agent_start", { prompt: "subagent result" });
+  h.finish("子代理结果已整理");
+  assert.equal((await h.until("done")).text, "子代理结果已整理");
+});
+
 test("local output is private; remote prompt waits until local agent fully settles", { timeout: 3000 }, async (t) => {
   const h = await harness(t, { idle: false }); h.prompt("remote question");
-  assert.match((await h.next()).text, /Waiting/);
+  assert.match((await h.next()).text, /正在等待/);
   h.emit("message_update", { message: { role: "assistant", content: [{ type: "text", text: "local-secret" }] } });
   h.emit("agent_settled"); assert.equal(h.prompts.length, 0);
   h.idle(true); h.emit("agent_settled");
-  assert.equal((await h.until("progress")).text, "Working…");
+  assert.equal((await h.until("progress")).text, "正在处理中…");
   assert.deepEqual(h.prompts, ["remote question"]);
   h.finish("public answer"); await h.until("done");
   assert(!JSON.stringify(h.messages).includes("local-secret"));
@@ -104,9 +122,9 @@ test("controller loss while pending never starts a ghost turn", { timeout: 3000 
 test("retry/tool turns reset drafts; local confirmation progress is forwarded without arguments", { timeout: 3000 }, async (t) => {
   const h = await harness(t); h.prompt(); await h.until("progress");
   h.emit("tool_execution_start", { toolName: "read", args: { secret: "never-forward" } });
-  assert.equal((await h.next()).text, "Using tool: read");
-  h.emit("ui_prompt_start"); assert.match((await h.next()).text, /confirmation/);
-  h.emit("ui_prompt_end"); assert.equal((await h.next()).text, "Working…");
+  assert.equal((await h.next()).text, "正在调用工具：read");
+  h.emit("ui_prompt_start"); assert.match((await h.next()).text, /正在等待本地确认/);
+  h.emit("ui_prompt_end"); assert.equal((await h.next()).text, "正在处理中…");
   h.idle(false); h.finish("temporary failure", true);
   h.idle(true); h.finish("recovered");
   const done = await h.until("done");

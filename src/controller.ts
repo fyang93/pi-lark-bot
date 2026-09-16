@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { isMissing, readPrivateJson, writePrivateJson } from "./storage.ts";
-import { conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type WorkerFactory, type WorkerEvent } from "./types.ts";
+import { conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type ModelSpec, type WorkerFactory, type WorkerEvent } from "./types.ts";
+import { modelPickerCard, modelSelectedCard, parseModelCardAction } from "./model-card.ts";
 
 /** Conservative UTF-8 payload bound, including room for card JSON overhead. */
 export function splitText(text: string, maxBytes = 12_000): string[] {
@@ -13,12 +14,12 @@ export function splitText(text: string, maxBytes = 12_000): string[] {
     part += char; bytes += size;
   }
   if (part) parts.push(part);
-  return parts.length ? parts : ["(No text response)"];
+  return parts.length ? parts : ["（没有文本回复）"];
 }
 
 /** One in-flight edit and one coalesced pending snapshot, never an unbounded token queue. */
 export class ProgressMessage {
-  private latest = "⏳ Preparing session…";
+  private latest = "⏳ 正在准备会话…";
   private sent = "";
   private timer?: ReturnType<typeof setTimeout>;
   private pending: Promise<void> = Promise.resolve();
@@ -66,13 +67,24 @@ export interface ControllerOptions {
   stateDir: string;
   transport: BotTransport;
   workers: WorkerFactory;
+  defaultModel?: ModelSpec;
+  availableModels?: readonly ModelSpec[];
   onError?: (error: unknown) => void;
   onStatus?: () => void;
   streamInterval?: number;
 }
 
+type BotCommand = { name: "new"; arg: "" } | { name: "model"; arg: string };
+function command(text: string): BotCommand | undefined {
+  const match = text.trim().match(/^\/(new|model)(?:\s+(.+?))?\s*$/i);
+  if (!match) return undefined;
+  return { name: match[1]!.toLowerCase() as BotCommand["name"], arg: match[2]?.trim() ?? "" } as BotCommand;
+}
+
 export class BotController {
   private active = false;
+  private readonly models = new Map<string, ModelSpec>();
+  private readonly modelCards = new Map<string, { chatId: string; key: string; ownerId?: string }>();
   private stopping?: Promise<void>;
   private users = new Map<string, UserQueue>();
   private seen = new Set<string>();
@@ -118,19 +130,21 @@ export class BotController {
       });
       if (!this.active) return;
       const key = conversationKey(message);
+      const botCommand = command(message.text);
       let queue = this.users.get(key);
       if (!queue) { queue = { tail: Promise.resolve(), count: 0 }; this.users.set(key, queue); }
       if (queue.count >= 20 || Buffer.byteLength(message.text) + (message.chatType === "group" ? Buffer.byteLength(message.userId) + 2 : 0) > 64_000) {
-        void this.options.transport.send(message.chatId, "Message too long or queue full (maximum 20). Please retry later.", message.id).catch(this.onError);
+        void this.options.transport.send(message.chatId, "消息过长或队列已满（最多 20 条），请稍后重试。", message.id).catch(this.onError);
         return;
       }
       const wasBusy = queue.count > 0;
       queue.count++;
-      if (wasBusy) void this.options.transport.send(message.chatId, `Queued behind ${queue.count - 1} message(s).`, message.id).catch(this.onError);
+      if (wasBusy) void this.options.transport.send(message.chatId, `正在排队，前方还有 ${queue.count - 1} 条消息。`, message.id).catch(this.onError);
       const current = queue;
       current.tail = current.tail.then(async () => {
         if (!this.active) return;
-        await this.execute(message);
+        if (botCommand) await this.executeCommand(message, key, botCommand);
+        else await this.execute(message);
       }).catch(this.onError).finally(() => { current.count--; this.options.onStatus?.(); });
       this.options.onStatus?.();
     });
@@ -139,43 +153,108 @@ export class BotController {
     return Promise.resolve();
   }
 
+  private async executeCommand(message: IncomingMessage, key: string, value: BotCommand): Promise<void> {
+    const { transport, workers } = this.options;
+    if (value.name === "new") {
+      if (!workers.reset) throw new Error("This worker does not support session reset");
+      await workers.reset(key);
+      this.models.delete(key);
+      await transport.send(message.chatId, "已开启新的 Pi 会话。", message.id);
+      return;
+    }
+    if (!value.arg) {
+      const current = this.models.get(key) ?? this.options.defaultModel;
+      if (transport.sendCard) {
+        const id = await transport.sendCard(message.chatId, modelPickerCard(this.options.availableModels ?? [], current), message.id);
+        this.modelCards.set(id, { chatId: message.chatId, key, ...(message.chatType === "group" ? {} : { ownerId: message.userId }) });
+      } else {
+        const list = (this.options.availableModels ?? []).slice(0, 80).map((model) => `- ${model.provider}/${model.id}`).join("\n");
+        await transport.send(message.chatId, `当前模型：${current ? `${current.provider}/${current.id}` : "未设置"}\n${list}`, message.id);
+      }
+      return;
+    }
+    const slash = value.arg.indexOf("/");
+    const requested = slash > 0 ? { provider: value.arg.slice(0, slash), id: value.arg.slice(slash + 1) } : undefined;
+    const model = requested && this.options.availableModels?.find((item) => item.provider === requested.provider && item.id === requested.id);
+    if (!model) {
+      await transport.send(message.chatId, "模型不可用。请发送 /model 查看可用模型。", message.id);
+      return;
+    }
+    if (!workers.setModel) throw new Error("This worker does not support model switching");
+    // `key` is derived solely from the incoming DM user or group chat, so a
+    // command cannot reset or reconfigure another user's private session.
+    await workers.setModel(key, model);
+    this.models.set(key, model);
+    await transport.send(message.chatId, `已切换当前会话模型：${model.provider}/${model.id}\n下一条消息将使用该模型继续当前历史。`, message.id);
+  }
+
+  /** Handle a card callback only when it belongs to a model picker we created. */
+  async handleModelCardAction(messageId: string, chatId: string, operatorId: string | undefined, value: unknown): Promise<void> {
+    const card = this.modelCards.get(messageId), action = parseModelCardAction(value);
+    if (!card || !action || card.chatId !== chatId || card.ownerId && card.ownerId !== operatorId) return;
+    const current = this.models.get(card.key) ?? this.options.defaultModel;
+    if (action.action === "providers" || action.action === "models") {
+      await this.options.transport.updateCard?.(messageId, modelPickerCard(this.options.availableModels ?? [], current,
+        action.action === "models" ? action.provider : undefined, action.action === "models" ? action.page : 0));
+      return;
+    }
+    const slash = action.key.indexOf("/");
+    const selected = slash > 0 && this.options.availableModels?.find((model) => model.provider === action.key.slice(0, slash) && model.id === action.key.slice(slash + 1));
+    if (!selected || !this.options.workers.setModel) return;
+    await this.options.workers.setModel(card.key, selected);
+    this.models.set(card.key, selected);
+    await this.options.transport.updateCard?.(messageId, modelSelectedCard(selected));
+  }
+
   private async execute(message: IncomingMessage): Promise<void> {
     const { transport, workers } = this.options;
-    let progress: ProgressMessage | undefined;
-    let answer = "", status = "⏳ Working…", final: Extract<WorkerEvent, { type: "done" }> | undefined;
+    let progress: ProgressMessage | undefined, responseId: string | undefined;
+    let answer = "", continuation = "", initialDone = false, status = "⏳ 正在处理中…", final: Extract<WorkerEvent, { type: "done" }> | undefined;
     try {
-      const id = await transport.send(message.chatId, "⏳ Preparing session…", message.id);
+      const id = await transport.send(message.chatId, "⏳ 正在准备会话…", message.id);
+      responseId = id;
       progress = new ProgressMessage(transport, id, this.options.streamInterval, this.onError);
-      if (!this.active) { await progress.finish("⏹ Stopped. Message was not executed."); return; }
+      if (!this.active) { await progress.finish("⏹ 已停止，消息未执行。"); return; }
       const worker = await workers.open(conversationKey(message));
-      if (!this.active) { await progress.finish("⏹ Stopped. Message was not executed."); return; }
+      if (!this.active) { await progress.finish("⏹ 已停止，消息未执行。"); return; }
       const prompt = message.chatType === "group" ? `${message.userId}: ${message.text}` : message.text;
       await worker.run(prompt, (event) => {
-        if (event.type === "done") { final = event; return; }
+        if (initialDone) {
+          if (event.type === "text") continuation = event.text;
+          if (event.type === "done") {
+            const text = event.text || continuation || (event.error ? "会话后续任务执行失败。" : "（没有文本回复）");
+            continuation = "";
+            // A background task often leaves the original card at a waiting
+            // status. Finalize that status before posting its later result.
+            if (responseId && /等待/.test(status)) void transport.update(responseId, "✅ 后续任务已完成").catch(this.onError);
+            void transport.send(message.chatId, text, message.id).catch(this.onError);
+          }
+          return;
+        }
+        if (event.type === "done") { final = event; initialDone = true; return; }
         if (event.type === "text") answer = event.text;
         else status = event.text;
         progress?.set(`${status}\n\n${answer}`);
       });
       const cancelled = async () => {
         if (this.active) return false;
-        await progress!.finish("⏹ Stopped. Execution interrupted; local history preserved.");
+        await progress!.finish("⏹ 已停止，执行已中断；本地历史已保留。");
         return true;
       };
       if (await cancelled()) return;
       const result = final as Extract<WorkerEvent, { type: "done" }> | undefined;
       if (!result) throw new Error("Worker ended without a final result.");
-      await progress.finish(result.error ? "❌ Failed. See the response below." : "✅ Completed");
-      for (const part of splitText(result.text || (result.error ? "Execution failed. Check the session pane." : "(No text response)"))) {
-        if (await cancelled()) return;
-        await transport.send(message.chatId, part, message.id);
-      }
+      // The progress card is the reply. Replacing its content instead of sending
+      // another message preserves one continuous, streaming conversation bubble.
+      await progress.finish(result.text || (result.error ? "执行失败，请检查会话 pane。" : "（没有文本回复）"));
+      await cancelled();
     } catch (error) {
       this.onError(error);
-      await progress?.finish(this.active ? "❌ Execution or reply failed; history preserved locally." : "⏹ Stopped. Execution interrupted.");
-      try { await transport.send(message.chatId, this.active
-        ? "Execution or reply failed. Check pi and the session pane. Send another message to continue the saved conversation."
-        : "Bot stopped and execution interrupted. Restart to continue the saved conversation.", message.id); }
-      catch (sendError) { this.onError(sendError); }
+      // Keep errors in the existing progress card too, rather than creating a
+      // second bubble after a streamed response.
+      await progress?.finish(this.active
+        ? "❌ 执行或回复失败；本地历史已保留。请检查 Pi 和会话 pane，然后发送新消息继续。"
+        : "⏹ 机器人已停止，执行已中断；重启后可继续已保存的会话。");
     }
   }
 

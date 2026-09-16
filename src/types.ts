@@ -29,9 +29,15 @@ export interface ConversationWorker {
   close(): Promise<void>;
 }
 
+export interface ModelSpec { provider: string; id: string }
+
 export interface WorkerFactory {
   list?(): Array<{ userId: string; paneId?: string; sessionFile: string; connected: boolean }>;
   open(userId: string): Promise<ConversationWorker>;
+  /** Delete only this conversation's saved Pi history and close its pane. */
+  reset?(userId: string): Promise<void>;
+  /** Select the model used when this conversation's pane is next opened. */
+  setModel?(userId: string, model: ModelSpec): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -41,4 +47,6 @@ export interface BotTransport {
   stop(): Promise<void>;
   send(chatId: string, text: string, replyTo?: string): Promise<string>;
   update(messageId: string, text: string): Promise<void>;
+  sendCard?(chatId: string, card: object, replyTo?: string): Promise<string>;
+  updateCard?(messageId: string, card: object): Promise<void>;
 }

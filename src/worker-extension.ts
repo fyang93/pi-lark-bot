@@ -19,6 +19,11 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   let socket: Socket | undefined, ctx: ExtensionContext | undefined, buffer = "";
   let pending: Prompt | undefined, dispatching: Prompt | undefined;
   let active: { id: string; prompt: string; text: string; failed: boolean; started: boolean } | undefined;
+  let lastRemoteId: string | undefined, localTurnPending = false;
+  // pi-interactive-subagents returns from its tool immediately, then delivers
+  // the completed result as a fresh, steered parent turn. Keep the remote turn
+  // open across that idle gap so its final parent answer reaches Lark.
+  let awaitingSubagent = false, spawnedSubagentThisTurn = false;
   let stopping = false, promptOpen = false, waiting = false;
   let handoffTimer: NodeJS.Timeout | undefined, textTimer: NodeJS.Timeout | undefined, retryTimer: NodeJS.Timeout | undefined;
   let queuedText: { id: string; text: string } | undefined;
@@ -33,7 +38,8 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   const cleanup = (): void => {
     stopping = true;
     clearTimeout(handoffTimer); clearTimeout(textTimer); clearTimeout(retryTimer);
-    queuedText = undefined; pending = undefined; dispatching = undefined; active = undefined;
+    queuedText = undefined; pending = undefined; dispatching = undefined; active = undefined; lastRemoteId = undefined;
+    awaitingSubagent = false; spawnedSubagentThisTurn = false;
     setWaiting(false);
   };
   const shutdown = (): void => {
@@ -65,7 +71,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     if (promptOpen || !ctx.isIdle()) {
       if (!waiting) {
         setWaiting(true);
-        send({ type: "progress", id: pending.id, text: "Waiting for the local pi turn or confirmation to finish." });
+        send({ type: "progress", id: pending.id, text: "正在等待本地 Pi 当前回合或确认操作结束…" });
       }
       // Covers manual compaction/dialog completion as well as agent_settled.
       if (!retryTimer) retryTimer = setTimeout(() => { retryTimer = undefined; dispatch(); }, 250);
@@ -75,12 +81,12 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     const prompt = pending; dispatching = prompt; setWaiting(false);
     handoffTimer = setTimeout(() => {
       if (active?.started || stopping) return;
-      send({ type: "done", id: prompt.id, text: "Pi did not accept the remote prompt. Check local input-handling extensions.", error: true });
+      send({ type: "done", id: prompt.id, text: "Pi 未能接收远程消息，请检查本地输入处理扩展。", error: true });
       socket?.end(); shutdown(); // never leave a latent prompt running after an apparent failure
     }, 10_000);
     try { pi.sendUserMessage(prompt.text, { expandPromptTemplates: false }); }
     catch {
-      send({ type: "done", id: prompt.id, text: "Pi could not accept the remote prompt.", error: true });
+      send({ type: "done", id: prompt.id, text: "Pi 无法接收远程消息。", error: true });
       socket?.end(); shutdown();
     }
   };
@@ -117,16 +123,33 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     socket.on("close", shutdown);
   });
   pi.on("input", (event) => {
-    if (stopping || event.source !== "extension" || !dispatching || event.text !== dispatching.text) return;
+    if (stopping) return;
+    if (event.source === "interactive") { localTurnPending = true; return; }
+    if (event.source !== "extension" || !dispatching || event.text !== dispatching.text) return;
     const prompt = dispatching;
     dispatching = undefined; pending = undefined;
     active = { id: prompt.id, prompt: prompt.text, text: "", failed: false, started: false };
   });
   pi.on("before_agent_start", (event) => {
-    if (!active || active.started || event.prompt !== active.prompt) return;
+    // Any extension/background continuation in this pane belongs to the last
+    // remote conversation. Local TUI input is explicitly excluded above.
+    if (!active && lastRemoteId && !localTurnPending) {
+      active = { id: lastRemoteId, prompt: "", text: "", failed: false, started: true };
+      emit({ type: "progress", text: "正在处理会话后续消息…" });
+      return;
+    }
+    localTurnPending = false;
+    if (!active) return;
+    if (active.started && awaitingSubagent) {
+      // This is the steered continuation containing a subagent result.
+      awaitingSubagent = false; spawnedSubagentThisTurn = false; active.text = "";
+      emit({ type: "progress", text: "正在整理子代理结果…" });
+      return;
+    }
+    if (active.started || event.prompt !== active.prompt) return;
     active.started = true;
     clearTimeout(handoffTimer); handoffTimer = undefined;
-    emit({ type: "progress", text: "Working…" });
+    emit({ type: "progress", text: "正在处理中…" });
   });
   pi.on("message_start", (event) => {
     if (active?.started && event.message.role === "assistant") {
@@ -141,29 +164,42 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     if (!active?.started || event.message.role !== "assistant") return;
     active.text = textFrom(event.message); emit({ type: "text", text: active.text });
   });
-  pi.on("tool_execution_start", (event) => emit({ type: "progress", text: `Using tool: ${event.toolName}` }));
-  pi.on("tool_execution_end", (event) => emit({ type: "progress", text: `${event.isError ? "Tool failed" : "Finished tool"}: ${event.toolName}` }));
+  pi.on("tool_execution_start", (event) => {
+    if (event.toolName === "subagent") spawnedSubagentThisTurn = true;
+    emit({ type: "progress", text: `正在调用工具：${event.toolName}` });
+  });
+  pi.on("tool_execution_end", (event) => emit({ type: "progress", text: `${event.isError ? "工具执行失败" : "工具执行完成"}：${event.toolName}` }));
   pi.on("agent_end", (event) => {
     if (!active?.started) return;
-    const last = [...event.messages].reverse().find((message) => message.role === "assistant");
+    const messages = [...event.messages] as any[];
+    const last = [...messages].reverse().find((message) => message.role === "assistant");
     active.failed = last?.stopReason === "error" || last?.stopReason === "aborted";
+    // Extension-provided tools do not consistently emit tool_execution_start in
+    // every Pi runtime. The completed turn still contains its tool result.
+    if (messages.some((message) => message?.role === "toolResult" && message?.toolName === "subagent")) spawnedSubagentThisTurn = true;
   });
   pi.on("agent_settled", () => {
     if (stopping || !ctx?.isIdle()) return;
     if (active?.started) {
-      const completed = active; flushText(true); active = undefined;
-      send({ type: "done", id: completed.id, text: completed.text || (completed.failed ? "The pi turn failed or was aborted." : ""), error: completed.failed || undefined });
+      if (spawnedSubagentThisTurn) {
+        spawnedSubagentThisTurn = false; awaitingSubagent = true;
+        emit({ type: "progress", text: "正在等待子代理完成…" });
+        return;
+      }
+      if (awaitingSubagent) return;
+      const completed = active; flushText(true); active = undefined; lastRemoteId = completed.id;
+      send({ type: "done", id: completed.id, text: completed.text || (completed.failed ? "Pi 回合执行失败或已中止。" : ""), error: completed.failed || undefined });
     }
     dispatch();
   });
   pi.on("ui_prompt_start", () => {
     promptOpen = true;
-    if (active?.started) emit({ type: "progress", text: "Waiting for local confirmation." });
-    else if (pending) send({ type: "progress", id: pending.id, text: "Waiting for local confirmation." });
+    if (active?.started) emit({ type: "progress", text: "正在等待本地确认…" });
+    else if (pending) send({ type: "progress", id: pending.id, text: "正在等待本地确认…" });
   });
   pi.on("ui_prompt_end", () => {
     promptOpen = false;
-    if (active?.started) emit({ type: "progress", text: "Working…" });
+    if (active?.started) emit({ type: "progress", text: "正在处理中…" });
     else queueMicrotask(dispatch);
   });
   const blockSwitch = () => {

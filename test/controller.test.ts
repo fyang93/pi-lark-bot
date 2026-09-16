@@ -38,9 +38,10 @@ test("controller deduplicates across restart, reuses per-user worker and sends s
     await Promise.all([bot.receive(msg("a")), bot.receive(msg("a")), bot.receive(msg("b", "ou_b")), bot.receive(msg("new-user", "ou_x"))]);
     await bot.drain();
     assert.deepEqual(calls.sort(), ["ou_a:a", "ou_b:b", "ou_x:new-user"]);
-    assert.equal(transport.sends.filter((x) => x.text.startsWith("Answer")).length, 3);
+    assert.equal(transport.sends.filter((x) => x.text.startsWith("Answer")).length, 0);
     assert(transport.sends.some((x) => x.chat === "chat_ou_x"));
-    assert(transport.updates.includes("✅ Completed"));
+    assert(transport.updates.includes("Answer new-user"));
+    assert.equal(transport.sends.filter((x) => x.text.startsWith("Answer")).length, 0, "final replies reuse the streamed bubble");
     await bot.stop();
     const bot2 = new BotController({ config, stateDir: dir, transport: new FakeTransport(), workers });
     await bot2.start(); await bot2.receive(msg("a")); await bot2.drain();
@@ -65,13 +66,13 @@ test("same-user FIFO, different users concurrent, event handler does not wait fo
     await bot.receive(msg("two")); await bot.receive(msg("other", "ou_b"));
     // Admission barrier via a standalone user job finishing, without a sleep.
     const otherDone = deferred();
-    const original = transport.send.bind(transport);
-    transport.send = async (...args) => { const id = await original(...args); if (args[1] === "other") otherDone.resolve(); return id; };
+    const original = transport.update.bind(transport);
+    transport.update = async (...args) => { await original(...args); if (args[1] === "other") otherDone.resolve(); };
     await otherDone.promise;
     assert.deepEqual(order, ["one", "other"]);
     gate.resolve(); await bot.drain();
     assert.deepEqual(order, ["one", "other", "two"]);
-    assert(transport.sends.some((x) => x.text.includes("Queued")));
+    assert(transport.sends.some((x) => x.text.includes("正在排队")));
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -106,7 +107,7 @@ test("per-user queue and input-size limits reject excess work without invoking t
   const send = transport.send.bind(transport);
   transport.send = async (...args) => {
     const id = await send(...args);
-    if (args[1].includes("Message too long or queue full")) rejected.resolve();
+    if (args[1].includes("消息过长或队列已满")) rejected.resolve();
     return id;
   };
   const workers: WorkerFactory = { async open() { return { async run(_text, emit) {
@@ -138,9 +139,8 @@ test("stop closes workers, skips queued work and is idempotent", async () => {
     await Promise.all([bot.stop(), bot.stop()]);
     await bot.receive(msg("three"));
     assert.equal(closes, 1); assert.equal(runs, 1); assert.equal(bot.status.active, false);
-    assert(!transport.updates.includes("✅ Completed"));
     assert(!transport.sends.some((x) => x.text === "stopped"));
-    assert(transport.updates.at(-1)?.includes("Stopped"));
+    assert(transport.updates.at(-1)?.includes("已停止"));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -157,7 +157,7 @@ test("stop during pane startup finalizes the preparing card without running a pr
     await bot.start(); await bot.receive(msg("one")); await opened.promise;
     await bot.stop();
     assert.equal(runs, 0);
-    assert(transport.updates.at(-1)?.includes("Stopped"));
+    assert(transport.updates.at(-1)?.includes("已停止"));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -166,7 +166,7 @@ test("stop during completion update prevents subsequent final answer sends", asy
   const began = deferred(); const gate = deferred();
   const transport = new FakeTransport();
   transport.update = async (_id, text) => {
-    if (text === "✅ Completed") { began.resolve(); await gate.promise; }
+    if (text === "should-not-send") { began.resolve(); await gate.promise; }
     transport.updates.push(text);
   };
   const workers: WorkerFactory = { async open() { return { async run(_text, emit) {
@@ -177,7 +177,7 @@ test("stop during completion update prevents subsequent final answer sends", asy
     await bot.start(); await bot.receive(msg("one")); await began.promise;
     const stopping = bot.stop(); gate.resolve(); await stopping;
     assert(!transport.sends.some((x) => x.text === "should-not-send"));
-    assert(transport.updates.at(-1)?.includes("Stopped"));
+    assert(transport.updates.includes("should-not-send"));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -191,7 +191,7 @@ test("worker failures are reported, next message still runs", async () => {
   const bot = new BotController({ config, stateDir: dir, transport, workers, onError: () => { errors++; } });
   try {
     await bot.start(); await bot.receive(msg("bad")); await bot.receive(msg("good")); await bot.drain();
-    assert(errors > 0); assert(transport.sends.some((x) => x.text === "success"));
+    assert(errors > 0); assert(transport.updates.includes("success"));
     assert(!transport.sends.some((x) => x.text.includes("secret")));
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });

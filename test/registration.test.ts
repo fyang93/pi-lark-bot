@@ -31,6 +31,22 @@ test("registers with begin, addon URL, pending poll, and returns credentials", a
   assert.equal(new URL(shown).hostname, "open.feishu.cn");
 });
 
+test("connects an existing app through its QR authorization", async () => {
+  let shown = "";
+  let n = 0;
+  globalThis.fetch = (async () => {
+    n++;
+    return n === 1
+      ? response({ verification_uri_complete: "https://open.feishu.cn/verify", device_code: "device", expires_in: 60, interval: 0.001 })
+      : response({ client_id: "cli_existing", client_secret: "secret", user_info: { tenant_brand: "feishu" } });
+  }) as typeof fetch;
+  const result = await registerBot({ brand: "feishu", allowExistingApp: true, signal: new AbortController().signal, onUrl: (url) => { shown = url; } });
+  assert.equal(result.appId, "cli_existing");
+  const qrUrl = new URL(shown);
+  assert.equal(qrUrl.searchParams.has("clientID"), false);
+  assert.equal(qrUrl.searchParams.has("createOnly"), false);
+});
+
 test("switches to Lark polling domain", async () => {
   const urls: string[] = [];
   let n = 0;

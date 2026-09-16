@@ -1,15 +1,15 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer, type Server, type Socket } from "node:net";
 import { mkdtemp, rm, stat } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { privateDir, writePrivateJson } from "./storage.ts";
-import type { ConversationWorker, WorkerEvent, WorkerFactory } from "./types.ts";
+import type { ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory } from "./types.ts";
 
 import { createSurface, closeSurface } from "./tmux.ts";
 const execFile = promisify(execFileCallback);
@@ -30,17 +30,35 @@ function sessionKey(appId: string, userId: string): string {
   return createHash("sha256").update(`${appId}\0${userId}`).digest("hex");
 }
 function piCliPath(): string {
+  const candidates = new Set<string>();
+  // Pi extensions can be loaded through jiti, where import.meta.resolve is not
+  // available. They can also live outside Pi's own node_modules tree, so retain
+  // several ways of locating the exact CLI that launched this process.
+  if (process.argv[1] && basename(process.argv[1]) === "cli.js") candidates.add(process.argv[1]);
   try {
     const resolver = (import.meta as ImportMeta & { resolve?: (specifier: string) => string }).resolve;
     if (resolver) {
-      const path = join(dirname(fileURLToPath(resolver("@earendil-works/pi-coding-agent"))), "bundle", "cli.js");
-      if (existsSync(path)) return path;
+      const dist = dirname(fileURLToPath(resolver("@earendil-works/pi-coding-agent")));
+      candidates.add(join(dist, "bundle", "cli.js"));
+      candidates.add(join(dist, "cli.js"));
     }
   } catch { /* pi's jiti host may not implement import.meta.resolve */ }
   const require = createRequire(import.meta.url);
   for (const directory of require.resolve.paths("@earendil-works/pi-coding-agent") ?? []) {
-    const path = join(directory, "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
-    if (existsSync(path)) return path;
+    const dist = join(directory, "@earendil-works", "pi-coding-agent", "dist");
+    candidates.add(join(dist, "bundle", "cli.js"));
+    candidates.add(join(dist, "cli.js"));
+  }
+  // A package-installed extension's resolver may see only its own dependencies.
+  // PATH is inherited from the active Pi session, so its `pi` command is a final
+  // reliable fallback without recording it in shell input or a remote prompt.
+  try { candidates.add(execFileSync("sh", ["-c", "command -v pi"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); }
+  catch { /* a descriptive error is emitted below */ }
+  for (const candidate of candidates) {
+    try {
+      const path = realpathSync(candidate);
+      if (existsSync(path)) return path;
+    } catch { /* try the next candidate */ }
   }
   throw new Error("Unable to locate the pi CLI bundle");
 }
@@ -61,6 +79,8 @@ class PaneWorker implements ConversationWorker {
   private rejectReady?: (error: Error) => void;
   private serial: Promise<void> = Promise.resolve();
   private active?: { id: string; onEvent: (event: WorkerEvent) => void; resolve: () => void; reject: (error: Error) => void };
+  /** Keep the callback after a turn settles: extensions may trigger a later continuation in this same Pi session. */
+  private readonly continuations = new Map<string, (event: WorkerEvent) => void>();
   constructor(private options: TmuxWorkersOptions, private userId: string) {
     this.sessionFile = resolve(options.stateDir ?? join(options.cwd, ".pi", "lark-bot"), "sessions", `${sessionKey(options.appId, userId)}.jsonl`);
   }
@@ -181,19 +201,28 @@ class PaneWorker implements ConversationWorker {
     return result;
   }
   private handle(message: any): void {
-    const active = this.active;
-    if (!active || message.id !== active.id || typeof message.text !== "string" || !["progress", "text", "done"].includes(message.type)) return;
+    if (typeof message.text !== "string" || !["progress", "text", "done"].includes(message.type)) return;
     const event: WorkerEvent = message.type === "done"
       ? { type: "done", text: message.text, error: message.error === true }
       : { type: message.type, text: message.text };
+    const active = this.active;
+    if (!active || message.id !== active.id) {
+      const continuation = typeof message.id === "string" ? this.continuations.get(message.id) : undefined;
+      if (continuation) try { continuation(event); } catch { /* a late continuation must not kill the worker */ }
+      return;
+    }
     try { active.onEvent(event); }
     catch { this.failActive(new Error("Pi worker event handler failed")); return; }
-    if (event.type === "done") { this.active = undefined; active.resolve(); }
+    if (event.type === "done") {
+      this.active = undefined;
+      this.continuations.set(active.id, active.onEvent);
+      active.resolve();
+    }
   }
   private failActive(error: Error): void { const active = this.active; this.active = undefined; active?.reject(error); }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closed = true; this.ready = false;
+    this.closed = true; this.ready = false; this.continuations.clear();
     this.rejectReady?.(new Error("Pi worker closed")); this.abort.abort();
     this.failActive(new Error("Pi worker closed"));
     for (const peer of this.peers) peer.destroy();
@@ -215,6 +244,7 @@ class PaneWorker implements ConversationWorker {
 
 export class TmuxWorkers implements WorkerFactory {
   private entries = new Map<string, { worker: PaneWorker; promise: Promise<PaneWorker>; started: boolean }>();
+  private readonly models = new Map<string, ModelSpec>();
   private closed = false;
   private closing?: Promise<void>;
   constructor(private options: TmuxWorkersOptions) {
@@ -225,7 +255,7 @@ export class TmuxWorkers implements WorkerFactory {
     if (this.closed) return Promise.reject(new Error("TmuxWorkers is closed"));
     const old = this.entries.get(userId);
     if (old && (old.worker.isConnected() || !old.started)) return old.promise;
-    const worker = new PaneWorker(this.options, userId);
+    const worker = new PaneWorker({ ...this.options, model: this.models.get(userId) ?? this.options.model }, userId);
     const entry = { worker, promise: undefined as unknown as Promise<PaneWorker>, started: false };
     entry.promise = Promise.resolve().then(async () => {
       await old?.worker.close();
@@ -241,6 +271,27 @@ export class TmuxWorkers implements WorkerFactory {
     });
     this.entries.set(userId, entry);
     return entry.promise;
+  }
+  async reset(userId: string): Promise<void> {
+    const entry = this.entries.get(userId);
+    if (entry) {
+      await entry.worker.close();
+      await entry.promise.catch(() => {});
+      if (this.entries.get(userId) === entry) this.entries.delete(userId);
+    }
+    const sessionFile = new PaneWorker({ ...this.options, model: this.models.get(userId) ?? this.options.model }, userId).sessionFile;
+    await rm(sessionFile, { force: true });
+    this.models.delete(userId);
+  }
+  async setModel(userId: string, model: ModelSpec): Promise<void> {
+    if (this.closed) throw new Error("TmuxWorkers is closed");
+    this.models.set(userId, model);
+    const entry = this.entries.get(userId);
+    if (entry) {
+      await entry.worker.close();
+      await entry.promise.catch(() => {});
+      if (this.entries.get(userId) === entry) this.entries.delete(userId);
+    }
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;

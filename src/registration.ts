@@ -11,6 +11,10 @@ export type RegistrationBrand = "feishu" | "lark";
 
 export interface RegisterBotOptions {
   brand: RegistrationBrand;
+  /** Existing `cli_…` app to update and retrieve credentials for. */
+  appId?: string;
+  /** Let the official confirmation page select an existing app after scanning. */
+  allowExistingApp?: boolean;
   signal: AbortSignal;
   onUrl: (url: string, expiresIn: number) => void;
 }
@@ -37,6 +41,7 @@ const addons = {
     tenant: ["im:message:send_as_bot", "im:message.p2p_msg:readonly", "im:message.group_at_msg:readonly", "im:message:update"],
   },
   events: { items: { tenant: ["im.message.receive_v1"] } },
+  callbacks: { items: ["card.action.trigger"] },
 };
 
 function abortError(): Error {
@@ -134,8 +139,9 @@ function wait(ms: number, signal: AbortSignal, deadlineSignal?: AbortSignal): Pr
 
 /** Register a new bot app through the official Lark/Feishu device flow. */
 export async function registerBot(options: RegisterBotOptions): Promise<RegisteredBot> {
-  const { brand, signal, onUrl } = options;
+  const { brand, appId, allowExistingApp, signal, onUrl } = options;
   if (brand !== "feishu" && brand !== "lark") throw new Error("Unsupported registration brand");
+  if (appId !== undefined && !/^cli_[a-zA-Z0-9_-]+$/.test(appId)) throw new Error("Invalid existing bot App ID");
   if (signal.aborted) throw abortError();
 
   let baseUrl = `https://${DOMAINS[brand]}`;
@@ -154,7 +160,10 @@ export async function registerBot(options: RegisterBotOptions): Promise<Register
   url.searchParams.set("source", "pi-lark-bot");
   url.searchParams.set("tp", "sdk");
   url.searchParams.set("addons", encodeAddons());
-  url.searchParams.set("createOnly", "true");
+  // Omitting createOnly lets the official page select an existing app; a
+  // supplied clientID makes that selection explicit and returns its secret.
+  if (appId) url.searchParams.set("clientID", appId);
+  else if (!allowExistingApp) url.searchParams.set("createOnly", "true");
   onUrl(url.toString(), expiresIn);
 
   const deadline = Date.now() + expiresIn * 1000;

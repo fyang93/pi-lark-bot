@@ -34,6 +34,7 @@ export class LarkTransport implements BotTransport {
   private readonly dispatcher: InstanceType<LarkSdk["EventDispatcher"]>;
   private readonly ws: InstanceType<LarkSdk["WSClient"]>;
   private onMessage?: (message: IncomingMessage) => Promise<void>;
+  private onCardAction?: (messageId: string, chatId: string, operatorId: string | undefined, value: unknown) => Promise<void>;
   private pendingStart?: PendingStart;
   private _state: LarkTransportState = "stopped";
   private botOpenId?: string;
@@ -52,7 +53,7 @@ export class LarkTransport implements BotTransport {
     const common = { appId: config.appId, appSecret: config.appSecret, domain, httpInstance, logger: silentLogger, loggerLevel: 0 };
     this.client = new sdk.Client(common);
     this.dispatcher = new sdk.EventDispatcher({ logger: silentLogger, loggerLevel: 0 });
-    this.dispatcher.register({ "im.message.receive_v1": (event) => this.receive(event) });
+    this.dispatcher.register({ "im.message.receive_v1": (event) => this.receive(event), "card.action.trigger": (event) => this.cardAction(event) });
     this.ws = new sdk.WSClient({
       ...common,
       handshakeTimeoutMs: API_TIMEOUT_MS,
@@ -67,6 +68,8 @@ export class LarkTransport implements BotTransport {
   }
 
   get state(): LarkTransportState { return this._state; }
+
+  setCardActionHandler(handler: (messageId: string, chatId: string, operatorId: string | undefined, value: unknown) => Promise<void>): void { this.onCardAction = handler; }
 
   start(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void> {
     if (this._state !== "stopped") return Promise.reject(new Error("Lark transport is already started"));
@@ -114,9 +117,21 @@ export class LarkTransport implements BotTransport {
     return messageId;
   }
 
-  async update(messageId: string, text: string): Promise<void> {
+  async update(messageId: string, text: string): Promise<void> { await this.updateCard(messageId, card(text)); }
+
+  async sendCard(chatId: string, value: object, replyTo?: string): Promise<string> {
+    const data = { msg_type: "interactive", content: JSON.stringify(value), uuid: randomUUID() };
+    const response = replyTo
+      ? await this.request(() => this.client.im.v1.message.reply({ data, path: { message_id: replyTo } }))
+      : await this.request(() => this.client.im.v1.message.create({ data: { ...data, receive_id: chatId }, params: { receive_id_type: "chat_id" } }));
+    const messageId = response?.data?.message_id;
+    if (typeof messageId !== "string" || !messageId) throw this.failure();
+    return messageId;
+  }
+
+  async updateCard(messageId: string, value: object): Promise<void> {
     await this.request(() => this.client.im.v1.message.patch({
-      path: { message_id: messageId }, data: { content: JSON.stringify(card(text)) },
+      path: { message_id: messageId }, data: { content: JSON.stringify(value) },
     }));
   }
 
@@ -162,6 +177,16 @@ export class LarkTransport implements BotTransport {
   private close(): void {
     try { this.ws.close({ force: true }); }
     catch (_error) { this.report("Lark connection could not be stopped"); }
+  }
+
+  private async cardAction(value: unknown): Promise<void> {
+    const event = value as any;
+    const messageId = event?.context?.open_message_id ?? event?.open_message_id ?? event?.message_id;
+    const chatId = event?.context?.open_chat_id ?? event?.open_chat_id ?? event?.chat_id;
+    const operatorId = event?.operator?.open_id;
+    if (typeof messageId !== "string" || typeof chatId !== "string" || !this.onCardAction) return;
+    try { await this.onCardAction(messageId, chatId, typeof operatorId === "string" ? operatorId : undefined, event?.action?.value); }
+    catch { this.report("Lark card action handler failed"); }
   }
 
   private async receive(value: unknown): Promise<void> {

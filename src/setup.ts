@@ -3,6 +3,7 @@ import { Input, Text, matchesKey } from "@earendil-works/pi-tui";
 import { registerBot } from "./registration.ts";
 import type { BotConfig } from "./types.ts";
 import { validateConfig } from "./storage.ts";
+import { renderQrCode } from "./qr.ts";
 
 async function secretInput(ctx: ExtensionCommandContext, signal: AbortSignal): Promise<string | undefined> {
   return ctx.ui.custom<string | undefined>((tui, _theme, _keys, done) => {
@@ -35,7 +36,7 @@ export async function connectBot(ctx: ExtensionCommandContext, signal: AbortSign
   if (!brandChoice || signal.aborted) return;
   const brand = brandChoice === "Feishu" ? "feishu" : "lark";
   const mode = await ctx.ui.select("Connect bot (project-local; does not start listening)", [
-    "Register a new bot (recommended)", "Enter existing App ID / App Secret",
+    "Register a new bot (recommended)", "Connect an existing bot with a QR code", "Enter existing App ID / App Secret",
   ], { signal });
   if (!mode || signal.aborted) return;
   if (mode.startsWith("Enter")) {
@@ -46,6 +47,7 @@ export async function connectBot(ctx: ExtensionCommandContext, signal: AbortSign
     return validateConfig({ version: 1, brand, appId: appId.trim(), appSecret: appSecret.trim() });
   }
 
+  const connectExisting = mode.startsWith("Connect an existing");
   return ctx.ui.custom<BotConfig | undefined>((tui, _theme, _keys, done) => {
     const controller = new AbortController();
     const abort = () => { controller.abort(); finish(undefined); };
@@ -60,9 +62,11 @@ export async function connectBot(ctx: ExtensionCommandContext, signal: AbortSign
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) { abort(); }
     else void registerBot({ brand, signal: controller.signal,
+      allowExistingApp: connectExisting,
       onUrl(url, expiresIn) {
         if (finished) return;
-        text = `Open this official URL in your browser (expires in ${expiresIn}s):\n\n${url}\n\nWaiting for authorization… · Esc to cancel\nCredentials are saved only in this project, not the system keychain.`;
+        const action = connectExisting ? "select and connect an existing bot, then confirm the required permission/event additions" : "create a new bot";
+        text = `Use Lark / Feishu to scan this official QR code to ${action} (expires in ${expiresIn}s):\n\n${renderQrCode(url)}\n\nWaiting for authorization… · Esc to cancel\nIf the code wraps, widen the terminal; alternatively open:\n${url}\n\nCredentials are saved only in this project, not the system keychain.`;
         tui.requestRender();
       },
     }).then((result) => {
