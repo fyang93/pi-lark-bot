@@ -4,10 +4,10 @@ import { realpath } from "node:fs/promises";
 import { acquireLock, inspectLock, loadConfig, prepareState, writePrivateJson } from "./storage.ts";
 import type { BotController } from "./controller.ts";
 
-const commands = ["status", "connect", "on", "off", "help"];
+const commands = ["link", "on", "off", "help"];
 const help = [
-  "/lark-bot [status] — Show project configuration, listener and sessions",
-  "/lark-bot connect — Register a bot or enter existing app credentials",
+  "/lark-bot — Show project configuration, listener and sessions",
+  "/lark-bot link — Register a bot or enter existing app credentials",
   "/lark-bot on — Enable listening manually (requires tmux)",
   "/lark-bot off — Stop listening and close panes, preserving history",
 ].join("\n");
@@ -31,22 +31,22 @@ export default function larkBot(pi: ExtensionAPI): void {
     await stop();
   });
   pi.registerCommand("lark-bot", {
-    description: "Project-local Feishu/Lark bot: connect, on, off, status (default)",
+    description: "Project-local Feishu/Lark bot: link, on, off",
     getArgumentCompletions(prefix) {
       return commands.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
     },
     handler: async (args, ctx: ExtensionCommandContext) => {
       if (ctx.mode !== "tui") { ctx.ui.notify("/lark-bot requires an interactive pi TUI.", "error"); return; }
-      const [command = "status"] = args.trim().split(/\s+/).filter(Boolean);
+      const [command] = args.trim().split(/\s+/).filter(Boolean);
       if (command === "help") { ctx.ui.notify(help, "info"); return; }
-      if (!commands.includes(command)) { ctx.ui.notify(help, "warning"); return; }
+      if (command && !commands.includes(command)) { ctx.ui.notify(help, "warning"); return; }
       if (!ctx.isProjectTrusted()) { ctx.ui.notify("Trust this project first.", "error"); return; }
       if (operation || shuttingDown) { ctx.ui.notify("Another operation is still in progress. Try again later.", "warning"); return; }
       operation = true;
       try {
         const cwd = await realpath(ctx.cwd);
         const stateDir = join(cwd, CONFIG_DIR_NAME, "lark-bot");
-        if (command === "status") {
+        if (!command) {
           const config = await loadConfig(stateDir), status = controller?.status;
           const lock = await inspectLock(stateDir);
           const listener = status?.active ? "enabled in this pi"
@@ -55,7 +55,7 @@ export default function larkBot(pi: ExtensionAPI): void {
             : "stale or invalid project lock; verify old processes have exited before removal";
           ctx.ui.notify([
             `Project: ${cwd}`,
-            `Credentials: ${config ? `${config.brand} / ${config.appId}` : "not connected; run /lark-bot connect"}`,
+            `Credentials: ${config ? `${config.brand} / ${config.appId}` : "not connected; run /lark-bot link"}`,
             `Listener: ${listener} · Connection: ${status?.connection ?? "stopped"}`,
             `Main sessions: ${status?.users ?? 0} · Running/queued: ${status?.queued ?? 0}`,
             ...(status?.sessions.map((session) => `${session.userId} → pane ${session.paneId ?? "starting"} · ${session.connected ? "connected" : "disconnected"}`) ?? []),
@@ -70,7 +70,7 @@ export default function larkBot(pi: ExtensionAPI): void {
         }
         if (controller) { ctx.ui.notify("Run /lark-bot off before changing configuration or restarting.", "warning"); return; }
         await prepareState(cwd, CONFIG_DIR_NAME);
-        if (command === "connect") {
+        if (command === "link") {
           const unlock = await acquireLock(stateDir);
           try {
             if (await loadConfig(stateDir) && !await ctx.ui.confirm("Replace this project's bot?", "Existing sessions will be preserved. Listening will not start automatically.", { signal: setupAbort.signal })) return;
@@ -83,7 +83,7 @@ export default function larkBot(pi: ExtensionAPI): void {
           return;
         }
         let config = await loadConfig(stateDir);
-        if (!config) throw new Error("Run /lark-bot connect first.");
+        if (!config) throw new Error("Run /lark-bot link first.");
         if (!process.env.TMUX || !/^%\d+$/.test(process.env.TMUX_PANE ?? "")) throw new Error("Start pi inside tmux before running /lark-bot on.");
         const tmux = await pi.exec("tmux", ["-V"], { timeout: 5000 });
         const version = tmux.stdout.match(/tmux\s+(\d+)\.(\d+)/);

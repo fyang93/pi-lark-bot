@@ -53,5 +53,5 @@ test("untrusted project commands are rejected and unknown commands show help", a
   await h.commands.get("lark-bot").handler("on", h.ctx);
   assert(h.messages.at(-1)?.includes("Trust"));
   await h.commands.get("lark-bot").handler("unknown", h.ctx);
-  assert(h.messages.at(-1)?.includes("/lark-bot connect"));
+  assert(h.messages.at(-1)?.includes("/lark-bot link"));
 });
