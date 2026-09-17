@@ -16,6 +16,8 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   const socketPath = process.env.PI_LARK_BOT_SOCKET;
   const runId = process.env.PI_LARK_BOT_RUN_ID;
   const token = process.env.PI_LARK_BOT_TOKEN;
+  const directUserId = process.env.PI_LARK_BOT_DIRECT_USER_ID;
+  const isGroupChat = process.env.PI_LARK_BOT_GROUP_CHAT === "1";
   let socket: Socket | undefined, ctx: ExtensionContext | undefined, buffer = "";
   let pending: Prompt | undefined, dispatching: Prompt | undefined;
   let active: { id: string; prompt: string; text: string; failed: boolean; started: boolean } | undefined;
@@ -131,25 +133,32 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     active = { id: prompt.id, prompt: prompt.text, text: "", failed: false, started: false };
   });
   pi.on("before_agent_start", (event) => {
+    // Session metadata is supplied on every model turn, so it remains
+    // available after compaction without adding a visible conversation entry.
+    const sessionContext = directUserId
+      ? `The user ID is \`${directUserId}\`.`
+      : isGroupChat ? "In this group chat, each user message is formatted as `user_id: message`." : undefined;
+    const identity = sessionContext ? { systemPrompt: `${event.systemPrompt}\n\n${sessionContext}` } : undefined;
     // Any extension/background continuation in this pane belongs to the last
     // remote conversation. Local TUI input is explicitly excluded above.
     if (!active && lastRemoteId && !localTurnPending) {
       active = { id: lastRemoteId, prompt: "", text: "", failed: false, started: true };
       emit({ type: "progress", text: "正在处理会话后续消息…" });
-      return;
+      return identity;
     }
     localTurnPending = false;
-    if (!active) return;
+    if (!active) return identity;
     if (active.started && awaitingSubagent) {
       // This is the steered continuation containing a subagent result.
       awaitingSubagent = false; spawnedSubagentThisTurn = false; active.text = "";
       emit({ type: "progress", text: "正在整理子代理结果…" });
-      return;
+      return identity;
     }
-    if (active.started || event.prompt !== active.prompt) return;
+    if (active.started || event.prompt !== active.prompt) return identity;
     active.started = true;
     clearTimeout(handoffTimer); handoffTimer = undefined;
     emit({ type: "progress", text: "正在处理中…" });
+    return identity;
   });
   pi.on("message_start", (event) => {
     if (active?.started && event.message.role === "assistant") {
