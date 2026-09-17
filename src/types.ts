@@ -5,6 +5,10 @@ export interface BotConfig {
   appSecret: string;
 }
 
+export type IncomingAttachment =
+  | { status: "ready"; type: "file" | "image" | "audio" | "video"; path: string; name: string; size: number; sourceMessageId: string }
+  | { status: "failed"; type: "file" | "image" | "audio" | "video"; name: string; sourceMessageId: string; error: "download_failed" };
+
 export interface IncomingMessage {
   id: string;
   userId: string;
@@ -12,6 +16,10 @@ export interface IncomingMessage {
   text: string;
   chatType?: "p2p" | "group";
   mentionedBot?: boolean;
+  /** The directly quoted/replied-to message, if any. */
+  parentMessageId?: string;
+  attachments?: IncomingAttachment[];
+  preparationWarning?: "referenced_message_unavailable";
 }
 
 /** Keep existing private-session keys; group IDs occupy a distinct namespace. */
@@ -47,6 +55,8 @@ export interface BotTransport {
   stop(): Promise<void>;
   send(chatId: string, text: string, replyTo?: string): Promise<string>;
   update(messageId: string, text: string): Promise<void>;
+  /** Resolve quoted resources only after sender authorization succeeds. */
+  prepareMessage?(message: IncomingMessage): Promise<IncomingMessage>;
   sendCard?(chatId: string, card: object, replyTo?: string): Promise<string>;
   updateCard?(messageId: string, card: object): Promise<void>;
 }

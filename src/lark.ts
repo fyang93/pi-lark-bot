@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { BotConfig, BotTransport, IncomingMessage } from "./types.js";
+import { AttachmentCache, MAX_ATTACHMENT_BYTES } from "./attachment-cache.js";
 
 /** The SDK surface used here; exported so integration tests can supply a real-shaped fake. */
 export interface LarkSdk {
@@ -38,11 +39,13 @@ export class LarkTransport implements BotTransport {
   private pendingStart?: PendingStart;
   private _state: LarkTransportState = "stopped";
   private botOpenId?: string;
+  private readonly attachmentCache?: AttachmentCache;
 
   constructor(
-    config: BotConfig,
+    private readonly config: BotConfig,
     private readonly onError: (error: Error) => void = () => {},
     sdk: LarkSdk = Lark as unknown as LarkSdk,
+    attachmentCacheDir?: string,
   ) {
     if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
     const domain = config.brand === "lark" ? sdk.Domain?.Lark : sdk.Domain?.Feishu;
@@ -52,6 +55,7 @@ export class LarkTransport implements BotTransport {
     const httpInstance = boundedHttp(sdk.defaultHttpInstance);
     const common = { appId: config.appId, appSecret: config.appSecret, domain, httpInstance, logger: silentLogger, loggerLevel: 0 };
     this.client = new sdk.Client(common);
+    this.attachmentCache = attachmentCacheDir ? new AttachmentCache(attachmentCacheDir) : undefined;
     this.dispatcher = new sdk.EventDispatcher({ logger: silentLogger, loggerLevel: 0 });
     this.dispatcher.register({ "im.message.receive_v1": (event) => this.receive(event), "card.action.trigger": (event) => this.cardAction(event) });
     this.ws = new sdk.WSClient({
@@ -118,6 +122,43 @@ export class LarkTransport implements BotTransport {
   }
 
   async update(messageId: string, text: string): Promise<void> { await this.updateCard(messageId, card(text)); }
+
+  /** Resolve directly quoted resources after authorization; one failed resource never drops the text request. */
+  async prepareMessage(message: IncomingMessage): Promise<IncomingMessage> {
+    if (!message.parentMessageId || !this.attachmentCache) return message;
+    let item: any;
+    try {
+      const response = await this.request(() => this.client.im.v1.message.get({ path: { message_id: message.parentMessageId } }));
+      item = response?.data?.items?.find((candidate: any) => candidate?.message_id === message.parentMessageId);
+    } catch {
+      return { ...message, preparationWarning: "referenced_message_unavailable" };
+    }
+    if (!item || item.chat_id !== message.chatId || typeof item.body?.content !== "string") return message;
+    let content: unknown;
+    try { content = JSON.parse(item.body.content); } catch { return message; }
+    const candidates = referencedResources(item.msg_type, content);
+    if (!candidates.length) return message;
+    const attachments: NonNullable<IncomingMessage["attachments"]> = [];
+    for (const candidate of candidates) {
+      try {
+        const cached = await this.attachmentCache.get(
+          `${this.config.appId}\0${message.parentMessageId}\0${candidate.key}`,
+          candidate.name,
+          async () => {
+            const resource = await this.downloadResource(message.parentMessageId!, candidate.key, candidate.apiType);
+            const length = Number(resource.headers?.["content-length"] ?? resource.headers?.["Content-Length"]);
+            if (Number.isFinite(length) && length > MAX_ATTACHMENT_BYTES) throw new Error("Referenced resource is larger than 100 MB");
+            return resource.getReadableStream() as AsyncIterable<Uint8Array | string>;
+          },
+        );
+        attachments.push({ status: "ready", type: candidate.type, ...cached, sourceMessageId: message.parentMessageId });
+      } catch {
+        attachments.push({ status: "failed", type: candidate.type, name: candidate.name,
+          sourceMessageId: message.parentMessageId, error: "download_failed" });
+      }
+    }
+    return { ...message, attachments };
+  }
 
   async sendCard(chatId: string, value: object, replyTo?: string): Promise<string> {
     const data = { msg_type: "interactive", content: JSON.stringify(value), uuid: randomUUID() };
@@ -214,8 +255,22 @@ export class LarkTransport implements BotTransport {
     }
     if (!text.trim() || !this.onMessage || this._state !== "connected") return;
     try { await this.onMessage({ id: message.message_id, userId, chatId: message.chat_id, text,
+      ...(typeof message.parent_id === "string" && message.parent_id ? { parentMessageId: message.parent_id } : {}),
       ...(group ? { chatType: "group" as const, mentionedBot: true } : {}) }); }
     catch (_error) { this.report("Lark message handler failed"); }
+  }
+
+  private async downloadResource(messageId: string, fileKey: string, type: "file" | "image"): Promise<any> {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        const response = await this.client.im.v1.messageResource.get({
+          path: { message_id: messageId, file_key: fileKey }, params: { type },
+        });
+        if (response && typeof response.getReadableStream === "function") return response;
+      } catch { /* bounded retry below */ }
+      if (attempt < MAX_ATTEMPTS - 1) await delay(attempt);
+    }
+    throw this.failure();
   }
 
   private async request(operation: () => Promise<any>): Promise<any> {
@@ -272,6 +327,32 @@ function boundedHttp(http: LarkSdk["defaultHttpInstance"]): LarkSdk["defaultHttp
 
 function delay(attempt: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+}
+
+interface ReferencedResource {
+  key: string;
+  name: string;
+  type: "file" | "image" | "audio" | "video";
+  apiType: "file" | "image";
+}
+
+function referencedResources(messageType: unknown, value: unknown): ReferencedResource[] {
+  const content = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const validKey = (key: unknown): key is string => typeof key === "string" && key.length > 0 && key.length <= 4096;
+  const suppliedName = typeof content.file_name === "string" && content.file_name ? content.file_name : undefined;
+  switch (messageType) {
+    case "file":
+      return validKey(content.file_key) ? [{ key: content.file_key, name: suppliedName ?? "attachment.bin", type: "file", apiType: "file" }] : [];
+    case "image":
+      return validKey(content.image_key) ? [{ key: content.image_key, name: "image.bin", type: "image", apiType: "image" }] : [];
+    case "audio":
+      return validKey(content.file_key) ? [{ key: content.file_key, name: suppliedName ?? "audio.opus", type: "audio", apiType: "file" }] : [];
+    case "media":
+    case "video":
+      return validKey(content.file_key) ? [{ key: content.file_key, name: suppliedName ?? "video.mp4", type: "video", apiType: "file" }] : [];
+    default:
+      return [];
+  }
 }
 
 function card(text: string): object {

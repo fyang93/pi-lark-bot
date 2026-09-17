@@ -57,7 +57,7 @@ export default function larkBot(pi: ExtensionAPI): void {
             `Project: ${cwd}`,
             `Credentials: ${config ? `${config.brand} / ${config.appId}` : "not connected; run /lark-bot link"}`,
             `Listener: ${listener} · Connection: ${status?.connection ?? "stopped"}`,
-            `Main sessions: ${status?.users ?? 0} · Running/queued: ${status?.queued ?? 0}`,
+            `Allowlisted users: ${status?.allowlisted ?? 0} · Main sessions: ${status?.users ?? 0} · Running/queued: ${status?.queued ?? 0}`,
             ...(status?.sessions.map((session) => `${session.userId} → pane ${session.paneId ?? "starting"} · ${session.connected ? "connected" : "disconnected"}`) ?? []),
             `Storage: ${stateDir}`,
           ].join("\n"), "info");
@@ -88,7 +88,7 @@ export default function larkBot(pi: ExtensionAPI): void {
         const tmux = await pi.exec("tmux", ["-V"], { timeout: 5000 });
         const version = tmux.stdout.match(/tmux\s+(\d+)\.(\d+)/);
         if (tmux.code !== 0 || !version || Number(version[1]) < 3 || Number(version[1]) === 3 && Number(version[2]) < 2) throw new Error("tmux 3.2 or newer is required.");
-        if (!await ctx.ui.confirm("Enable remote code execution?", "Anyone who can message this bot or mention it in a group can use local pi tools. There is no allowlist. Sessions share project files, and group replies are visible to group members.", { signal: setupAbort.signal })) return;
+        if (!await ctx.ui.confirm("Enable remote code execution?", "New users require local approval (10-second timeout; default choice is Confirm), whether they contact the bot directly or @mention it in a group. Sessions share project files, and group replies are visible to group members.", { signal: setupAbort.signal })) return;
         if (shuttingDown) return;
         release = await acquireLock(stateDir);
         try {
@@ -108,13 +108,18 @@ export default function larkBot(pi: ExtensionAPI): void {
               ? ` (${error.message.slice(0, 240)})` : "";
             ctx.ui.notify(`Lark bot operation failed${detail}. Check connectivity, app permissions and the session pane. Generated history is preserved locally.`, "error");
           };
-          const transport = new LarkTransport(config, onError);
+          const transport = new LarkTransport(config, onError, undefined, join(stateDir, "attachments"));
           const instance = new BotController({ config, stateDir, transport,
             workers: new TmuxWorkers({ cwd, stateDir, appId: config.appId,
               model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
               thinkingLevel: pi.getThinkingLevel() }),
             defaultModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
             availableModels: ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id })),
+            authorizeUser: (userId, message, signal) => ctx.ui.confirm(
+              "Allow new Feishu/Lark user?",
+              `User ${userId} is not in this project's allowlist and sent ${message.chatType === "group" ? `an @mention in group ${message.chatId}` : "a direct message"}. Add this user and process the message? No response within 10 seconds is treated as Reject.`,
+              { signal, timeout: 10_000 },
+            ),
             onError, onStatus: () => {
               if (!shuttingDown) ctx.ui.setStatus("lark-bot", controller?.status.active ? `Lark ● ${controller.status.queued} running/queued` : undefined);
             },
@@ -123,7 +128,7 @@ export default function larkBot(pi: ExtensionAPI): void {
           controller = instance;
           await instance.start();
           if (shuttingDown) { await stop(); return; }
-          ctx.ui.notify("Lark bot enabled: direct messages and group @mentions. Run /lark-bot off to disable.", "info");
+          ctx.ui.notify("Lark bot enabled: only allowlisted users can use direct messages or group @mentions. Run /lark-bot off to disable.", "info");
         } catch (error) { await stop(); throw error; }
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : "Lark bot operation failed", "error");

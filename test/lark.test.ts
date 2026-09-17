@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable } from "node:stream";
 import * as ActualLark from "@larksuiteoapi/node-sdk";
 import { LarkTransport, type LarkSdk } from "../src/lark.ts";
 import type { BotConfig } from "../src/types.ts";
@@ -9,20 +13,24 @@ const config: BotConfig = { version: 1, brand: "lark", appId: "cli_123", appSecr
 function fakeSdk() {
   let handler: ((event: unknown) => Promise<void>) | undefined;
   let clientOptions: any;
-  const calls: { create: any[]; reply: any[]; patch: any[]; start: number; close: any[]; http: any[] } = {
-    create: [], reply: [], patch: [], start: 0, close: [], http: [],
+  const calls: { create: any[]; reply: any[]; patch: any[]; get: any[]; resource: any[]; start: number; close: any[]; http: any[] } = {
+    create: [], reply: [], patch: [], get: [], resource: [], start: 0, close: [], http: [],
   };
   let callbacks: Record<string, (() => void) | undefined> = {};
   let started!: () => void;
   const startEvent = new Promise<void>((resolve) => { started = resolve; });
-  const api = {
+  const api: any = {
     create: async (payload: unknown) => { calls.create.push(payload); return { code: 0, data: { message_id: "out-1" } }; },
     reply: async (payload: unknown) => { calls.reply.push(payload); return { code: 0, data: { message_id: "out-2" } }; },
     patch: async (payload: unknown) => { calls.patch.push(payload); return { code: 0, data: {} }; },
+    get: async (payload: unknown) => { calls.get.push(payload); return { code: 0, data: { items: [] } }; },
+  };
+  const messageResource = {
+    get: async (payload: unknown) => { calls.resource.push(payload); return { headers: {}, getReadableStream: () => Readable.from([]) }; },
   };
   class Client {
     constructor(options: any) { clientOptions = options; }
-    im = { v1: { message: api } };
+    im = { v1: { message: api, messageResource } };
     async request(payload: any) { assert.equal(payload.url, "/open-apis/bot/v3/info"); return { code: 0, bot: { open_id: "ou_bot" } }; }
   }
   class EventDispatcher { constructor(_options?: any) {} register(handles: any) { handler = handles["im.message.receive_v1"]; } }
@@ -37,7 +45,7 @@ function fakeSdk() {
   };
   return {
     sdk: { Client, EventDispatcher, WSClient, defaultHttpInstance, Domain: { Feishu: "feishu", Lark: "lark" } } as unknown as LarkSdk,
-    calls, clientOptions: () => clientOptions, emit: async (event: unknown) => handler?.(event),
+    calls, api, messageResource, clientOptions: () => clientOptions, emit: async (event: unknown) => handler?.(event),
     ready: async () => { await startEvent; callbacks.onReady?.(); }, error: () => callbacks.onError?.(),
     reconnecting: () => callbacks.onReconnecting?.(), reconnected: () => callbacks.onReconnected?.(),
   };
@@ -84,6 +92,52 @@ test("groups require a real bot mention; other mentions and empty prompts are ig
     await fake.emit({ ...event, message: { ...event.message, content: JSON.stringify({ text: "@_user_1" }) } });
     assert.deepEqual(received, [{ id: "om_1", userId: "ou_1", chatId: "oc_1", text: "hello", chatType: "group", mentionedBot: true }]);
   } finally { await transport.stop(); }
+});
+
+test("captures a reply parent and caches its file resource for the authorized controller", async () => {
+  const root = await mkdtemp(join(tmpdir(), "lark-file-cache-"));
+  const fake = fakeSdk();
+  fake.api.get = async (payload: any) => {
+    fake.calls.get.push(payload);
+    return { code: 0, data: { items: [{ message_id: "om_file", chat_id: "oc_1", msg_type: "file",
+      body: { content: JSON.stringify({ file_key: "file-key", file_name: "../report.csv" }) } }] } };
+  };
+  fake.messageResource.get = async (payload: any) => {
+    fake.calls.resource.push(payload);
+    return { headers: { "content-length": "7" }, getReadableStream: () => Readable.from([Buffer.from("a,b\n1,2")]) };
+  };
+  const transport = new LarkTransport(config, undefined, fake.sdk, root);
+  const received: any[] = [];
+  try {
+    const starting = transport.start(async (message) => { received.push(message); });
+    await fake.ready(); await starting;
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, parent_id: "om_file" } });
+    assert.equal(received[0].parentMessageId, "om_file");
+    const prepared = await transport.prepareMessage(received[0]);
+    const attachment = prepared.attachments?.[0];
+    assert.equal(attachment?.name, "report.csv");
+    assert(attachment?.status === "ready");
+    assert.equal(await readFile(attachment.path, "utf8"), "a,b\n1,2");
+    assert.deepEqual(fake.calls.resource[0], { path: { message_id: "om_file", file_key: "file-key" }, params: { type: "file" } });
+    await transport.prepareMessage(received[0]);
+    assert.equal(fake.calls.resource.length, 1, "the second reference reuses the persistent cache");
+  } finally { await transport.stop(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("a quoted attachment download failure is isolated from the text request", async () => {
+  const root = await mkdtemp(join(tmpdir(), "lark-file-failure-"));
+  const fake = fakeSdk();
+  fake.api.get = async () => ({ code: 0, data: { items: [{ message_id: "om_image", chat_id: "oc_1", msg_type: "image",
+    body: { content: JSON.stringify({ image_key: "img-key" }) } }] } });
+  fake.messageResource.get = async () => { throw new Error("secret SDK detail"); };
+  const transport = new LarkTransport(config, undefined, fake.sdk, root);
+  try {
+    const prepared = await transport.prepareMessage({ ...textEvent.message, id: "request", userId: "ou_1", chatId: "oc_1",
+      text: "analyze it", parentMessageId: "om_image" });
+    assert.deepEqual(prepared.attachments, [{ status: "failed", type: "image", name: "image.bin",
+      sourceMessageId: "om_image", error: "download_failed" }]);
+    assert(!JSON.stringify(prepared).includes("secret SDK detail"));
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("rejects a pending start on SDK failure or explicit stop and cleans up", async () => {

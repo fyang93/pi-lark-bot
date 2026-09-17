@@ -38,7 +38,7 @@ const DEFAULT_EXPIRES_SECONDS = 600;
 const addons = {
   preset: false,
   scopes: {
-    tenant: ["im:message:send_as_bot", "im:message.p2p_msg:readonly", "im:message.group_at_msg:readonly", "im:message:update"],
+    tenant: ["im:message:send_as_bot", "im:message.p2p_msg:readonly", "im:message.group_at_msg:readonly", "im:message:readonly", "im:message:update"],
   },
   events: { items: { tenant: ["im.message.receive_v1"] } },
   callbacks: { items: ["card.action.trigger"] },

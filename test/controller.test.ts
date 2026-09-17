@@ -50,6 +50,65 @@ test("controller deduplicates across restart, reuses per-user worker and sends s
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("direct and group senders require approval and share the persisted user allowlist", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-allowlist-"));
+  const calls: string[] = []; let prompts = 0;
+  const workers: WorkerFactory = { async open(key) { return { async run(text, emit) {
+    calls.push(`${key}|${text}`); emit({ type: "done", text: "ok" });
+  }, async close() {} }; }, async close() {} };
+  const group: IncomingMessage = { id: "group", userId: "ou_group", chatId: "oc_room", text: "hello", chatType: "group", mentionedBot: true };
+  try {
+    const transport = new FakeTransport();
+    const bot = new BotController({ config, stateDir: dir, transport, workers,
+      authorizeUser: async (userId) => { prompts++; return userId === "ou_allowed" || userId === "ou_group"; } });
+    await bot.start();
+    await Promise.all([
+      bot.receive(msg("first", "ou_allowed")), bot.receive(msg("second", "ou_allowed")),
+      bot.receive(msg("denied", "ou_denied")), bot.receive(group),
+    ]);
+    await bot.drain();
+    assert.equal(prompts, 3, "concurrent messages from one new user share one prompt, while a group sender is also checked");
+    assert(calls.includes("ou_allowed|first") && calls.includes("ou_allowed|second"));
+    assert(calls.includes("group:oc_room|ou_group: hello"));
+    assert(!calls.some((x) => x.includes("denied")));
+    assert(transport.sends.some((x) => x.chat === "chat_ou_denied" && x.text.includes("未获得")));
+    assert.equal(bot.status.allowlisted, 2);
+    await bot.stop();
+
+    let restartPrompts = 0;
+    const bot2 = new BotController({ config, stateDir: dir, transport: new FakeTransport(), workers,
+      authorizeUser: async () => { restartPrompts++; return false; } });
+    await bot2.start(); await bot2.receive(msg("after-restart", "ou_allowed")); await bot2.drain();
+    assert.equal(restartPrompts, 0);
+    assert(calls.includes("ou_allowed|after-restart"));
+    await bot2.stop();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("quoted files are prepared only after authorization and their cache paths reach the worker", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-prepared-file-"));
+  const prompts: string[] = []; const prepared: string[] = [];
+  const transport = new FakeTransport();
+  (transport as any).prepareMessage = async (message: IncomingMessage) => {
+    prepared.push(message.id);
+    return { ...message, attachments: [{ status: "ready", type: "file", path: "/private/cache/report.csv", name: "report.csv", size: 12, sourceMessageId: "om_file" }] };
+  };
+  const workers: WorkerFactory = { async open() { return { async run(text, emit) {
+    prompts.push(text); emit({ type: "done", text: "ok" });
+  }, async close() {} }; }, async close() {} };
+  const bot = new BotController({ config, stateDir: dir, transport, workers,
+    authorizeUser: async (userId) => userId === "ou_allowed" });
+  try {
+    await bot.start();
+    await bot.receive({ ...msg("denied", "ou_denied"), parentMessageId: "om_file" });
+    await bot.receive({ ...msg("allowed", "ou_allowed"), parentMessageId: "om_file" });
+    await bot.drain();
+    assert.deepEqual(prepared, ["allowed"]);
+    assert.match(prompts[0]!, /\/private\/cache\/report\.csv/);
+    assert.match(prompts[0]!, /untrusted user input/);
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
 test("same-user FIFO, different users concurrent, event handler does not wait for model", async () => {
   const dir = await mkdtemp(join(tmpdir(), "lark-controller-"));
   const gate = deferred(); const began = deferred();
