@@ -136,10 +136,12 @@ class PaneWorker implements ConversationWorker {
       if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_LARK_BOT_") || ["PI_SESSION_ID", "PI_SESSION_FILE"].includes(key)) delete childEnv[key];
     }
     Object.assign(childEnv, { PI_LARK_BOT_WORKER: "1", PI_LARK_BOT_SOCKET: socketPath, PI_LARK_BOT_RUN_ID: runId, PI_LARK_BOT_TOKEN: token });
-    // A group session represents a chat, not one member. Direct-message panes
-    // receive an identity; group panes receive only their message format.
-    if (this.userId.startsWith("group:")) childEnv.PI_LARK_BOT_GROUP_CHAT = "1";
-    else childEnv.PI_LARK_BOT_DIRECT_USER_ID = this.userId;
+    // A group session represents a chat, not one member. Pass its chat ID so
+    // every model turn can identify the shared conversation after compaction.
+    if (this.userId.startsWith("group:")) {
+      childEnv.PI_LARK_BOT_GROUP_CHAT = "1";
+      childEnv.PI_LARK_BOT_GROUP_CHAT_ID = this.userId.slice("group:".length);
+    } else childEnv.PI_LARK_BOT_DIRECT_USER_ID = this.userId;
     const extension = this.options.workerExtensionPath ?? fileURLToPath(new URL("./worker-extension.ts", import.meta.url));
     const args = ["--session", this.sessionFile, "-e", extension];
     if (this.options.model) args.push("--model", `${this.options.model.provider}/${this.options.model.id}`);

@@ -6,8 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import workerExtension from "../src/worker-extension.ts";
 
-async function harness(t: TestContext, options: { idle?: boolean; accept?: boolean; directUserId?: string; groupChat?: boolean } = {}) {
-  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_DIRECT_USER_ID", "PI_LARK_BOT_GROUP_CHAT"];
+async function harness(t: TestContext, options: { idle?: boolean; accept?: boolean; directUserId?: string; groupChat?: boolean; groupChatId?: string } = {}) {
+  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_DIRECT_USER_ID", "PI_LARK_BOT_GROUP_CHAT", "PI_LARK_BOT_GROUP_CHAT_ID"];
   const old = keys.map((key) => process.env[key]);
   const root = await mkdtemp(join(tmpdir(), "pi-lark-worker-test-"));
   let peer: Socket | undefined;
@@ -36,8 +36,10 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
   Object.assign(process.env, { PI_LARK_BOT_SOCKET: path, PI_LARK_BOT_RUN_ID: "run", PI_LARK_BOT_TOKEN: "token" });
   if (options.directUserId) process.env.PI_LARK_BOT_DIRECT_USER_ID = options.directUserId;
   else delete process.env.PI_LARK_BOT_DIRECT_USER_ID;
-  if (options.groupChat) process.env.PI_LARK_BOT_GROUP_CHAT = "1";
+  if (options.groupChat || options.groupChatId) process.env.PI_LARK_BOT_GROUP_CHAT = "1";
   else delete process.env.PI_LARK_BOT_GROUP_CHAT;
+  if (options.groupChatId) process.env.PI_LARK_BOT_GROUP_CHAT_ID = options.groupChatId;
+  else delete process.env.PI_LARK_BOT_GROUP_CHAT_ID;
   delete process.env.PI_LARK_BOT_WORKER; // never use a real process-exit fallback inside a unit test
   const handlers = new Map<string, Function>();
   let idle = options.idle ?? true;
@@ -87,10 +89,10 @@ test("adds the direct Lark user ID to every system prompt", { timeout: 3000 }, a
   });
 });
 
-test("adds the group message format to every system prompt", { timeout: 3000 }, async (t) => {
-  const h = await harness(t, { groupChat: true });
+test("adds the group chat ID and message format to every system prompt", { timeout: 3000 }, async (t) => {
+  const h = await harness(t, { groupChatId: "oc_team" });
   assert.deepEqual(h.emit("before_agent_start", { prompt: "local", systemPrompt: "base" }), {
-    systemPrompt: "base\n\nIn this group chat, each user message is formatted as `user_id: message`.",
+    systemPrompt: "base\n\nThe group chat ID is `oc_team`. In this group chat, each user message is formatted as `user_id: message`.",
   });
 });
 

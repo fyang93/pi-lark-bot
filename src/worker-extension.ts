@@ -17,7 +17,8 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   const runId = process.env.PI_LARK_BOT_RUN_ID;
   const token = process.env.PI_LARK_BOT_TOKEN;
   const directUserId = process.env.PI_LARK_BOT_DIRECT_USER_ID;
-  const isGroupChat = process.env.PI_LARK_BOT_GROUP_CHAT === "1";
+  const groupChatId = process.env.PI_LARK_BOT_GROUP_CHAT_ID;
+  const isGroupChat = process.env.PI_LARK_BOT_GROUP_CHAT === "1" || !!groupChatId;
   let socket: Socket | undefined, ctx: ExtensionContext | undefined, buffer = "";
   let pending: Prompt | undefined, dispatching: Prompt | undefined;
   let active: { id: string; prompt: string; text: string; failed: boolean; started: boolean } | undefined;
@@ -137,7 +138,9 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     // available after compaction without adding a visible conversation entry.
     const sessionContext = directUserId
       ? `The user ID is \`${directUserId}\`.`
-      : isGroupChat ? "In this group chat, each user message is formatted as `user_id: message`." : undefined;
+      : isGroupChat
+        ? `${groupChatId ? `The group chat ID is \`${groupChatId}\`. ` : ""}In this group chat, each user message is formatted as \`user_id: message\`.`
+        : undefined;
     const identity = sessionContext ? { systemPrompt: `${event.systemPrompt}\n\n${sessionContext}` } : undefined;
     // Any extension/background continuation in this pane belongs to the last
     // remote conversation. Local TUI input is explicitly excluded above.
