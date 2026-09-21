@@ -7,7 +7,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { TmuxWorkers } from "../src/panes.ts";
+import { ZellijWorkers } from "../src/panes.ts";
 import { BotController } from "../src/controller.ts";
 import type { BotTransport, WorkerEvent } from "../src/types.ts";
 
@@ -44,21 +44,25 @@ async function listenMock(fixture: string) {
   const address = server.address(); assert(address && typeof address !== "string");
   return { server, url: `http://127.0.0.1:${address.port}/v1`, requests };
 }
-async function run(worker: Awaited<ReturnType<TmuxWorkers["open"]>>, prompt: string) {
+async function run(worker: Awaited<ReturnType<ZellijWorkers["open"]>>, prompt: string) {
   const events: WorkerEvent[] = [];
   await timeout(worker.run(prompt, (event) => events.push(event)), 15000, "remote prompt");
   return events;
 }
+async function panes(): Promise<{ id: number; is_plugin: boolean; is_focused: boolean; tab_id: number }[]> {
+  const { stdout, stderr } = await execFile("zellij", ["action", "list-panes", "--json", "--all"], { timeout: 5000 });
+  assert(stdout.trim(), `Zellij list-panes returned no JSON: ${stderr}`);
+  return JSON.parse(stdout);
+}
 async function paneIds(): Promise<Set<string>> {
-  const { stdout } = await execFile("tmux", ["list-panes", "-a", "-F", "#{pane_id}"], { timeout: 5000 });
-  return new Set(stdout.trim().split("\n"));
+  return new Set((await panes()).filter((pane) => !pane.is_plugin).map((pane) => `terminal_${pane.id}`));
 }
 
-test("real tmux/pi: tools, streaming, balanced panes, isolation, crash recovery and history", { skip: !enabled, timeout: 100000 }, async () => {
-  const socket = process.env.PI_LARK_BOT_TEST_SOCKET;
-  assert(socket?.startsWith(join(tmpdir(), "pi-lark-bot-test-")) && process.env.TMUX?.split(",")[0] === socket,
-    "Refusing to manipulate a working tmux server; run npm run test:integration.");
-  const parent = process.env.TMUX_PANE!; assert.match(parent, /^%\d+$/);
+test("real Zellij/pi: tools, streaming, native panes, isolation, crash recovery and history", { skip: !enabled, timeout: 100000 }, async () => {
+  const session = process.env.PI_LARK_BOT_TEST_SESSION;
+  assert(session?.startsWith("pi-lark-bot-test-") && process.env.ZELLIJ_SESSION_NAME === session,
+    "Refusing to manipulate a working Zellij session; run npm run test:integration.");
+  const parent = process.env.ZELLIJ_PANE_ID!; assert.match(parent, /^\d+$/);
   const root = await mkdtemp(join(tmpdir(), "pi-lark-bot-integration-"));
   const project = join(root, "project"); await mkdir(project);
   const fixture = join(project, "fixture.txt"); await writeFile(fixture, "harmless tool fixture");
@@ -68,32 +72,34 @@ test("real tmux/pi: tools, streaming, balanced panes, isolation, crash recovery 
     workerExtensionPath: resolve("test/fixtures/mock-worker-extension.ts"),
     env: { PI_CODING_AGENT_DIR: join(root, "pi"), LARK_BOT_MOCK_URL: mock.url },
   };
-  let workers: TmuxWorkers | undefined, restored: TmuxWorkers | undefined, bridge: BotController | undefined;
+  let workers: ZellijWorkers | undefined, restored: ZellijWorkers | undefined, bridge: BotController | undefined;
   const owned = new Set<string>();
-  const record = (factory: TmuxWorkers) => factory.list().forEach((pane) => { if (pane.paneId) owned.add(pane.paneId); });
-  const assertBalanced = async () => {
-    await delay(180); // copied tmux surface rebalances after 120ms
-    const { stdout } = await execFile("tmux", ["list-panes", "-t", parent, "-F", "#{pane_id}\t#{pane_width}\t#{pane_active}"], { timeout: 5000 });
-    const panes = stdout.trim().split("\n").map((row) => row.split("\t"));
-    const widths = panes.map((p) => Number(p[1]));
-    assert(Math.max(...widths) - Math.min(...widths) <= 2, `unequal pane widths: ${widths}`);
-    assert.equal(panes.find((p) => p[0] === parent)?.[2], "1", "must not steal parent focus");
+  const record = (factory: ZellijWorkers) => factory.list().forEach((pane) => { if (pane.paneId) owned.add(pane.paneId); });
+  const assertPlacement = async () => {
+    const current = await panes();
+    const parentPane = current.find((p) => !p.is_plugin && p.id === Number(parent));
+    assert(parentPane);
+    assert(parentPane.is_focused, "must not steal parent focus");
+    for (const id of owned) {
+      const pane = current.find((p) => !p.is_plugin && `terminal_${p.id}` === id);
+      if (pane) assert.equal(pane.tab_id, parentPane.tab_id);
+    }
   };
   try {
-    workers = new TmuxWorkers(common);
+    workers = new ZellijWorkers(common);
     const one = await timeout(workers.open("user-one"), 20000, "first pane startup"); record(workers);
     const first = await run(one, "first prompt");
-    assert(first.some((event) => event.type === "progress" && event.text === "Using tool: read"));
+    assert(first.some((event) => event.type === "progress" && event.text === "正在调用工具：read"), JSON.stringify(first));
     assert(first.some((event) => event.type === "text" && event.text === "mock:"));
     assert.deepEqual(first.at(-1), { type: "done", text: "mock:first prompt", error: false });
     assert.strictEqual(await workers.open("user-one"), one);
     const two = await timeout(workers.open("user-two"), 20000, "second pane startup"); record(workers);
-    assert.notStrictEqual(two, one); await assertBalanced();
+    assert.notStrictEqual(two, one); await assertPlacement();
     if (process.env.PI_LARK_BOT_SIBLING_TEST === "1") {
-      const sibling = await import(pathToFileURL(resolve("../pi-interactive-subagents/pi-extension/subagents/tmux.ts")).href);
-      const extra: string = sibling.createSurface("balance-fixture"); owned.add(extra);
-      try { await assertBalanced(); } finally { sibling.closeSurface(extra); }
-      await assertBalanced();
+      const sibling = await import(pathToFileURL(resolve("../pi-interactive-subagents/pi-extension/subagents/zellij.ts")).href);
+      const extra: string = sibling.createSurface("layout-fixture"); owned.add(extra);
+      try { await assertPlacement(); } finally { sibling.closeSurface(extra); }
+      await assertPlacement();
     }
     await run(two, "separate user");
     assert(!mock.requests.at(-1)!.includes("first prompt"));
@@ -101,14 +107,14 @@ test("real tmux/pi: tools, streaming, balanced panes, isolation, crash recovery 
     assert(mock.requests.at(-1)!.includes("first prompt"));
     assert(!mock.requests.at(-1)!.includes("separate user"));
     const crashed = workers.list().find((pane) => pane.userId === "user-one")!.paneId!;
-    await execFile("tmux", ["kill-pane", "-t", crashed], { timeout: 5000 });
+    await execFile("zellij", ["action", "close-pane", "--pane-id", crashed], { timeout: 5000 });
     await delay(100);
     const recovered = await timeout(workers.open("user-one"), 20000, "crash replacement"); record(workers);
     assert.notStrictEqual(recovered, one);
     await run(recovered, "after crash"); assert(mock.requests.at(-1)!.includes("first prompt"));
     await workers.close(); workers = undefined;
     for (const id of owned) assert(!(await paneIds()).has(id), `owned pane ${id} must close after stop`);
-    restored = new TmuxWorkers(common);
+    restored = new ZellijWorkers(common);
     const resumed = await timeout(restored.open("user-one"), 20000, "restored pane"); record(restored);
     await run(resumed, "after restart");
     const request = mock.requests.at(-1)!;
@@ -117,14 +123,13 @@ test("real tmux/pi: tools, streaming, balanced panes, isolation, crash recovery 
     const outbound: string[] = [], edits: string[] = [];
     const transport: BotTransport = { async start() {}, async stop() {},
       async send(_chat, text) { outbound.push(text); return `card-${outbound.length}`; }, async update(_id, text) { edits.push(text); } };
-    const botWorkers = new TmuxWorkers(common);
+    const botWorkers = new ZellijWorkers(common);
     bridge = new BotController({ config: { version: 1, brand: "feishu", appId: "integration-app", appSecret: "fixture" },
       stateDir: common.stateDir, workers: botWorkers, transport, streamInterval: 20 });
     await bridge.start(); await bridge.receive({ id: "message-1", userId: "ou_owner", chatId: "chat", text: "first prompt" });
     await timeout(bridge.drain(), 25000, "bot reply"); record(botWorkers);
-    assert(outbound.includes("mock:first prompt"));
+    assert(edits.includes("mock:first prompt"));
     assert(edits.some((text) => text.includes("read") || text.includes("mock:")));
-    assert(edits.includes("✅ Completed"));
     await bridge.receive({ id: "group-1", userId: "ou_owner", chatId: "oc_room", chatType: "group", mentionedBot: true, text: "group first" });
     await timeout(bridge.drain(), 25000, "first group reply"); record(botWorkers);
     const groupPane = botWorkers.list().find((pane) => pane.userId === "group:oc_room")!;
@@ -134,9 +139,9 @@ test("real tmux/pi: tools, streaming, balanced panes, isolation, crash recovery 
     assert.equal(botWorkers.list().find((pane) => pane.userId === "group:oc_room")?.paneId, groupPane.paneId);
     assert(mock.requests.at(-1)!.includes("ou_owner: group first"));
     assert(!mock.requests.at(-1)!.includes('"first prompt"'));
-    assert(outbound.includes("mock:ou_other: group second"));
+    assert(edits.includes("mock:ou_other: group second"));
     await bridge.stop(); bridge = undefined;
-    restored = new TmuxWorkers(common);
+    restored = new ZellijWorkers(common);
     const groupResumed = await restored.open("group:oc_room"); record(restored);
     await run(groupResumed, "after group restart");
     assert(mock.requests.at(-1)!.includes("ou_other: group second"));

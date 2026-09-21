@@ -2,18 +2,18 @@
 
 将 [pi](https://github.com/badlogic/pi-mono) 接入飞书 / Lark：用户在私聊中直接发送消息，或在群里 @机器人，即可让 pi 在本机项目中工作。
 
-**一个私聊用户或一个群聊，对应一个独立的 pi 主 agent 会话和 tmux pane。** 它不是 `subagent`：每个会话都是完整、可在本地交互的 pi TUI，保留自己的历史和模型选择。
+**一个私聊用户或一个群聊，对应一个独立的 pi 主 agent 会话和 Zellij pane。** 它不是 `subagent`：每个会话都是完整、可在本地交互的 pi TUI，保留自己的历史和模型选择。
 
 > [!WARNING]
 > 私聊和群聊都受项目本地用户白名单保护：新用户首次私聊机器人或在群中 @机器人时，会在本机 pi TUI 中弹出确认，默认选中 Confirm，10 秒未确认则拒绝。群聊中未 @机器人的消息会被忽略。请限制应用可用范围，不要把它当作权限沙箱；所有会话共享同一个项目文件。
 
 ## 工作方式
 
-收到消息后，扩展会为对应的私聊用户或群聊创建（或复用）一个 tmux pane，并在其中运行主 pi 会话：
+收到消息后，扩展会为对应的私聊用户或群聊创建（或复用）一个 Zellij pane，并在其中运行主 pi 会话：
 
 ```text
 飞书 / Lark 私聊用户 ──┐
-                        ├── 独立 pi 会话 + tmux pane
+                        ├── 独立 pi 会话 + Zellij pane
 飞书 / Lark 群聊    ────┘
 ```
 
@@ -29,13 +29,13 @@
 
 - Node.js 22+
 - pi 0.85.1+，且已配置模型
-- tmux 3.2+
+- Zellij 0.44+
 - 飞书或 Lark 开放平台应用
 
-建议从专用 tmux 窗口启动 pi，以免调整 pane 布局影响日常工作窗口：
+在 Zellij 中启动 pi（可使用专用 tab 管理机器人会话）：
 
 ```sh
-tmux new -A -s pi
+zellij
 pi
 ```
 
@@ -102,11 +102,11 @@ pi install -l /absolute/path/to/pi-lark-bot
 | `/model` | 显示可用模型和当前会话模型 |
 | `/model provider/model` | 切换当前私聊或群聊会话的模型；保留历史并从下一条消息生效 |
 
-## tmux pane
+## Zellij pane
 
-新会话会在父 pi pane 的右侧通过 `split-window -d -h` 创建，不会抢走键盘焦点。创建或关闭 pane 后，扩展会以 120 ms 防抖应用 `select-layout ... even-horizontal`，因此会**均衡父 pi 所在整个 tmux 窗口**的 pane。
+新会话通过 `action new-pane --near-current-pane` 创建在父 pi 所在 tab，不会抢走键盘焦点。分屏遵循现有 Zellij 布局，不强制方向或等宽；建议保留 `auto_layout true`，由 Zellij 自动调整创建、关闭后的布局。
 
-扩展按精确的 `%pane_id` 关闭 pane；创建后使用 `respawn-pane` 直接启动主 pi，不等待 shell 提示符，也不会将远程消息打入 shell。pane 操作实现基于 `pi-interactive-subagents` 的 MIT 代码，并仅保留本项目所需部分；不依赖该扩展的安装、工具调用或生命周期。
+扩展按精确的 `terminal_<id>` 关闭 pane；创建时直接启动主 pi，不等待 shell 提示符，也不会将远程消息打入 shell。pane 操作位于 `src/zellij.ts`，基于 `pi-interactive-subagents` 的 MIT 代码，仅保留本项目所需部分；不依赖该扩展的安装、工具调用或生命周期。
 
 ## 本地存储与安全
 
@@ -137,7 +137,7 @@ npm run test:integration
 npm pack --dry-run
 ```
 
-集成测试使用独立 tmux socket/server、空配置、真实 pi TUI 和本地模拟模型，覆盖工具执行、流式回复、会话隔离、历史恢复、布局与 pane 清理；不会操作工作窗口，也不会消耗付费模型额度。
+集成测试使用独立 Zellij session、最小配置、真实 pi TUI 和本地模拟模型，覆盖工具执行、流式回复、会话隔离、历史恢复、焦点与 pane 清理；不会操作工作 session，也不会消耗付费模型额度。运行需要 Zellij 0.44+ 和 util-linux 的 `script` 命令。
 
 真实租户授权、权限审批和飞书/Lark 客户端显示效果仍须用自己的应用验收。
 

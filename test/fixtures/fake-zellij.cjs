@@ -39,18 +39,24 @@ if (process.argv[2] === "--child") {
   socket.on("close", () => { clearTimeout(watchdog); process.exit(0); });
 } else {
   const root = path.dirname(process.argv[1]);
-  const action = process.argv[2];
-  if (action === "split-window") {
-    fs.writeFileSync(path.join(root, `pane-${process.pid}.json`), JSON.stringify({ pid: null }));
-    console.log(`%${process.pid}`);
-  } else if (action === "respawn-pane") {
-    const id = process.argv[process.argv.indexOf("-t") + 1].slice(1);
-    const child = spawn(process.execPath, [__filename, "--child", process.argv.at(-1)], { detached: true, stdio: "ignore" });
+  const action = process.argv[3];
+  if (process.argv[2] === "--version") {
+    console.log("zellij 0.44.3");
+  } else if (action === "new-pane") {
+    const assert = require("node:assert/strict");
+    const args = process.argv.slice(4), command = args.slice(args.indexOf("--") + 1);
+    assert.deepEqual(args.slice(0, 2), ["--near-current-pane", "--name"]);
+    assert(!args.includes("--direction"));
+    assert.equal(command[0], process.execPath);
+    assert.equal(path.basename(command[1]), "launch-worker.cjs");
+    assert.equal(command.length, 3);
+    const child = spawn(process.execPath, [__filename, "--child", command[2]], { detached: true, stdio: "ignore" });
     child.unref();
-    fs.writeFileSync(path.join(root, `pane-${id}.json`), JSON.stringify({ pid: child.pid }));
-  } else if (action === "kill-pane") {
-    const id = process.argv.at(-1).slice(1), file = path.join(root, `pane-${id}.json`);
+    fs.writeFileSync(path.join(root, `pane-${process.pid}.json`), JSON.stringify({ pid: child.pid }));
+    console.log(`terminal_${process.pid}`);
+  } else if (action === "close-pane") {
+    const id = process.argv.at(-1).replace(/^terminal_/, ""), file = path.join(root, `pane-${id}.json`);
     try { const { pid } = JSON.parse(fs.readFileSync(file, "utf8")); process.kill(pid, "SIGTERM"); } catch {}
     try { fs.unlinkSync(file); } catch {}
-  } else if (action !== "select-layout") process.exitCode = 1;
+  } else process.exitCode = 1;
 }

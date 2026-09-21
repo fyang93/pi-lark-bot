@@ -1,5 +1,4 @@
-import { execFile as execFileCallback, execFileSync } from "node:child_process";
-import { promisify } from "node:util";
+import { execFileSync } from "node:child_process";
 import { createServer, type Server, type Socket } from "node:net";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
@@ -11,10 +10,9 @@ import { createRequire } from "node:module";
 import { privateDir, writePrivateJson } from "./storage.ts";
 import type { ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory } from "./types.ts";
 
-import { createSurface, closeSurface } from "./tmux.ts";
-const execFile = promisify(execFileCallback);
+import { createSurface, closeSurface } from "./zellij.ts";
 const MAX_FRAME = 8 * 1024 * 1024;
-export interface TmuxWorkersOptions {
+export interface ZellijWorkersOptions {
   cwd: string;
   stateDir?: string;
   appId: string;
@@ -81,7 +79,7 @@ class PaneWorker implements ConversationWorker {
   private active?: { id: string; onEvent: (event: WorkerEvent) => void; resolve: () => void; reject: (error: Error) => void };
   /** Keep the callback after a turn settles: extensions may trigger a later continuation in this same Pi session. */
   private readonly continuations = new Map<string, (event: WorkerEvent) => void>();
-  constructor(private options: TmuxWorkersOptions, private userId: string) {
+  constructor(private options: ZellijWorkersOptions, private userId: string) {
     this.sessionFile = resolve(options.stateDir ?? join(options.cwd, ".pi", "lark-bot"), "sessions", `${sessionKey(options.appId, userId)}.jsonl`);
   }
   snapshot(): PaneSnapshot { return { userId: this.userId, paneId: this.paneId, sessionFile: this.sessionFile, connected: this.isConnected() }; }
@@ -93,7 +91,7 @@ class PaneWorker implements ConversationWorker {
     const runId = randomBytes(16).toString("hex"), token = randomBytes(32).toString("hex");
     let resolveReady!: () => void;
     const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; this.rejectReady = reject; });
-    // Start the deadline before any filesystem, tmux, or pi startup operation.
+    // Start the deadline before any filesystem, Zellij, or pi startup operation.
     const timer = setTimeout(() => {
       this.rejectReady?.(new Error("Timed out waiting for pi worker startup"));
       void this.close();
@@ -149,15 +147,12 @@ class PaneWorker implements ConversationWorker {
     const launchFile = join(this.tempDir, "launch.json");
     await writePrivateJson(launchFile, { cli: piCliPath(), args, cwd: this.options.cwd, env: childEnv });
     this.checkOpen();
-    // tmux's server environment can be stale. Pass the actual parent environment
-    // privately, preserving the new pane's own TMUX_PANE in the launcher.
+    // Pass the actual parent environment privately, preserving the new pane's
+    // own Zellij identity in the launcher. Remote messages only use IPC.
     const launcher = fileURLToPath(new URL("./launch-worker.cjs", import.meta.url));
-    this.paneId = createSurface(`lark-${sessionKey(this.options.appId, this.userId).slice(0, 10)}`);
+    this.paneId = createSurface(`lark-${sessionKey(this.options.appId, this.userId).slice(0, 10)}`,
+      [process.execPath, launcher, launchFile]);
     this.checkOpen();
-    // Reuse the copied pane primitives, but start pi directly instead of typing
-    // commands into a potentially unready shell. Remote messages only use IPC.
-    await execFile("tmux", ["respawn-pane", "-k", "-t", this.paneId, "-c", "/", "--",
-      process.execPath, launcher, launchFile], { timeout: 10_000, signal: this.abort.signal });
   }
 
   private accept(socket: Socket, runId: string, token: string, resolveReady: () => void): void {
@@ -248,27 +243,27 @@ class PaneWorker implements ConversationWorker {
   }
 }
 
-export class TmuxWorkers implements WorkerFactory {
+export class ZellijWorkers implements WorkerFactory {
   private entries = new Map<string, { worker: PaneWorker; promise: Promise<PaneWorker>; started: boolean }>();
   private readonly models = new Map<string, ModelSpec>();
   private closed = false;
   private closing?: Promise<void>;
-  constructor(private options: TmuxWorkersOptions) {
-    if (!options.cwd || !options.appId) throw new Error("TmuxWorkers requires cwd and appId");
+  constructor(private options: ZellijWorkersOptions) {
+    if (!options.cwd || !options.appId) throw new Error("ZellijWorkers requires cwd and appId");
   }
   list(): PaneSnapshot[] { return [...this.entries.values()].map((entry) => entry.worker.snapshot()); }
   open(userId: string): Promise<ConversationWorker> {
-    if (this.closed) return Promise.reject(new Error("TmuxWorkers is closed"));
+    if (this.closed) return Promise.reject(new Error("ZellijWorkers is closed"));
     const old = this.entries.get(userId);
     if (old && (old.worker.isConnected() || !old.started)) return old.promise;
     const worker = new PaneWorker({ ...this.options, model: this.models.get(userId) ?? this.options.model }, userId);
     const entry = { worker, promise: undefined as unknown as Promise<PaneWorker>, started: false };
     entry.promise = Promise.resolve().then(async () => {
       await old?.worker.close();
-      if (this.closed) throw new Error("TmuxWorkers is closed");
+      if (this.closed) throw new Error("ZellijWorkers is closed");
       await worker.start();
       entry.started = true;
-      if (this.closed) { await worker.close(); throw new Error("TmuxWorkers is closed"); }
+      if (this.closed) { await worker.close(); throw new Error("ZellijWorkers is closed"); }
       return worker;
     }).catch(async (error) => {
       await worker.close();
@@ -290,7 +285,7 @@ export class TmuxWorkers implements WorkerFactory {
     this.models.delete(userId);
   }
   async setModel(userId: string, model: ModelSpec): Promise<void> {
-    if (this.closed) throw new Error("TmuxWorkers is closed");
+    if (this.closed) throw new Error("ZellijWorkers is closed");
     this.models.set(userId, model);
     const entry = this.entries.get(userId);
     if (entry) {

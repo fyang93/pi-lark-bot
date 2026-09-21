@@ -3,12 +3,13 @@ import { join } from "node:path";
 import { realpath } from "node:fs/promises";
 import { acquireLock, inspectLock, loadConfig, prepareState, writePrivateJson } from "./storage.ts";
 import type { BotController } from "./controller.ts";
+import { requireZellij } from "./zellij.ts";
 
 const commands = ["link", "on", "off", "help"];
 const help = [
   "/lark-bot — Show project configuration, listener and sessions",
   "/lark-bot link — Register a bot or enter existing app credentials",
-  "/lark-bot on — Enable listening manually (requires tmux)",
+  "/lark-bot on — Enable listening manually (requires Zellij 0.44+)",
   "/lark-bot off — Stop listening and close panes, preserving history",
 ].join("\n");
 
@@ -84,10 +85,7 @@ export default function larkBot(pi: ExtensionAPI): void {
         }
         let config = await loadConfig(stateDir);
         if (!config) throw new Error("Run /lark-bot link first.");
-        if (!process.env.TMUX || !/^%\d+$/.test(process.env.TMUX_PANE ?? "")) throw new Error("Start pi inside tmux before running /lark-bot on.");
-        const tmux = await pi.exec("tmux", ["-V"], { timeout: 5000 });
-        const version = tmux.stdout.match(/tmux\s+(\d+)\.(\d+)/);
-        if (tmux.code !== 0 || !version || Number(version[1]) < 3 || Number(version[1]) === 3 && Number(version[2]) < 2) throw new Error("tmux 3.2 or newer is required.");
+        requireZellij();
         if (!await ctx.ui.confirm("Enable remote code execution?", "New users require local approval (10-second timeout; default choice is Confirm), whether they contact the bot directly or @mention it in a group. Sessions share project files, and group replies are visible to group members.", { signal: setupAbort.signal })) return;
         if (shuttingDown) return;
         release = await acquireLock(stateDir);
@@ -95,7 +93,7 @@ export default function larkBot(pi: ExtensionAPI): void {
           // Configuration may have changed during the confirmation dialog.
           config = await loadConfig(stateDir);
           if (!config) throw new Error("Configuration changed. Check and retry.");
-          const [{ LarkTransport }, { TmuxWorkers }, { BotController }] = await Promise.all([
+          const [{ LarkTransport }, { ZellijWorkers }, { BotController }] = await Promise.all([
             import("./lark.ts"), import("./panes.ts"), import("./controller.ts"),
           ]);
           if (shuttingDown) { await stop(); return; }
@@ -104,13 +102,13 @@ export default function larkBot(pi: ExtensionAPI): void {
             if (Date.now() - lastErrorAt < 5000 || shuttingDown) return;
             lastErrorAt = Date.now();
             // Never dump SDK errors, subprocess objects, payloads or credentials.
-            const detail = error instanceof Error && /^(Lark (API|connection)|Pi worker|Timed out waiting for pi worker|Tmux did not|Unable to locate the pi CLI)/.test(error.message)
+            const detail = error instanceof Error && /^(Lark (API|connection)|Pi worker|Timed out waiting for pi worker|Zellij did not|Unable to locate the pi CLI)/.test(error.message)
               ? ` (${error.message.slice(0, 240)})` : "";
             ctx.ui.notify(`Lark bot operation failed${detail}. Check connectivity, app permissions and the session pane. Generated history is preserved locally.`, "error");
           };
           const transport = new LarkTransport(config, onError, undefined, join(stateDir, "attachments"));
           const instance = new BotController({ config, stateDir, transport,
-            workers: new TmuxWorkers({ cwd, stateDir, appId: config.appId,
+            workers: new ZellijWorkers({ cwd, stateDir, appId: config.appId,
               model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
               thinkingLevel: pi.getThinkingLevel() }),
             defaultModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,

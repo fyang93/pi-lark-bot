@@ -1,4 +1,4 @@
-// Executed inside a new tmux pane. No shell interpolation or remote text in argv.
+// Executed inside a new Zellij pane. No shell interpolation or remote text in argv.
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 let child;
@@ -10,7 +10,7 @@ try {
   finally { fs.closeSync(handle); }
   fs.unlinkSync(path); // one-use private environment handoff, never retain model API keys
   const env = { ...config.env };
-  for (const key of ["TMUX", "TMUX_PANE"]) {
+  for (const key of ["ZELLIJ", "ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
     else delete env[key];
   }
