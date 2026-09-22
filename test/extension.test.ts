@@ -12,7 +12,7 @@ function harness(cwd: string) {
   extension({ registerCommand(name: string, value: unknown) { commands.set(name, value); },
     on(name: string, handler: unknown) { handlers.set(name, handler); } } as unknown as ExtensionAPI);
   const ctx = { cwd, mode: "tui", isProjectTrusted: () => true,
-    ui: { notify: (text: string) => messages.push(text), setStatus() {} } } as unknown as ExtensionCommandContext;
+    ui: { notify: (text: string) => messages.push(text), setStatus() {}, theme: { fg: (_color: string, text: string) => text } } } as unknown as ExtensionCommandContext;
   return { commands, handlers, messages, ctx };
 }
 

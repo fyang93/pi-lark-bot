@@ -36,7 +36,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   };
   const setWaiting = (value: boolean): void => {
     waiting = value;
-    ctx?.ui.setStatus("lark-bot", value ? "Lark message waiting for local turn" : undefined);
+    ctx?.ui.setStatus("lark-bot", value ? ctx.ui.theme.fg("warning", "Lark: waiting") : undefined);
   };
   const cleanup = (): void => {
     stopping = true;

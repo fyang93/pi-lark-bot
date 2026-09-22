@@ -119,7 +119,10 @@ export default function larkBot(pi: ExtensionAPI): void {
               { signal, timeout: 10_000 },
             ),
             onError, onStatus: () => {
-              if (!shuttingDown) ctx.ui.setStatus("lark-bot", controller?.status.active ? `Lark ● ${controller.status.queued} running/queued` : undefined);
+              if (shuttingDown) return;
+              const jobs = controller?.status.active ? controller.status.queued : undefined;
+              ctx.ui.setStatus("lark-bot", jobs === undefined ? undefined
+                : ctx.ui.theme.fg("accent", jobs > 0 ? `Lark: ${jobs} job${jobs === 1 ? "" : "s"}` : "Lark: on"));
             },
           });
           transport.setCardActionHandler((messageId, chatId, operatorId, value) => instance.handleModelCardAction(messageId, chatId, operatorId, value));

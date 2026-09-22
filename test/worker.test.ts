@@ -47,7 +47,7 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
   let shutdownResolve!: () => void, submittedResolve!: () => void;
   const shutdown = new Promise<void>((resolve) => { shutdownResolve = resolve; });
   const submitted = new Promise<void>((resolve) => { submittedResolve = resolve; });
-  const context = { isIdle: () => idle, async abort() {}, shutdown: shutdownResolve, ui: { notify() {}, setStatus() {} } };
+  const context = { isIdle: () => idle, async abort() {}, shutdown: shutdownResolve, ui: { notify() {}, setStatus() {}, theme: { fg: (_color: string, text: string) => text } } };
   const emit = (name: string, event: unknown = {}) => handlers.get(name)?.(event, context);
   workerExtension({ on(name: string, handler: Function) { handlers.set(name, handler); },
     sendUserMessage(text: string) {
