@@ -310,19 +310,21 @@ test("SDK diagnostics reach the trace instead of being silenced, with the secret
     new LarkTransport(config, undefined, sdk, undefined, log);
 
     assert.equal(captured.loggerLevel, 2, "warnings must not be filtered out by level");
-    captured.logger.warn("no im.message.receive_v1 handle");
-    captured.logger.error("boom", { payload: "ignored" });
+    // The SDK's LoggerProxy passes its arguments as a single array.
+    captured.logger.warn(["no im.message.receive_v1 handle"]);
+    captured.logger.error(["[ws]", new Error("boom")], { text: "secret chat content" });
     captured.logger.info("routine chatter");
     captured.logger.debug("routine chatter");
     // Anything the SDK echoes back must not leak the credential.
-    captured.logger.warn(`request failed with ${config.appSecret}`);
+    captured.logger.warn([`request failed with ${config.appSecret}`]);
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     const lines = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
     assert.deepEqual(lines.map((l) => l.disposition), ["sdk_warn", "sdk_error", "sdk_warn"],
       "info and debug stay out of the trace");
     assert.equal(lines[0].note, "no im.message.receive_v1 handle");
-    assert.equal(lines[1].note, "boom", "non-string arguments are never recorded");
+    assert.equal(lines[1].note, "[ws] Error: boom {text}",
+      "arrays flatten, errors keep their message, objects contribute key names only");
     assert(!lines[2].note.includes(config.appSecret) && lines[2].note.includes("***"));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

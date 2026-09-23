@@ -124,10 +124,22 @@ export class LarkTransport implements BotTransport {
     appendFile(path, line, { mode: 0o600 }).catch(() => {});
   }
 
-  /** Record an SDK diagnostic. Only string arguments are kept, and never the app secret. */
+  /**
+   * Record an SDK diagnostic. The SDK's LoggerProxy hands its arguments over as
+   * one array, so they are flattened. Objects contribute their key names only:
+   * an SDK payload can carry message text, and this log promises not to hold any.
+   */
   private traceSdk(disposition: string, args: unknown[]): void {
     if (!this.eventLogPath) return;
-    const note = args.filter((arg): arg is string => typeof arg === "string").join(" ").slice(0, 300);
+    const parts = (value: unknown, depth = 0): string[] => {
+      if (typeof value === "string") return [value];
+      if (typeof value === "number" || typeof value === "boolean") return [String(value)];
+      if (value instanceof Error) return [`${value.name}: ${value.message}`];
+      if (Array.isArray(value)) return depth < 3 ? value.flatMap((item) => parts(item, depth + 1)) : [];
+      if (value && typeof value === "object") return [`{${Object.keys(value).slice(0, 12).join(",")}}`];
+      return [];
+    };
+    const note = parts(args).join(" ").slice(0, 300);
     this.write({ disposition, state: this._state, note: note.split(this.config.appSecret).join("***") });
   }
 
