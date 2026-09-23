@@ -69,14 +69,24 @@ export class LarkTransport implements BotTransport {
       error: (...args: unknown[]) => this.traceSdk("sdk_error", args),
       warn: (...args: unknown[]) => this.traceSdk("sdk_warn", args),
     }, quietLogger);
-    const common = { appId: config.appId, appSecret: config.appSecret, domain, httpInstance, logger, loggerLevel: 2 };
-    this.client = new sdk.Client(common);
+    const credentials = { appId: config.appId, appSecret: config.appSecret, domain, logger, loggerLevel: 2 };
+    // The bounded HTTP instance exists to cap REST calls. It was also handed to
+    // the WebSocket client, which the two implementations this one replaced
+    // never did, and a long connection has no business inheriting a 10s
+    // request budget.
+    this.client = new sdk.Client({ ...credentials, httpInstance });
     this.attachmentCache = attachmentCacheDir ? new AttachmentCache(attachmentCacheDir) : undefined;
     this.dispatcher = new sdk.EventDispatcher({ logger, loggerLevel: 2 });
-    this.dispatcher.register({ "im.message.receive_v1": (event) => this.receive(event), "card.action.trigger": (event) => this.cardAction(event) });
+    this.dispatcher.register({
+      "im.message.receive_v1": (event) => this.receive(event),
+      "card.action.trigger": (event) => this.cardAction(event),
+      // Subscribed by the platform alongside messages. Handled so the SDK stops
+      // reporting it as unregistered on every read receipt.
+      "im.message.message_read_v1": () => { this.trace("skip_read_receipt"); return undefined; },
+    });
     this.ws = new sdk.WSClient({
-      ...common,
-      handshakeTimeoutMs: API_TIMEOUT_MS,
+      ...credentials,
+      autoReconnect: true,
       onReady: () => { this.trace("ws_ready"); this.ready(); },
       onReconnecting: () => {
         this.trace("ws_reconnecting");

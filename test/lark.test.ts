@@ -328,3 +328,21 @@ test("SDK diagnostics reach the trace instead of being silenced, with the secret
     assert(!lines[2].note.includes(config.appSecret) && lines[2].note.includes("***"));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("the WebSocket client gets plain credentials, not the REST call budget", async () => {
+  let wsOptions: any, clientOptions: any;
+  const fake = fakeSdk();
+  const sdk = {
+    ...fake.sdk,
+    Client: class { constructor(options: any) { clientOptions = options; } im = {} as any;
+      async request() { return { code: 0, bot: { open_id: "ou_bot" } }; } },
+    WSClient: class { constructor(options: any) { wsOptions = options; } async start() {} close() {} },
+  } as unknown as LarkSdk;
+  new LarkTransport(config, undefined, sdk);
+
+  assert(clientOptions.httpInstance, "REST calls stay bounded");
+  assert.equal(wsOptions.httpInstance, undefined,
+    "a long connection must not inherit the REST request timeout");
+  assert.equal(wsOptions.handshakeTimeoutMs, undefined);
+  assert.equal(wsOptions.autoReconnect, true);
+});
