@@ -1,6 +1,6 @@
 {
   "name": "pi-lark-bot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Opt-in Feishu/Lark bot with independent per-user and per-group pi sessions in Zellij",
   "type": "module",
   "license": "MIT",

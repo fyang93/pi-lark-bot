@@ -5,6 +5,7 @@ import { acquireLock, inspectLock, loadAllowlist, loadConfig, loadPushTarget, pr
 import type { BotController } from "./controller.ts";
 import { registerPushTools } from "./push-tools.ts";
 import { requireZellij } from "./zellij.ts";
+import { missingBotPermissions, permissionInstructions } from "./registration.ts";
 
 const commands = ["link", "on", "off", "allow", "deny", "push", "help"];
 const help = [
@@ -196,7 +197,17 @@ export default function larkBot(pi: ExtensionAPI): void {
             const config = await connectBot(ctx, setupAbort.signal);
             if (!config || shuttingDown) return;
             await writePrivateJson(join(stateDir, "config.json"), config);
-            ctx.ui.notify("Credentials saved in project .pi/lark-bot/. Enable the bot, long-connection events and required permissions, then run /lark-bot on.", "info");
+            ctx.ui.notify("Credentials saved in project .pi/lark-bot/. Checking bot permissions…", "info");
+            const missing = await missingBotPermissions(config, setupAbort.signal);
+            if (shuttingDown) return;
+            if (missing?.length === 0) {
+              ctx.ui.notify("Required bot permissions are granted. Run /lark-bot on to start listening.", "info");
+            } else {
+              const title = missing ? "Missing bot permissions" : "Could not verify bot permissions";
+              const note = permissionInstructions(config, missing);
+              ctx.ui.notify(`${title}\n${note}`, "warning");
+              await ctx.ui.confirm(title, `${note}\n\nClose this notice when finished (credentials are already saved).`, { signal: setupAbort.signal });
+            }
           } finally { await unlock(); }
           return;
         }

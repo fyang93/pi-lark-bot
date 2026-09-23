@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { gunzipSync } from "node:zlib";
-import { registerBot } from "../src/registration.ts";
+import { missingBotPermissions, permissionInstructions, registerBot } from "../src/registration.ts";
 
 const originalFetch = globalThis.fetch;
 function response(body: unknown, status = 200): Response {
@@ -21,7 +21,7 @@ test("registers with begin, addon URL, pending poll, and returns credentials", a
   }) as typeof fetch;
   let shown = "";
   const result = await registerBot({ brand: "feishu", signal: new AbortController().signal, onUrl: (url) => { shown = url; } });
-  assert.deepEqual(result, { appId: "cli_new", appSecret: "secret", brand: "feishu", ownerOpenId: "ou_owner" });
+  assert.deepEqual(result, { appId: "cli_new", appSecret: "secret", brand: "feishu" });
   assert.equal(calls[0]!.body, "action=begin&archetype=PersonalAgent&auth_method=client_secret&request_user_info=open_id");
   assert.match(shown, /createOnly=true/);
   const addons = JSON.parse(gunzipSync(Buffer.from(new URL(shown).searchParams.get("addons")!, "base64url")).toString("utf8"));
@@ -29,6 +29,42 @@ test("registers with begin, addon URL, pending poll, and returns credentials", a
   assert.deepEqual(addons.events.items.tenant, ["im.message.receive_v1"]);
   assert(addons.scopes.tenant.includes("im:message.p2p_msg:readonly"));
   assert.equal(new URL(shown).hostname, "open.feishu.cn");
+  const permissionUrl = new URL(permissionInstructions(result).split("\n")[1]!);
+  assert.equal(permissionUrl.hostname, "open.feishu.cn");
+  assert.equal(permissionUrl.pathname, "/page/scope-apply");
+  assert.equal(permissionUrl.searchParams.get("clientID"), result.appId);
+  assert.deepEqual(permissionUrl.searchParams.get("scopes")!.split(","), addons.scopes.tenant);
+  assert(!permissionUrl.href.includes(result.appSecret));
+});
+
+test("permission checks distinguish tenant grants, missing grants and an unavailable check", async () => {
+  const config = { brand: "lark" as const, appId: "cli_existing", appSecret: "private-secret" };
+  const required = new URL(permissionInstructions(config).split("\n")[1]!).searchParams.get("scopes")!.split(",");
+  let scopes: unknown = required.map((scope_name) => ({ scope_name, scope_type: "tenant", grant_status: 1 }));
+  globalThis.fetch = (async (input, init) => {
+    const url = new URL(String(input));
+    assert.equal(url.hostname, "open.larksuite.com");
+    assert(init?.signal);
+    if (url.pathname.endsWith("/tenant_access_token/internal")) {
+      assert.equal(init?.method, "POST");
+      assert.deepEqual(JSON.parse(String(init?.body)), { app_id: config.appId, app_secret: config.appSecret });
+      return response({ code: 0, tenant_access_token: "private-token" });
+    }
+    assert.equal(url.pathname, "/open-apis/application/v6/scopes");
+    assert.equal(new Headers(init?.headers).get("authorization"), "Bearer private-token");
+    return response({ code: 0, data: { scopes } });
+  }) as typeof fetch;
+  const signal = new AbortController().signal;
+  assert.deepEqual(await missingBotPermissions(config, signal), []);
+  scopes = required.map((scope_name, index) => ({ scope_name, scope_type: index === 0 ? "user" : "tenant", grant_status: index === 1 ? 0 : 1 }));
+  const missing = await missingBotPermissions(config, signal);
+  assert.deepEqual(missing, required.slice(0, 2));
+  const url = new URL(permissionInstructions(config, missing).split("\n")[1]!);
+  assert.deepEqual(url.searchParams.get("scopes")!.split(","), missing);
+  scopes = undefined;
+  assert.equal(await missingBotPermissions(config, signal), undefined);
+  globalThis.fetch = (async () => { throw new Error("private-secret"); }) as typeof fetch;
+  assert.equal(await missingBotPermissions(config, signal), undefined);
 });
 
 test("connects an existing app through its QR authorization", async () => {
@@ -82,6 +118,19 @@ test("cancels before begin and while polling", async () => {
   await new Promise((resolve) => setTimeout(resolve, 10));
   duringPoll.abort();
   await assert.rejects(pending, /aborted/);
+});
+
+test("cancels the polling delay without making a poll request", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return response({ verification_uri_complete: "https://accounts.feishu.cn/v", device_code: "d", expires_in: 60, interval: 30 });
+  }) as typeof fetch;
+  await assert.rejects(registerBot({ brand: "feishu", signal: controller.signal,
+    onUrl: () => { setImmediate(() => controller.abort()); },
+  }), /aborted/);
+  assert.equal(calls, 1);
 });
 
 test("expires without polling when the server gives an expired device code", async () => {

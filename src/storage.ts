@@ -141,31 +141,28 @@ export async function inspectLock(stateDir: string): Promise<{ state: "none" | "
 export async function acquireLock(stateDir: string): Promise<() => Promise<void>> {
   const path = join(stateDir, "controller.lock");
   const token = randomUUID();
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const handle = await open(path, "wx", 0o600);
-      try { await handle.writeFile(JSON.stringify({ pid: process.pid, token })); }
-      finally { await handle.close(); }
-      return async () => {
-        try {
-          const record = await readPrivateJson(path) as { token?: string };
-          if (record.token === token) await unlink(path);
-        } catch (error) { if (!isMissing(error)) throw error; }
-      };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const record = await readPrivateJson(path) as { pid?: number };
-      if (!record || !Number.isSafeInteger(record.pid) || record.pid! <= 0) {
-        throw new Error("Invalid controller.lock; inspect it manually before removing it.");
-      }
-      try { process.kill(record.pid!, 0); }
-      catch (e) {
-        if ((e as NodeJS.ErrnoException).code === "ESRCH") {
-          throw new Error(`Stale controller.lock found. Confirm the previous controller and its panes have exited, then remove ${path} and retry.`);
-        }
-      }
-      throw new Error("This project already has a running lark-bot controller.");
+  try {
+    const handle = await open(path, "wx", 0o600);
+    try { await handle.writeFile(JSON.stringify({ pid: process.pid, token })); }
+    finally { await handle.close(); }
+    return async () => {
+      try {
+        const record = await readPrivateJson(path) as { token?: string };
+        if (record.token === token) await unlink(path);
+      } catch (error) { if (!isMissing(error)) throw error; }
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const record = await readPrivateJson(path) as { pid?: number };
+    if (!record || !Number.isSafeInteger(record.pid) || record.pid! <= 0) {
+      throw new Error("Invalid controller.lock; inspect it manually before removing it.");
     }
+    try { process.kill(record.pid!, 0); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ESRCH") {
+        throw new Error(`Stale controller.lock found. Confirm the previous controller and its panes have exited, then remove ${path} and retry.`);
+      }
+    }
+    throw new Error("This project already has a running lark-bot controller.");
   }
-  throw new Error("Could not acquire the project controller lock.");
 }

@@ -45,6 +45,10 @@ test("exclusive lock prevents duplicate project listeners and releases idempoten
     await unlock(); await unlock();
     assert.deepEqual(await inspectLock(root), { state: "none" });
     const unlock2 = await acquireLock(root); await unlock2();
+    const lockPath = join(root, "controller.lock");
+    await writePrivateJson(lockPath, { pid: 0 });
+    await assert.rejects(acquireLock(root), /Invalid controller.lock/);
+    assert.deepEqual(await readPrivateJson(lockPath), { pid: 0 });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

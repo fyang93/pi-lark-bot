@@ -190,8 +190,14 @@ test("uses idempotent create/reply/patch cards and bounded HTTP/retries", async 
   assert.match(create.data.uuid, /^[0-9a-f-]{36}$/);
   assert.equal(JSON.parse(create.data.content).elements[0].content, "progress");
   assert.equal(fake.calls.reply[0].path.message_id, "om_1");
-  assert.equal(fake.calls.reply[0].data.uuid, fake.calls.reply[0].data.uuid);
+  assert.notEqual(fake.calls.reply[0].data.uuid, create.data.uuid);
   assert.equal(fake.calls.patch[0].path.message_id, "out-1");
+  const customCard = { schema: "2.0", body: { elements: [] } };
+  assert.equal(await transport.sendCard("oc_1", customCard), "out-1");
+  assert.equal(await transport.sendCard("oc_1", customCard, "om_2"), "out-2");
+  assert.deepEqual(JSON.parse(fake.calls.create[1].data.content), customCard);
+  assert.deepEqual(JSON.parse(fake.calls.reply[1].data.content), customCard);
+  assert.equal(fake.calls.reply[1].path.message_id, "om_2");
   await fake.clientOptions().httpInstance.request({ timeout: 50_000, url: "token" });
   assert.equal(fake.calls.http[0].timeout, 10_000);
 

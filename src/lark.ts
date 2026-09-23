@@ -112,16 +112,7 @@ export class LarkTransport implements BotTransport {
   }
 
   async send(chatId: string, text: string, replyTo?: string): Promise<string> {
-    // Lark uses uuid for idempotency. Keep it stable across retries of this one send.
-    const data = { msg_type: "interactive", content: JSON.stringify(card(text)), uuid: randomUUID() };
-    const response = replyTo
-      ? await this.request(() => this.client.im.v1.message.reply({ data, path: { message_id: replyTo } }))
-      : await this.request(() => this.client.im.v1.message.create({
-        data: { ...data, receive_id: chatId }, params: { receive_id_type: "chat_id" },
-      }));
-    const messageId = response?.data?.message_id;
-    if (typeof messageId !== "string" || !messageId) throw this.failure();
-    return messageId;
+    return this.sendCard(chatId, card(text), replyTo);
   }
 
   async update(messageId: string, text: string): Promise<void> { await this.updateCard(messageId, card(text)); }
@@ -164,6 +155,7 @@ export class LarkTransport implements BotTransport {
   }
 
   async sendCard(chatId: string, value: object, replyTo?: string): Promise<string> {
+    // Lark uses uuid for idempotency. Keep it stable across retries of this one send.
     const data = { msg_type: "interactive", content: JSON.stringify(value), uuid: randomUUID() };
     const response = replyTo
       ? await this.request(() => this.client.im.v1.message.reply({ data, path: { message_id: replyTo } }))

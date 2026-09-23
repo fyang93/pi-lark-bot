@@ -4,6 +4,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import extension from "../src/index.ts";
+import { permissionInstructions } from "../src/registration.ts";
 import { acquireLock, prepareState, readPrivateJson, writePrivateJson } from "../src/storage.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
@@ -51,6 +52,45 @@ test("status reports a project lock held by another controller instance", async 
     const h = harness(cwd); await h.commands.get("lark-bot").handler("", h.ctx);
     assert(h.messages.at(-1)?.includes("another pi holds the project lock"));
   } finally { await unlock(); await rm(cwd, { recursive: true, force: true }); }
+});
+
+test("link only shows a permission dialog when grants are missing or unknown", async () => {
+  const originalFetch = globalThis.fetch;
+  const required = new URL(permissionInstructions({ brand: "feishu", appId: "cli_test" }).split("\n")[1]!)
+    .searchParams.get("scopes")!.split(",");
+  try {
+    for (const state of ["granted", "missing", "unknown"]) {
+      const cwd = await mkdtemp(join(tmpdir(), "lark-link-"));
+      try {
+        const h = harness(cwd);
+        let choice = 0;
+        const dialogs: string[] = [];
+        h.ctx.ui.select = async () => choice++ === 0 ? "Feishu" : "Enter existing App ID / App Secret";
+        h.ctx.ui.input = async () => "cli_test";
+        h.ctx.ui.confirm = async (_title, body) => { dialogs.push(body); return true; };
+        h.ctx.ui.custom = (async (factory: any) => new Promise((resolve) => {
+          const component = factory({ requestRender() {} }, {}, {}, resolve);
+          component.handleInput("private-secret"); component.handleInput("\r"); component.dispose();
+        })) as typeof h.ctx.ui.custom;
+        globalThis.fetch = (async (input) => {
+          if (state === "unknown") throw new Error("private-secret");
+          return new Response(JSON.stringify(String(input).includes("tenant_access_token")
+            ? { code: 0, tenant_access_token: "token" }
+            : { code: 0, data: { scopes: required.slice(state === "missing" ? 1 : 0)
+              .map((scope_name) => ({ scope_name, scope_type: "tenant", grant_status: 1 })) } }),
+          { headers: { "content-type": "application/json" } });
+        }) as typeof fetch;
+        await h.commands.get("lark-bot").handler("link", h.ctx);
+        assert.equal(dialogs.length, state === "granted" ? 0 : 1);
+        if (dialogs.length) assert(dialogs[0]!.includes("https://open.feishu.cn/page/scope-apply?"));
+        assert(![...h.messages, ...dialogs].join("\n").includes("private-secret"));
+        const stored = await readPrivateJson(join(cwd, ".pi/lark-bot/config.json")) as { appId: string };
+        assert.equal(stored.appId, "cli_test", "failed checks must not discard saved credentials");
+        assert.equal(h.tools.size, 0, "link never starts the listener");
+        assert(!h.commands.get("lark-bot").getArgumentCompletions("").includes("permissions"));
+      } finally { await rm(cwd, { recursive: true, force: true }); }
+    }
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test("worker process never registers a second bot listener command", () => {
