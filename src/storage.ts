@@ -1,8 +1,8 @@
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { BotConfig } from "./types.ts";
+import type { BotConfig, PushTarget } from "./types.ts";
 
 export function isMissing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -56,6 +56,52 @@ export async function loadConfig(stateDir: string): Promise<BotConfig | undefine
     }
     return validateConfig(await readPrivateJson(join(stateDir, "config.json")));
   } catch (error) { if (isMissing(error)) return undefined; throw error; }
+}
+
+/** Allowlisted senders are user open_ids only; group chats are never authorized as a unit. */
+export function validateAllowlist(value: unknown): { appId: string; users: string[] } {
+  const stored = value as { appId?: unknown; users?: unknown } | null;
+  if (!stored || typeof stored.appId !== "string" || !Array.isArray(stored.users) ||
+    stored.users.some((user) => typeof user !== "string" || !user)) throw new Error("Invalid allowlist.json");
+  return { appId: stored.appId, users: stored.users as string[] };
+}
+
+/** An allowlist written under a different App ID never carries over. */
+export async function loadAllowlist(stateDir: string, appId: string): Promise<Set<string>> {
+  try {
+    const stored = validateAllowlist(await readPrivateJson(join(stateDir, "allowlist.json")));
+    return new Set(stored.appId === appId ? stored.users : []);
+  } catch (error) { if (isMissing(error)) return new Set(); throw error; }
+}
+
+export async function saveAllowlist(stateDir: string, appId: string, users: Iterable<string>): Promise<void> {
+  await writePrivateJson(join(stateDir, "allowlist.json"), { appId, users: [...new Set(users)].sort() });
+}
+
+export function validatePushTarget(value: unknown): PushTarget {
+  const target = value as Partial<PushTarget> | null;
+  if (!target || target.version !== 1 || typeof target.appId !== "string" || !target.appId ||
+    typeof target.chatId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(target.chatId) ||
+    (target.chatType !== "p2p" && target.chatType !== "group")) {
+    throw new Error("Invalid push-target.json: expected appId, chatId and chatType.");
+  }
+  return { version: 1, appId: target.appId, chatId: target.chatId, chatType: target.chatType,
+    setBy: typeof target.setBy === "string" ? target.setBy : "",
+    setAt: typeof target.setAt === "string" ? target.setAt : "" };
+}
+
+/** Absent, or stored under another App ID, both mean "no target": pushing stays disabled. */
+export async function loadPushTarget(stateDir: string, appId: string): Promise<PushTarget | undefined> {
+  try {
+    const target = validatePushTarget(await readPrivateJson(join(stateDir, "push-target.json")));
+    return target.appId === appId ? target : undefined;
+  } catch (error) { if (isMissing(error)) return undefined; throw error; }
+}
+
+export async function savePushTarget(stateDir: string, target: PushTarget | undefined): Promise<void> {
+  const path = join(stateDir, "push-target.json");
+  if (target) await writePrivateJson(path, target);
+  else await rm(path, { force: true });
 }
 
 /** Add ignore before any credential is created; never modify global Git configuration. */

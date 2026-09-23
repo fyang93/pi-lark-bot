@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BotController, ProgressMessage, splitText } from "../src/controller.ts";
+import { BotController, ProgressMessage, senderCode, splitText } from "../src/controller.ts";
 import type { BotTransport, IncomingMessage, WorkerFactory } from "../src/types.ts";
 
 const config = { version: 1 as const, brand: "feishu" as const, appId: "cli_test", appSecret: "secret" };
@@ -71,7 +71,7 @@ test("direct and group senders require approval and share the persisted user all
     assert(calls.includes("ou_allowed|first") && calls.includes("ou_allowed|second"));
     assert(calls.includes("group:oc_room|ou_group: hello"));
     assert(!calls.some((x) => x.includes("denied")));
-    assert(transport.sends.some((x) => x.chat === "chat_ou_denied" && x.text.includes("未获得")));
+    assert(transport.sends.some((x) => x.chat === "chat_ou_denied" && x.text.includes("本机拒绝启动")));
     assert.equal(bot.status.allowlisted, 2);
     await bot.stop();
 
@@ -301,4 +301,116 @@ test("UTF8 chunking is lossless, including supplementary Unicode", () => {
   const chunks = splitText(text);
   assert.equal(chunks.join(""), text);
   assert(chunks.every((x) => Buffer.byteLength(x) <= 12_000));
+});
+
+test("rejected senders get a code the operator can allowlist, and the picker list stays bounded", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-denied-"));
+  try {
+    const transport = new FakeTransport();
+    const workers: WorkerFactory = { async open() { return { async run() {}, async close() {} }; }, async close() {} };
+    const bot = new BotController({ config, stateDir: dir, transport, workers, authorizeUser: async () => false });
+    await bot.start();
+    for (let i = 0; i < 25; i++) await bot.receive(msg(`m${i}`, `ou_user${i}`));
+    await bot.receive(msg("again", "ou_user24"));
+    await bot.drain();
+
+    const denied = bot.listDenied();
+    assert.equal(denied.length, 5, "the in-memory picker list is capped");
+    assert.equal(new Set(denied.map((entry) => entry.userId)).size, 5, "one entry per sender");
+    assert.equal(denied[0]!.userId, "ou_user24", "most recent first");
+    assert(transport.sends.some((send) => send.text.includes(`授权码：${senderCode("ou_user24")}`)));
+
+    assert.equal((await bot.allow("nonsense")).ok, false);
+    assert.equal((await bot.allow(senderCode("ou_user24"))).ok, true);
+    assert(!bot.listDenied().some((entry) => entry.userId === "ou_user24"), "allowlisting clears the pending entry");
+    assert.equal(bot.status.allowlisted, 1);
+    assert.equal((await bot.allow("ou_never_seen")).ok, true, "a full open_id needs no rejection history");
+    assert.equal((await bot.deny(senderCode("ou_never_seen"))).ok, true, "deny resolves a code like allow does");
+    assert.equal((await bot.deny("ou_never_seen")).ok, false);
+    assert.equal((await bot.deny("")).ok, false);
+    assert.equal(bot.status.allowlisted, 1);
+    await bot.stop();
+
+    const restored = new BotController({ config, stateDir: dir, transport: new FakeTransport(), workers });
+    await restored.start();
+    assert.equal(restored.status.allowlisted, 1, "manual allowlisting persists");
+    assert.equal(restored.listDenied().length, 0, "rejection history never outlives the listener");
+    await restored.stop();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("the push target is set from the worker's own chat, persists, and gates pushing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-push-"));
+  try {
+    const transport = new FakeTransport();
+    const workers: WorkerFactory = {
+      async open() { return { async run(_text, emit) { emit({ type: "done", text: "ok" }); }, async close() {} }; },
+      async close() {},
+    };
+    const notices: string[] = [];
+    const bot = new BotController({ config, stateDir: dir, transport, workers, onNotice: (text) => notices.push(text) });
+    await bot.start();
+
+    assert.equal((await bot.push("nothing yet")).ok, false, "no target means no pushing");
+    assert.equal((await bot.handleWorkerRequest("group:oc_team", { action: "set-target" })).ok, false,
+      "a worker with no seen conversation cannot set a target");
+
+    const group: IncomingMessage = { id: "g1", userId: "ou_a", chatId: "oc_team", text: "hi", chatType: "group", mentionedBot: true };
+    await bot.receive(group);
+    await bot.drain();
+    assert.equal((await bot.handleWorkerRequest("group:oc_team", { action: "set-target" })).ok, true);
+    assert(notices.some((text) => text.includes("oc_team")));
+    assert.deepEqual(bot.status.pushTarget, { chatId: "oc_team", chatType: "group" });
+
+    transport.sends.length = 0;
+    assert.equal((await bot.push("build finished")).ok, true);
+    assert.deepEqual(transport.sends, [{ chat: "oc_team", text: "build finished", reply: undefined }],
+      "a push is a plain message, never a reply");
+    assert.equal((await bot.push("   ")).ok, false);
+    await bot.stop();
+
+    const restored = new BotController({ config, stateDir: dir, transport: new FakeTransport(), workers });
+    await restored.start();
+    assert.deepEqual(restored.status.pushTarget, { chatId: "oc_team", chatType: "group" });
+    assert.equal((await restored.handleWorkerRequest("group:oc_team", { action: "clear-target" })).ok, true);
+    assert.equal(restored.status.pushTarget, undefined);
+    assert.equal((await restored.push("after clear")).ok, false);
+    await restored.stop();
+
+    const other = new BotController({ config: { ...config, appId: "cli_other" }, stateDir: dir, transport: new FakeTransport(), workers });
+    await other.start();
+    assert.equal(other.status.pushTarget, undefined, "a target never carries over to another app");
+    await other.stop();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("pushes are rate limited and truncated, and stop with the listener", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-push-limit-"));
+  try {
+    const transport = new FakeTransport();
+    const workers: WorkerFactory = { async open() { return { async run() {}, async close() {} }; }, async close() {} };
+    const bot = new BotController({ config, stateDir: dir, transport, workers });
+    await bot.start();
+    await bot.setPushTarget({ version: 1, appId: config.appId, chatId: "oc_team", chatType: "group", setBy: "local", setAt: "" });
+
+    const long = "x".repeat(200_000);
+    transport.sends.length = 0;
+    assert.equal((await bot.push(long)).ok, true);
+    assert.equal(transport.sends.length, 4, "an oversized push is capped at four cards");
+    assert(transport.sends.at(-1)!.text.endsWith("（内容过长，已截断）"));
+
+    for (let i = 0; i < 15; i++) assert.equal((await bot.push(`n${i}`)).ok, true);
+    assert.equal(transport.sends.length, 19);
+    const wholePush = await bot.push(long);
+    assert.equal(wholePush.ok, false, "a multi-card push is rejected rather than half sent");
+    assert.equal(transport.sends.length, 19, "nothing was sent for the rejected push");
+    assert.equal((await bot.push("last one")).ok, true, "a single card still fits the remaining budget");
+    const blocked = await bot.push("one too many");
+    assert.equal(blocked.ok, false);
+    assert(blocked.text.includes("过于频繁"));
+
+    await bot.stop();
+    assert.equal((await bot.push("after stop")).ok, false);
+    assert.equal((await bot.handleWorkerRequest("ou_a", { action: "push", text: "after stop" })).ok, false);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

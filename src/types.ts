@@ -27,6 +27,25 @@ export function conversationKey(message: IncomingMessage): string {
   return message.chatType === "group" ? `group:${message.chatId}` : message.userId;
 }
 
+/** Global, single, optional push destination. Absent means pushing is disabled. */
+export interface PushTarget {
+  version: 1;
+  appId: string;
+  chatId: string;
+  chatType: "p2p" | "group";
+  /** Conversation key that set it, for local diagnostics only. */
+  setBy: string;
+  setAt: string;
+}
+
+/** Worker-initiated request over the controller IPC socket. */
+export type WorkerRequest =
+  | { action: "push"; text: string }
+  | { action: "set-target" }
+  | { action: "clear-target" }
+  | { action: "target-status" };
+export interface WorkerResponse { ok: boolean; text: string }
+
 export type WorkerEvent =
   | { type: "progress"; text: string }
   | { type: "text"; text: string }

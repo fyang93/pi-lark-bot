@@ -1,10 +1,13 @@
 import { createConnection, type Socket } from "node:net";
+import { randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { WorkerEvent } from "./types.ts";
+import { registerPushTools } from "./push-tools.ts";
+import type { WorkerEvent, WorkerRequest, WorkerResponse } from "./types.ts";
 
 type Prompt = { id: string; text: string };
 const MAX_FRAME_BYTES = 512 * 1024;
 const MAX_PROMPT_BYTES = 64_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 function textFrom(message: any): string {
   if (typeof message?.content === "string") return message.content;
   if (!Array.isArray(message?.content)) return "";
@@ -30,10 +33,24 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   let stopping = false, promptOpen = false, waiting = false;
   let handoffTimer: NodeJS.Timeout | undefined, textTimer: NodeJS.Timeout | undefined, retryTimer: NodeJS.Timeout | undefined;
   let queuedText: { id: string; text: string } | undefined;
+  const requests = new Map<string, (response: WorkerResponse) => void>();
 
   const send = (message: object): void => {
     if (socket && !socket.destroyed && !socket.writableEnded) socket.write(`${JSON.stringify(message)}\n`);
   };
+  /** Ask the controller to act. The worker holds no bot credentials, so it can only ask. */
+  const request = (payload: WorkerRequest): Promise<WorkerResponse> => new Promise((resolve) => {
+    if (stopping || !socket || socket.destroyed || socket.writableEnded) {
+      resolve({ ok: false, text: "与 Lark 控制端的连接不可用。" }); return;
+    }
+    const id = randomBytes(12).toString("hex");
+    const timer = setTimeout(() => {
+      requests.delete(id);
+      resolve({ ok: false, text: "Lark 控制端超时未响应。" });
+    }, REQUEST_TIMEOUT_MS);
+    requests.set(id, (response) => { clearTimeout(timer); resolve(response); });
+    send({ type: "request", id, ...payload });
+  });
   const setWaiting = (value: boolean): void => {
     waiting = value;
     ctx?.ui.setStatus("lark-bot", value ? ctx.ui.theme.fg("warning", "Lark: waiting") : undefined);
@@ -41,6 +58,8 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   const cleanup = (): void => {
     stopping = true;
     clearTimeout(handoffTimer); clearTimeout(textTimer); clearTimeout(retryTimer);
+    for (const resolve of requests.values()) resolve({ ok: false, text: "Lark 会话正在关闭。" });
+    requests.clear();
     queuedText = undefined; pending = undefined; dispatching = undefined; active = undefined; lastRemoteId = undefined;
     awaitingSubagent = false; spawnedSubagentThisTurn = false;
     setWaiting(false);
@@ -102,6 +121,14 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
       const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
       let message: any;
       try { message = JSON.parse(line); } catch { socket?.destroy(); return; }
+      if (message && message.type === "response" && typeof message.id === "string") {
+        const resolve = requests.get(message.id);
+        if (resolve) {
+          requests.delete(message.id);
+          resolve({ ok: message.ok === true, text: typeof message.text === "string" ? message.text : "" });
+        }
+        continue;
+      }
       if (!message || message.type !== "prompt" || !ctx || typeof message.id !== "string" || !message.id ||
         typeof message.text !== "string" || Buffer.byteLength(message.text) > MAX_PROMPT_BYTES || pending || dispatching || active) {
         socket?.destroy(); return;
@@ -110,6 +137,13 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
       dispatch();
     }
   };
+
+  if (socketPath) {
+    registerPushTools(pi, {
+      push: (text) => request({ action: "push", text }),
+      target: (action) => request({ action: action === "set" ? "set-target" : action === "clear" ? "clear-target" : "target-status" }),
+    });
+  }
 
   pi.on("session_start", (_event, eventCtx) => {
     ctx = eventCtx;

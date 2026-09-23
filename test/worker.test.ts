@@ -49,7 +49,9 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
   const submitted = new Promise<void>((resolve) => { submittedResolve = resolve; });
   const context = { isIdle: () => idle, async abort() {}, shutdown: shutdownResolve, ui: { notify() {}, setStatus() {}, theme: { fg: (_color: string, text: string) => text } } };
   const emit = (name: string, event: unknown = {}) => handlers.get(name)?.(event, context);
+  const tools = new Map<string, any>();
   workerExtension({ on(name: string, handler: Function) { handlers.set(name, handler); },
+    registerTool(tool: any) { tools.set(tool.name, tool); },
     sendUserMessage(text: string) {
       prompts.push(text); submittedResolve();
       if (options.accept !== false) { emit("input", { source: "extension", text }); emit("before_agent_start", { prompt: text }); }
@@ -60,7 +62,8 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
   const until = async (type: string) => { for (;;) { const value = await next(); if (value.type === type) return value; } };
   assert.deepEqual(await next(), { type: "hello", runId: "run", token: "token" });
   assert.deepEqual(await next(), { type: "ready" });
-  return { messages, prompts, next, until, emit, submitted, shutdown,
+  return { messages, prompts, tools, next, until, emit, submitted, shutdown,
+    reply(id: string, response: { ok: boolean; text: string }) { peer!.write(`${JSON.stringify({ type: "response", id, ...response })}\n`); },
     idle(value: boolean) { idle = value; },
     prompt(text = "hello") { peer!.write(`${JSON.stringify({ type: "prompt", id: "p1", text })}\n`); },
     disconnect() { peer!.destroy(); },
@@ -160,4 +163,31 @@ test("an intercepted handoff times out and shuts down rather than hanging or acc
   assert.equal((await h.until("done")).error, true);
   await h.shutdown;
   assert.deepEqual(h.prompts, ["hello"]);
+});
+
+test("push tools ask the controller instead of holding credentials", { timeout: 3000 }, async (t) => {
+  const h = await harness(t, { groupChatId: "oc_team" });
+  const push = h.tools.get("lark_push")!;
+  const target = h.tools.get("lark_push_target")!;
+  assert.deepEqual(Object.keys(push.parameters.properties), ["text"], "the model never supplies a chat ID");
+  assert.deepEqual(Object.keys(target.parameters.properties), ["action"]);
+
+  const sent = push.execute("t1", { text: "build finished" });
+  const request = await h.until("request");
+  assert.equal(request.action, "push");
+  assert.equal(request.text, "build finished");
+  h.reply(request.id, { ok: true, text: "已推送到群聊 oc_team。" });
+  assert.deepEqual((await sent).content, [{ type: "text", text: "已推送到群聊 oc_team。" }]);
+
+  const setting = target.execute("t2", { action: "set" });
+  const second = await h.until("request");
+  assert.equal(second.action, "set-target");
+  assert.equal(second.text, undefined, "setting the target carries no chat ID from the model");
+  h.reply(second.id, { ok: false, text: "无法确定当前会话所属的聊天。" });
+  await assert.rejects(setting, /无法确定当前会话所属的聊天/, "a refused request fails the tool call");
+
+  const orphan = push.execute("t3", { text: "after disconnect" });
+  await h.until("request");
+  h.disconnect();
+  await assert.rejects(orphan, /关闭|不可用/, "a pending request settles when the pane goes away");
 });

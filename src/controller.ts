@@ -1,6 +1,6 @@
 import { join } from "node:path";
-import { isMissing, readPrivateJson, writePrivateJson } from "./storage.ts";
-import { conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type ModelSpec, type WorkerFactory, type WorkerEvent } from "./types.ts";
+import { isMissing, loadAllowlist, loadPushTarget, readPrivateJson, saveAllowlist, savePushTarget, writePrivateJson } from "./storage.ts";
+import { conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type ModelSpec, type PushTarget, type WorkerFactory, type WorkerEvent, type WorkerRequest, type WorkerResponse } from "./types.ts";
 import { modelPickerCard, modelSelectedCard, parseModelCardAction } from "./model-card.ts";
 
 /** Conservative UTF-8 payload bound, including room for card JSON overhead. */
@@ -74,6 +74,33 @@ export interface ControllerOptions {
   streamInterval?: number;
   /** Ask the local operator whether a previously unseen sender may use the bot. */
   authorizeUser?: (userId: string, message: IncomingMessage, signal: AbortSignal) => Promise<boolean>;
+  /** Surface a state change, such as a new push target, in the local pi TUI. */
+  onNotice?: (text: string) => void;
+}
+
+/** Pushes are unsolicited, so bound both their size and their rate. */
+const PUSH_WINDOW_MS = 60_000, PUSH_MAX_PER_WINDOW = 20, PUSH_MAX_PARTS = 4;
+/** Recent denials the local operator can pick from; never written to disk. */
+const DENIED_LIMIT = 5;
+
+export interface DeniedSender {
+  userId: string;
+  /** Last characters of the open_id, echoed to the sender so an operator can match them without a directory lookup. */
+  code: string;
+  chatId: string;
+  chatType: "p2p" | "group";
+  /** Sanitized excerpt of the rejected message, shown only in the local picker. */
+  excerpt: string;
+  at: number;
+}
+
+export function senderCode(userId: string): string { return userId.slice(-6).toLowerCase(); }
+
+function excerpt(text: string): string {
+  // Rejected text is untrusted: keep it on one line and out of terminal control sequences.
+  const clean = [...text.replace(/\s+/g, " ").trim()]
+    .filter((char) => char >= " " && char !== "\u007f" && !/[\u2028\u2029\u202a-\u202e\u2066-\u2069]/.test(char)).join("");
+  return clean.length > 48 ? `${clean.slice(0, 48)}…` : clean;
 }
 
 type BotCommand = { name: "new"; arg: "" } | { name: "model"; arg: string };
@@ -95,10 +122,17 @@ export class BotController {
   private readonly authorizationAbort = new AbortController();
   private readonly authorizations = new Map<string, Promise<boolean>>();
   private allowlist = new Set<string>();
+  /** Conversation key to its chat, so "set the push target here" needs no ID from the model. */
+  private readonly chats = new Map<string, { chatId: string; chatType: "p2p" | "group" }>();
+  private pushTarget?: PushTarget;
+  private pushTimes: number[] = [];
+  private denied: DeniedSender[] = [];
   private readonly onError: (error: unknown) => void;
   constructor(private options: ControllerOptions) { this.onError = options.onError ?? (() => {}); }
   get status() { return { active: this.active, connection: this.options.transport.state ?? (this.active ? "connected" : "stopped"), users: this.users.size,
     allowlisted: this.allowlist.size, sessions: this.options.workers.list?.() ?? [],
+    pushTarget: this.pushTarget ? { chatId: this.pushTarget.chatId, chatType: this.pushTarget.chatType } : undefined,
+    denied: this.denied.length,
     queued: [...this.users.values()].reduce((n, u) => n + u.count, 0) }; }
 
   async start(): Promise<void> {
@@ -109,11 +143,8 @@ export class BotController {
       if (!stored || !Array.isArray(stored.ids) || stored.ids.some((x) => typeof x !== "string")) throw new Error("Invalid seen.json");
       if (stored.appId === this.options.config.appId) this.seen = new Set(stored.ids.slice(-10_000));
     } catch (error) { if (!isMissing(error)) throw error; }
-    try {
-      const stored = await readPrivateJson(join(this.options.stateDir, "allowlist.json")) as { appId: string; users: string[] };
-      if (!stored || !Array.isArray(stored.users) || stored.users.some((x) => typeof x !== "string" || !x)) throw new Error("Invalid allowlist.json");
-      if (stored.appId === this.options.config.appId) this.allowlist = new Set(stored.users);
-    } catch (error) { if (!isMissing(error)) throw error; }
+    this.allowlist = await loadAllowlist(this.options.stateDir, this.options.config.appId);
+    this.pushTarget = await loadPushTarget(this.options.stateDir, this.options.config.appId);
     if (this.stopping) throw new Error("Controller was stopped during startup.");
     this.active = true;
     try {
@@ -155,10 +186,12 @@ export class BotController {
       current.tail = current.tail.then(async () => {
         if (!this.active) return;
         if (!await this.isAllowed(message)) {
-          if (this.active) await this.options.transport.send(message.chatId, "⛔ 当前用户未获得本机操作者授权，无法使用此机器人。", message.id);
+          if (this.active) await this.options.transport.send(message.chatId,
+            `⛔ 同步率不足，本机拒绝启动。\n授权码：${senderCode(message.userId)} —— 请交给本机驾驶员完成同步。`, message.id);
           return;
         }
         if (!this.active) return;
+        this.chats.set(key, { chatId: message.chatId, chatType: message.chatType === "group" ? "group" : "p2p" });
         if (botCommand) await this.executeCommand(message, key, botCommand);
         else await this.execute(message);
       }).catch(this.onError).finally(() => { current.count--; this.options.onStatus?.(); });
@@ -182,11 +215,9 @@ export class BotController {
       let approved = false;
       try { approved = await this.options.authorizeUser!(message.userId, message, this.authorizationAbort.signal); }
       catch (error) { if (!this.authorizationAbort.signal.aborted) this.onError(error); }
-      if (!approved || !this.active) return false;
+      if (!approved || !this.active) { this.recordDenied(message); return false; }
       this.allowlist.add(message.userId);
-      await writePrivateJson(join(this.options.stateDir, "allowlist.json"), {
-        appId: this.options.config.appId, users: [...this.allowlist].sort(),
-      });
+      await saveAllowlist(this.options.stateDir, this.options.config.appId, this.allowlist);
       this.options.onStatus?.();
       return true;
     });
@@ -250,6 +281,120 @@ export class BotController {
     await this.options.workers.setModel(card.key, selected);
     this.models.set(card.key, selected);
     await this.options.transport.updateCard?.(messageId, modelSelectedCard(selected));
+  }
+
+  private recordDenied(message: IncomingMessage): void {
+    const entry: DeniedSender = {
+      userId: message.userId, code: senderCode(message.userId), chatId: message.chatId,
+      chatType: message.chatType === "group" ? "group" : "p2p", excerpt: excerpt(message.text), at: Date.now(),
+    };
+    this.denied = [entry, ...this.denied.filter((old) => old.userId !== entry.userId)].slice(0, DENIED_LIMIT);
+    this.options.onStatus?.();
+  }
+
+  /** Most recent first. In-memory only, so it never outlives the listener. */
+  listDenied(): readonly DeniedSender[] { return this.denied; }
+
+  /** Resolve a full open_id or a code echoed to a rejected sender. Codes only ever match recent denials. */
+  private resolveSender(input: string): { userId: string } | { error: string } {
+    const value = input.trim();
+    if (!value) return { error: "Provide an open_id or an authorization code." };
+    const exact = this.denied.find((entry) => entry.userId === value);
+    if (exact) return { userId: exact.userId };
+    const matches = this.denied.filter((entry) => entry.code === value.toLowerCase());
+    if (matches.length === 1) return { userId: matches[0]!.userId };
+    if (matches.length > 1) return { error: `Code ${value} matches several senders. Use the full open_id.` };
+    if (/^o[a-z]_[A-Za-z0-9_-]{6,120}$/.test(value)) return { userId: value };
+    return { error: `Unrecognized: ${value}. Not a recent authorization code, and not a valid open_id.` };
+  }
+
+  async allow(input: string): Promise<{ ok: boolean; text: string }> {
+    const resolved = this.resolveSender(input);
+    if ("error" in resolved) return { ok: false, text: resolved.error };
+    if (this.allowlist.has(resolved.userId)) return { ok: true, text: `${resolved.userId} is already allowlisted.` };
+    this.allowlist.add(resolved.userId);
+    await saveAllowlist(this.options.stateDir, this.options.config.appId, this.allowlist);
+    this.denied = this.denied.filter((entry) => entry.userId !== resolved.userId);
+    this.options.onStatus?.();
+    return { ok: true, text: `Allowlisted ${resolved.userId}.` };
+  }
+
+  async deny(input: string): Promise<{ ok: boolean; text: string }> {
+    const value = input.trim();
+    if (!value) return { ok: false, text: "Provide an open_id or an authorization code." };
+    // An allowlisted sender is no longer in the rejection list, so resolve the
+    // code against the allowlist itself rather than against recent denials.
+    let userId = this.allowlist.has(value) ? value : undefined;
+    if (!userId) {
+      const matches = [...this.allowlist].filter((id) => senderCode(id) === value.toLowerCase());
+      if (matches.length > 1) return { ok: false, text: `Code ${value} matches several allowlisted senders. Use the full open_id.` };
+      userId = matches[0];
+    }
+    if (!userId || !this.allowlist.delete(userId)) return { ok: false, text: `${value} is not allowlisted.` };
+    await saveAllowlist(this.options.stateDir, this.options.config.appId, this.allowlist);
+    this.options.onStatus?.();
+    // Existing panes keep running; removal only stops the next message from this sender.
+    return { ok: true, text: `Removed ${userId} from the allowlist. Open panes keep running; the next message from this sender is rejected.` };
+  }
+
+  /** Worker panes hold no credentials, so every push and target change is resolved here. */
+  async handleWorkerRequest(key: string, request: WorkerRequest): Promise<WorkerResponse> {
+    if (!this.active) return { ok: false, text: "Lark 机器人当前未在监听。" };
+    if (request.action === "push") return this.push(request.text);
+    if (request.action === "target-status") return { ok: true, text: this.describeTarget() };
+    if (request.action === "clear-target") {
+      await this.setPushTarget(undefined);
+      return { ok: true, text: "已清除推送目标，推送功能现在不可用。" };
+    }
+    // "set-target" never takes an ID from the model: the chat is whichever one
+    // this worker's own conversation belongs to.
+    const chat = this.chats.get(key);
+    if (!chat) return { ok: false, text: "无法确定当前会话所属的聊天，请重新发送一条消息后再试。" };
+    await this.setPushTarget({ version: 1, appId: this.options.config.appId, chatId: chat.chatId,
+      chatType: chat.chatType, setBy: key, setAt: new Date().toISOString() });
+    return { ok: true, text: `已把当前${chat.chatType === "group" ? "群聊" : "私聊"}设为全局推送目标。` };
+  }
+
+  describeTarget(): string {
+    if (!this.pushTarget) return "未配置推送目标。在目标聊天里让机器人把该聊天设为推送目标即可。";
+    return `当前推送目标：${this.pushTarget.chatType === "group" ? "群聊" : "私聊"} ${this.pushTarget.chatId}（设置于 ${this.pushTarget.setAt || "未知时间"}）。`;
+  }
+
+  async setPushTarget(target: PushTarget | undefined): Promise<void> {
+    this.pushTarget = target;
+    await savePushTarget(this.options.stateDir, target);
+    this.options.onNotice?.(target
+      ? `Lark push target set to ${target.chatType === "group" ? "group" : "direct chat"} ${target.chatId}.`
+      : "Lark push target cleared. Pushing is disabled until a chat is set as the target again.");
+    this.options.onStatus?.();
+  }
+
+  /** Send an unsolicited message to the configured target. Never a reply, so it needs no source message. */
+  async push(text: string): Promise<WorkerResponse> {
+    if (!this.active) return { ok: false, text: "Lark 机器人当前未在监听，无法推送。" };
+    const target = this.pushTarget;
+    if (!target) return { ok: false, text: "尚未配置推送目标，无法推送。" };
+    const body = text.trim();
+    if (!body) return { ok: false, text: "推送内容为空。" };
+    const all = splitText(body), parts = all.slice(0, PUSH_MAX_PARTS);
+    if (all.length > PUSH_MAX_PARTS) parts[parts.length - 1] += "\n\n（内容过长，已截断）";
+    const now = Date.now();
+    this.pushTimes = this.pushTimes.filter((at) => now - at < PUSH_WINDOW_MS);
+    // Budget every card before sending any: a rejected push is better than half a report.
+    if (this.pushTimes.length + parts.length > PUSH_MAX_PER_WINDOW) {
+      return { ok: false, text: `推送过于频繁（每分钟最多 ${PUSH_MAX_PER_WINDOW} 条），请稍后重试。` };
+    }
+    try {
+      for (const part of parts) {
+        if (!this.active) return { ok: false, text: "机器人已停止，推送中断。" };
+        this.pushTimes.push(Date.now());
+        await this.options.transport.send(target.chatId, part);
+      }
+    } catch (error) {
+      this.onError(error);
+      return { ok: false, text: "推送失败，请检查机器人是否仍在目标聊天中、以及网络与权限。" };
+    }
+    return { ok: true, text: `已推送到${target.chatType === "group" ? "群聊" : "私聊"} ${target.chatId}。` };
   }
 
   private async execute(message: IncomingMessage): Promise<void> {

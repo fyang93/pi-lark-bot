@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, stat, readFile, writeFile, symlink, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireLock, inspectLock, loadConfig, prepareState, readPrivateJson, validateConfig, writePrivateJson } from "../src/storage.ts";
+import { acquireLock, inspectLock, loadConfig, prepareState, readPrivateJson, validateAllowlist, validateConfig, validatePushTarget, writePrivateJson } from "../src/storage.ts";
 
 const config = { version: 1, brand: "feishu", appId: "cli_test", appSecret: "super-secret" };
 test("credentials and ignore are project-local with private permissions; no global fallback", async () => {
@@ -52,4 +52,16 @@ test("config rejects malformed secrets and unsupported brands", () => {
   assert.throws(() => validateConfig({ ...config, brand: "https://evil.test" }));
   assert.throws(() => validateConfig({ ...config, appSecret: "" }));
   assert.deepEqual(validateConfig(config), config);
+});
+
+test("push target and allowlist files reject malformed content", () => {
+  assert.throws(() => validatePushTarget({ version: 1, appId: "cli_test", chatId: "oc_team" }), /Invalid push-target/);
+  assert.throws(() => validatePushTarget({ version: 1, appId: "cli_test", chatId: "../escape", chatType: "group" }), /Invalid push-target/);
+  assert.throws(() => validatePushTarget({ version: 2, appId: "cli_test", chatId: "oc_team", chatType: "group" }), /Invalid push-target/);
+  assert.deepEqual(
+    validatePushTarget({ version: 1, appId: "cli_test", chatId: "oc_team", chatType: "group", extra: "dropped" }),
+    { version: 1, appId: "cli_test", chatId: "oc_team", chatType: "group", setBy: "", setAt: "" });
+  assert.throws(() => validateAllowlist({ appId: "cli_test", users: ["ou_a", 7] }), /Invalid allowlist/);
+  assert.throws(() => validateAllowlist({ appId: "cli_test" }), /Invalid allowlist/);
+  assert.deepEqual(validateAllowlist({ appId: "cli_test", users: ["ou_a"] }), { appId: "cli_test", users: ["ou_a"] });
 });

@@ -8,7 +8,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { privateDir, writePrivateJson } from "./storage.ts";
-import type { ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory } from "./types.ts";
+import type { ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory, WorkerRequest, WorkerResponse } from "./types.ts";
 
 import { createSurface, closeSurface } from "./zellij.ts";
 const MAX_FRAME = 8 * 1024 * 1024;
@@ -22,6 +22,19 @@ export interface ZellijWorkersOptions {
   workerExtensionPath?: string;
   /** Explicit child environment overrides, useful for isolated tests. Not written to argv. */
   env?: NodeJS.ProcessEnv;
+  /** Serve a worker-initiated request. The key is the worker's own conversation key. */
+  onRequest?: (key: string, request: WorkerRequest) => Promise<WorkerResponse>;
+}
+
+/** A worker may only ask for these; it never supplies a chat ID of its own. */
+const MAX_REQUEST_TEXT = 64_000;
+function parseRequest(message: any): WorkerRequest | undefined {
+  if (message.action === "push") {
+    return typeof message.text === "string" && message.text && Buffer.byteLength(message.text) <= MAX_REQUEST_TEXT
+      ? { action: "push", text: message.text } : undefined;
+  }
+  return ["set-target", "clear-target", "target-status"].includes(message.action)
+    ? { action: message.action } as WorkerRequest : undefined;
 }
 export interface PaneSnapshot { userId: string; paneId?: string; sessionFile: string; connected: boolean }
 function sessionKey(appId: string, userId: string): string {
@@ -202,6 +215,7 @@ class PaneWorker implements ConversationWorker {
     return result;
   }
   private handle(message: any): void {
+    if (message.type === "request") { void this.respond(message); return; }
     if (typeof message.text !== "string" || !["progress", "text", "done"].includes(message.type)) return;
     const event: WorkerEvent = message.type === "done"
       ? { type: "done", text: message.text, error: message.error === true }
@@ -220,6 +234,20 @@ class PaneWorker implements ConversationWorker {
       active.resolve();
     }
   }
+  /** Requests run outside the prompt lifecycle: a worker may push long after its turn ended. */
+  private async respond(message: any): Promise<void> {
+    if (typeof message.id !== "string" || !message.id) return;
+    let response: WorkerResponse = { ok: false, text: "控制端不支持该请求。" };
+    try {
+      const request = parseRequest(message);
+      if (request && this.options.onRequest) response = await this.options.onRequest(this.userId, request);
+    } catch { response = { ok: false, text: "控制端处理请求失败。" }; }
+    const socket = this.socket;
+    if (socket && !socket.destroyed && !socket.writableEnded) {
+      socket.write(`${JSON.stringify({ type: "response", id: message.id, ...response })}\n`, () => {});
+    }
+  }
+
   private failActive(error: Error): void { const active = this.active; this.active = undefined; active?.reject(error); }
   close(): Promise<void> {
     if (this.closing) return this.closing;
