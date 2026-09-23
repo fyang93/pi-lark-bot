@@ -20,6 +20,12 @@ export interface IncomingMessage {
   parentMessageId?: string;
   attachments?: IncomingAttachment[];
   preparationWarning?: "referenced_message_unavailable";
+  /**
+   * Set when a message was addressed to the bot but carries nothing it can run.
+   * It still travels the normal path so the allowlist decides who gets an answer:
+   * an addressed message must never vanish without one.
+   */
+  unsupported?: "message_type" | "content" | "empty_text";
 }
 
 /** Keep existing private-session keys; group IDs occupy a distinct namespace. */

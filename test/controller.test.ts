@@ -414,3 +414,31 @@ test("pushes are rate limited and truncated, and stop with the listener", async 
     assert.equal((await bot.handleWorkerRequest("ou_a", { action: "push", text: "after stop" })).ok, false);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("a message addressed to the bot is always answered, even when it cannot be run", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-unsupported-"));
+  try {
+    const transport = new FakeTransport();
+    let opened = 0;
+    const workers: WorkerFactory = {
+      async open() { opened++; return { async run() {}, async close() {} }; }, async close() {},
+    };
+    const bot = new BotController({ config, stateDir: dir, transport, workers });
+    await bot.start();
+
+    await bot.receive({ ...msg("m1"), text: "(image)", unsupported: "message_type" });
+    await bot.receive({ ...msg("m2"), text: "(unparsable)", unsupported: "content" });
+    await bot.receive({ id: "m3", userId: "ou_a", chatId: "oc_team", text: "(empty)",
+      unsupported: "empty_text", chatType: "group", mentionedBot: true });
+    await bot.drain();
+
+    assert.equal(opened, 0, "an unusable message never starts a session");
+    const replies = transport.sends.map((send) => send.text);
+    assert.equal(replies.length, 3, "every addressed message got exactly one answer");
+    assert(replies[0]!.includes("只能处理文字消息") && replies[0]!.includes("(image)"));
+    assert(replies[1]!.includes("无法解析"));
+    assert(replies[2]!.includes("@ 之后没有内容"));
+    assert(transport.sends.every((send) => send.reply), "each answer quotes the message it refers to");
+    await bot.stop();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

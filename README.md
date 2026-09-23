@@ -161,7 +161,7 @@ pi install -l /absolute/path/to/pi-lark-bot
   allowlist.json    # 已由本机操作者确认的用户 open_id（私聊与群聊共用）
   push-target.json  # 全局唯一的推送目标聊天；缺失即停用推送
   attachments/      # 被引用附件的持久缓存（按消息资源哈希去重）
-  events.log        # 仅在 PI_LARK_BOT_EVENT_LOG=1 时生成的事件处置日志
+  events.log        # 每条入站事件的处置记录（始终开启，上限 2 MB 后自行重写）
   controller.lock   # 项目独占锁
 ```
 
@@ -173,7 +173,7 @@ pi install -l /absolute/path/to/pi-lark-bot
 
 ## 排查消息未被处理
 
-设置 `PI_LARK_BOT_EVENT_LOG=1` 后启动 pi，再执行 `/lark-bot on`，扩展会把每一条入站事件的**处置结果**逐行追加到 `<project>/.pi/lark-bot/events.log`：
+监听期间，扩展会把每一条入站事件的**处置结果**逐行追加到 `<project>/.pi/lark-bot/events.log`（始终开启，超过 2 MB 后自行重写）：
 
 ```json
 {"at":"…","disposition":"accepted","state":"connected","chatType":"p2p","messageId":"om_…"}
@@ -181,9 +181,20 @@ pi install -l /absolute/path/to/pi-lark-bot
 {"at":"…","disposition":"ws_reconnecting","state":"connected"}
 ```
 
-`disposition` 说明该事件被接收还是被哪一条规则拦下（发送者非用户、消息类型非文本、内容不可解析、群里没有 @ 到本机器人、文本为空、传输已停止等），并记录长连接的状态变化。**日志只含元数据，不记录消息文本、发送者昵称或文件标识。**
+`disposition` 说明该事件被接收（`accepted*`）还是被哪一条规则拦下（`skip_*`），并记录长连接的状态变化。**日志只含元数据，不记录消息文本、发送者昵称或文件标识。**
 
-如果某条消息在飞书里发出却完全没有反应，先看这个日志：有对应行说明事件到达了，`disposition` 直接指出原因；没有任何行则说明事件根本没被推送到本机。
+**发给机器人的消息一定会有回应。** 私聊的全部消息、群里真正 @机器人的消息，即使内容无法执行也会收到明确答复，而不是石沉大海：
+
+| 情况 | 回应 |
+| --- | --- |
+| 非文字消息（图片、文件、富文本等） | 告知暂时只能处理文字 |
+| 内容无法解析 | 告知请改用文字重发 |
+| 群里只 @ 了机器人没写内容 | 告知把要做的事写在 @ 后面 |
+| 本地状态写入失败 | 告知该消息未执行、请重新发送 |
+
+只有**群里没有 @ 到本机器人**的消息会被直接忽略——那本来就不是发给它的。
+
+如果某条消息在飞书里发出却完全没有反应，先看这个日志：有对应行说明事件到达了本机，`disposition` 直接指出原因；**没有任何行则说明飞书根本没把这个事件推送过来**，那不是本扩展能修复的范围。
 
 ## 开发
 

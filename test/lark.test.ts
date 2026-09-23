@@ -72,13 +72,17 @@ test("waits for readiness, filters messages, handles reconnect, and force-closes
   await fake.emit({ ...textEvent, sender: { sender_type: "bot", sender_id: { open_id: "ou_2" } } });
   await fake.emit({ ...textEvent, message: { ...textEvent.message, content: "not json" } });
   await fake.emit({ ...textEvent, message: { ...textEvent.message, chat_type: "group" } });
-  assert.deepEqual(received, [{ id: "om_1", userId: "ou_1", chatId: "oc_1", text: "hello" }]);
+  assert.deepEqual(received, [
+    { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "hello" },
+    // Unreadable content in a direct chat is still addressed to the bot.
+    { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "(unparsable)", unsupported: "content" },
+  ], "only a group message with no bot mention is dropped outright");
   await transport.stop();
   assert.deepEqual(fake.calls.close, [{ force: true }]);
   assert.equal(transport.state, "stopped");
 });
 
-test("groups require a real bot mention; other mentions and empty prompts are ignored", async () => {
+test("groups require a real bot mention; an addressed but empty prompt is answered, not ignored", async () => {
   const fake = fakeSdk(); const transport = new LarkTransport(config, undefined, fake.sdk);
   const received: any[] = [];
   const starting = transport.start(async (message) => { received.push(message); });
@@ -90,7 +94,11 @@ test("groups require a real bot mention; other mentions and empty prompts are ig
     await fake.emit({ ...event, message: { ...event.message, mentions: [] } });
     await fake.emit({ ...event, message: { ...event.message, mentions: [{ key: "@_user_1", id: { open_id: "ou_other" } }] } });
     await fake.emit({ ...event, message: { ...event.message, content: JSON.stringify({ text: "@_user_1" }) } });
-    assert.deepEqual(received, [{ id: "om_1", userId: "ou_1", chatId: "oc_1", text: "hello", chatType: "group", mentionedBot: true }]);
+    assert.deepEqual(received, [
+      { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "hello", chatType: "group", mentionedBot: true },
+      // A bare mention reaches the controller so it can say what is missing.
+      { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "(empty)", unsupported: "empty_text", chatType: "group", mentionedBot: true },
+    ]);
   } finally { await transport.stop(); }
 });
 
@@ -280,7 +288,7 @@ test("each rejected event records why it was rejected", async () => {
     await fake.emit({ ...textEvent, message: { ...textEvent.message, chat_type: "group" } });
     await transport.stop();
     const reasons = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l).disposition);
-    for (const reason of ["skip_non_user_sender", "skip_message_type", "skip_unparsable_content", "skip_no_mentions"]) {
+    for (const reason of ["skip_non_user_sender", "accepted_message_type", "accepted_content", "skip_no_mentions"]) {
       assert(reasons.includes(reason), `missing ${reason}`);
     }
   } finally { await rm(dir, { recursive: true, force: true }); }

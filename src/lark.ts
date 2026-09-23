@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFile } from "node:fs/promises";
+import { appendFile, writeFile } from "node:fs/promises";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { BotConfig, BotTransport, IncomingMessage } from "./types.js";
 import { AttachmentCache, MAX_ATTACHMENT_BYTES } from "./attachment-cache.js";
@@ -24,6 +24,8 @@ const API_TIMEOUT_MS = 10_000;
 const START_TIMEOUT_MS = 30_000;
 const MAX_ATTEMPTS = 3;
 const RETRYABLE_CODES = new Set([90002, 90013, 99991400, 99991663]);
+/** The event trace is always on, so it rewrites itself rather than growing without end. */
+const EVENT_LOG_MAX_BYTES = 2 * 1024 * 1024;
 const silentLogger = Object.freeze({
   fatal() {}, error() {}, warn() {}, info() {}, debug() {}, trace() {},
 });
@@ -42,6 +44,7 @@ export class LarkTransport implements BotTransport {
   private botOpenId?: string;
   private readonly attachmentCache?: AttachmentCache;
   private readonly eventLogPath?: string;
+  private eventLogBytes = 0;
 
   constructor(
     private readonly config: BotConfig,
@@ -97,7 +100,15 @@ export class LarkTransport implements BotTransport {
         hasParent: typeof message?.parent_id === "string" || undefined,
       } : {}),
     })}\n`;
-    appendFile(this.eventLogPath, line, { mode: 0o600 }).catch(() => {});
+    // Bounded: the trace must never be the reason a disk fills up.
+    this.eventLogBytes += Buffer.byteLength(line);
+    const path = this.eventLogPath;
+    if (this.eventLogBytes > EVENT_LOG_MAX_BYTES) {
+      this.eventLogBytes = Buffer.byteLength(line);
+      writeFile(path, line, { mode: 0o600 }).catch(() => {});
+      return;
+    }
+    appendFile(path, line, { mode: 0o600 }).catch(() => {});
   }
 
   get state(): LarkTransportState { return this._state; }
@@ -265,36 +276,51 @@ export class LarkTransport implements BotTransport {
     const drop = (reason: string): undefined => { this.trace(reason, event); return undefined; };
     if (event?.sender?.sender_type !== "user") return drop("skip_non_user_sender");
     if (!["p2p", "group"].includes(message?.chat_type)) return drop("skip_chat_type");
-    if (message?.message_type !== "text") return drop("skip_message_type");
     if (typeof message?.message_id !== "string" || typeof message?.chat_id !== "string") return drop("skip_malformed_ids");
     const userId = event.sender.sender_id?.open_id;
     if (typeof userId !== "string" || !userId) return drop("skip_no_sender_open_id");
-    let content: unknown;
-    try { content = JSON.parse(message.content); } catch { return drop("skip_unparsable_content"); }
-    if (!content || typeof (content as { text?: unknown }).text !== "string") return drop("skip_no_text_field");
-    let text = (content as { text: string }).text;
     const group = message.chat_type === "group";
+
+    // Decide whether the message is addressed to this bot before judging its
+    // content: an unsupported message in a group we merely sit in stays silent,
+    // but one aimed at us must never disappear without an answer.
+    let mentionKeys: string[] = [];
     if (group) {
-      if (!this.botOpenId) return drop("skip_bot_identity_unknown");
+      if (!this.botOpenId) {
+        this.report("Lark bot identity is unknown, so group mentions cannot be matched");
+        return drop("skip_bot_identity_unknown");
+      }
       if (!Array.isArray(message.mentions)) return drop("skip_no_mentions");
-      const mentions = message.mentions.filter((mention: any) => mention?.id?.open_id === this.botOpenId &&
-        typeof mention.key === "string" && mention.key.length > 0 && text.includes(mention.key));
+      const mentions = message.mentions.filter((mention: any) => mention?.id?.open_id === this.botOpenId);
       if (!mentions.length) return drop("skip_bot_not_mentioned"); // @all or mentioning somebody else is not a bot command
-      for (const mention of mentions) text = text.split(mention.key).join("");
-      text = text.trim();
+      mentionKeys = mentions.map((mention: any) => mention.key).filter((key: any) => typeof key === "string" && key.length > 0);
     }
-    if (!text.trim()) return drop("skip_empty_text");
-    // The SDK only hands us an event over a live connection, so honouring it
-    // depends on whether this transport has been stopped, not on which phase of
-    // the connection lifecycle a status flag happens to be in. Dropping events
-    // during "starting" or "reconnecting" silently loses real user messages.
-    if (this._state === "stopped") return drop("skip_stopped");
-    if (!this.onMessage) return drop("skip_no_handler");
-    this.trace("accepted", event);
-    try { await this.onMessage({ id: message.message_id, userId, chatId: message.chat_id, text,
-      ...(typeof message.parent_id === "string" && message.parent_id ? { parentMessageId: message.parent_id } : {}),
-      ...(group ? { chatType: "group" as const, mentionedBot: true } : {}) }); }
-    catch (_error) { this.report("Lark message handler failed"); }
+
+    // Addressed but unusable: hand it on anyway, carrying the reason. The
+    // controller answers it after the allowlist check, so an unauthorized
+    // sender still gets no more than the usual refusal.
+    const deliver = (text: string, unsupported?: IncomingMessage["unsupported"]) => this.dispatch(message, userId, text, group, unsupported);
+    if (message.message_type !== "text") return deliver(`(${message.message_type})`, "message_type");
+    let content: unknown;
+    try { content = JSON.parse(message.content); } catch { return deliver("(unparsable)", "content"); }
+    if (!content || typeof (content as { text?: unknown }).text !== "string") return deliver("(no text)", "content");
+    let text = (content as { text: string }).text;
+    for (const key of mentionKeys) if (text.includes(key)) text = text.split(key).join("");
+    text = text.trim();
+    if (!text) return deliver("(empty)", "empty_text");
+    return deliver(text);
+  }
+
+  private async dispatch(message: any, userId: string, text: string, group: boolean, unsupported?: IncomingMessage["unsupported"]): Promise<void> {
+    if (this._state === "stopped") return void this.trace("skip_stopped", { message });
+    if (!this.onMessage) return void this.trace("skip_no_handler", { message });
+    this.trace(unsupported ? `accepted_${unsupported}` : "accepted", { message });
+    try {
+      await this.onMessage({ id: message.message_id, userId, chatId: message.chat_id, text,
+        ...(unsupported ? { unsupported } : {}),
+        ...(typeof message.parent_id === "string" && message.parent_id ? { parentMessageId: message.parent_id } : {}),
+        ...(group ? { chatType: "group" as const, mentionedBot: true } : {}) });
+    } catch (_error) { this.report("Lark message handler failed"); }
   }
 
   private async downloadResource(messageId: string, fileKey: string, type: "file" | "image"): Promise<any> {

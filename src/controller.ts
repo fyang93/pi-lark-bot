@@ -103,6 +103,13 @@ function excerpt(text: string): string {
   return clean.length > 48 ? `${clean.slice(0, 48)}…` : clean;
 }
 
+/** Addressed but unusable. Answering beats silence, which is indistinguishable from a lost message. */
+function unsupportedNote(message: IncomingMessage): string {
+  if (message.unsupported === "empty_text") return "@ 之后没有内容。请把要我做的事写在 @ 后面。";
+  if (message.unsupported === "content") return "这条消息的内容无法解析，请改用文字重新发送。";
+  return `暂时只能处理文字消息，这条是 ${message.text} 类型。请改用文字重新发送。`;
+}
+
 type BotCommand = { name: "new"; arg: "" } | { name: "model"; arg: string };
 function command(text: string): BotCommand | undefined {
   const match = text.trim().match(/^\/(new|model)(?:\s+(.+?))?\s*$/i);
@@ -167,9 +174,19 @@ export class BotController {
       if (!this.active || this.seen.has(message.id)) return;
       this.seen.add(message.id);
       while (this.seen.size > 10_000) this.seen.delete(this.seen.values().next().value!);
-      await writePrivateJson(join(this.options.stateDir, "seen.json"), {
-        appId: this.options.config.appId, ids: [...this.seen],
-      });
+      try {
+        await writePrivateJson(join(this.options.stateDir, "seen.json"), {
+          appId: this.options.config.appId, ids: [...this.seen],
+        });
+      } catch (error) {
+        // Keeping the id would swallow this message for good: the platform's own
+        // redelivery carries the same id and would be deduplicated away.
+        this.seen.delete(message.id);
+        this.onError(error);
+        void this.options.transport.send(message.chatId,
+          "⚠️ 本地状态写入失败，这条消息没有执行，请重新发送。", message.id).catch(this.onError);
+        return;
+      }
       if (!this.active) return;
       const key = conversationKey(message);
       const botCommand = command(message.text);
@@ -192,6 +209,10 @@ export class BotController {
         }
         if (!this.active) return;
         this.chats.set(key, { chatId: message.chatId, chatType: message.chatType === "group" ? "group" : "p2p" });
+        if (message.unsupported) {
+          await this.options.transport.send(message.chatId, unsupportedNote(message), message.id);
+          return;
+        }
         if (botCommand) await this.executeCommand(message, key, botCommand);
         else await this.execute(message);
       }).catch(this.onError).finally(() => { current.count--; this.options.onStatus?.(); });
