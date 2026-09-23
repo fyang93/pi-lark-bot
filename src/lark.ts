@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, writeFile } from "node:fs/promises";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { BotConfig, BotTransport, IncomingMessage } from "./types.js";
 import { AttachmentCache, MAX_ATTACHMENT_BYTES } from "./attachment-cache.js";
@@ -24,10 +23,9 @@ const API_TIMEOUT_MS = 10_000;
 const START_TIMEOUT_MS = 30_000;
 const MAX_ATTEMPTS = 3;
 const RETRYABLE_CODES = new Set([90002, 90013, 99991400, 99991663]);
-/** The event trace is always on, so it rewrites itself rather than growing without end. */
-const EVENT_LOG_MAX_BYTES = 2 * 1024 * 1024;
-/** Chatter the SDK emits per request; only fatal/error/warn are worth recording. */
-const quietLogger = Object.freeze({ info() {}, debug() {}, trace() {} });
+const silentLogger = Object.freeze({
+  fatal() {}, error() {}, warn() {}, info() {}, debug() {}, trace() {},
+});
 
 type PendingStart = { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 
@@ -42,115 +40,38 @@ export class LarkTransport implements BotTransport {
   private _state: LarkTransportState = "stopped";
   private botOpenId?: string;
   private readonly attachmentCache?: AttachmentCache;
-  private readonly eventLogPath?: string;
-  private eventLogBytes = 0;
 
   constructor(
     private readonly config: BotConfig,
     private readonly onError: (error: Error) => void = () => {},
     sdk: LarkSdk = Lark as unknown as LarkSdk,
     attachmentCacheDir?: string,
-    /** Opt-in metadata log for diagnosing dropped events. Never records message text. */
-    eventLogPath?: string,
   ) {
     if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
-    // Assign before the SDK objects below: their logger writes through it.
-    this.eventLogPath = eventLogPath;
     const domain = config.brand === "lark" ? sdk.Domain?.Lark : sdk.Domain?.Feishu;
     // Generated endpoint methods' second parameter is IRequestOptions, not an
     // Axios config, so a timeout there is ignored. This wrapper bounds normal
     // API calls, tenant-token exchange, and WS endpoint discovery for real SDKs.
     const httpInstance = boundedHttp(sdk.defaultHttpInstance);
-    // The SDK drops events of its own accord and only says so through warnings.
-    // Silencing those made a dropped event indistinguishable from one that was
-    // never delivered, so they are recorded instead.
-    const logger = Object.assign({
-      fatal: (...args: unknown[]) => this.traceSdk("sdk_fatal", args),
-      error: (...args: unknown[]) => this.traceSdk("sdk_error", args),
-      warn: (...args: unknown[]) => this.traceSdk("sdk_warn", args),
-    }, quietLogger);
-    const credentials = { appId: config.appId, appSecret: config.appSecret, domain, logger, loggerLevel: 2 };
-    // The bounded HTTP instance exists to cap REST calls. It was also handed to
-    // the WebSocket client, which the two implementations this one replaced
-    // never did, and a long connection has no business inheriting a 10s
-    // request budget.
-    this.client = new sdk.Client({ ...credentials, httpInstance });
+    const common = { appId: config.appId, appSecret: config.appSecret, domain, httpInstance, logger: silentLogger, loggerLevel: 0 };
+    this.client = new sdk.Client(common);
     this.attachmentCache = attachmentCacheDir ? new AttachmentCache(attachmentCacheDir) : undefined;
-    this.dispatcher = new sdk.EventDispatcher({ logger, loggerLevel: 2 });
+    this.dispatcher = new sdk.EventDispatcher({ logger: silentLogger, loggerLevel: 0 });
     this.dispatcher.register({
       "im.message.receive_v1": (event) => this.receive(event),
       "card.action.trigger": (event) => this.cardAction(event),
-      // Subscribed by the platform alongside messages. Handled so the SDK stops
-      // reporting it as unregistered on every read receipt.
-      "im.message.message_read_v1": () => { this.trace("skip_read_receipt"); return undefined; },
     });
     this.ws = new sdk.WSClient({
-      ...credentials,
-      autoReconnect: true,
-      onReady: () => { this.trace("ws_ready"); this.ready(); },
-      onReconnecting: () => {
-        this.trace("ws_reconnecting");
-        if (this._state === "connected") this._state = "reconnecting";
-      },
+      ...common,
+      handshakeTimeoutMs: API_TIMEOUT_MS,
+      onReady: () => this.ready(),
+      onReconnecting: () => { if (this._state === "connected") this._state = "reconnecting"; },
       onReconnected: () => {
-        this.trace("ws_reconnected");
         if (this._state === "starting") this.ready();
         else if (this._state !== "stopped") this._state = "connected";
       },
-      onError: () => { this.trace("ws_error"); this.connectionFailed(); },
+      onError: () => this.connectionFailed(),
     });
-  }
-
-  /**
-   * Append one line of event metadata. Message text, sender names and file keys
-   * are never written: this exists to explain why an event was or was not
-   * handled, not to mirror the conversation.
-   */
-  private trace(disposition: string, event?: any): void {
-    if (!this.eventLogPath) return;
-    const message = event?.message;
-    this.write({
-      disposition, state: this._state,
-      ...(event ? {
-        senderType: event?.sender?.sender_type, chatType: message?.chat_type,
-        messageType: message?.message_type, messageId: message?.message_id,
-        mentions: Array.isArray(message?.mentions) ? message.mentions.length : undefined,
-        hasParent: typeof message?.parent_id === "string" || undefined,
-      } : {}),
-    });
-  }
-
-  /** Append one bounded line. The trace must never be why a disk fills up. */
-  private write(record: object): void {
-    const path = this.eventLogPath;
-    if (!path) return;
-    const line = `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`;
-    this.eventLogBytes += Buffer.byteLength(line);
-    if (this.eventLogBytes > EVENT_LOG_MAX_BYTES) {
-      this.eventLogBytes = Buffer.byteLength(line);
-      writeFile(path, line, { mode: 0o600 }).catch(() => {});
-      return;
-    }
-    appendFile(path, line, { mode: 0o600 }).catch(() => {});
-  }
-
-  /**
-   * Record an SDK diagnostic. The SDK's LoggerProxy hands its arguments over as
-   * one array, so they are flattened. Objects contribute their key names only:
-   * an SDK payload can carry message text, and this log promises not to hold any.
-   */
-  private traceSdk(disposition: string, args: unknown[]): void {
-    if (!this.eventLogPath) return;
-    const parts = (value: unknown, depth = 0): string[] => {
-      if (typeof value === "string") return [value];
-      if (typeof value === "number" || typeof value === "boolean") return [String(value)];
-      if (value instanceof Error) return [`${value.name}: ${value.message}`];
-      if (Array.isArray(value)) return depth < 3 ? value.flatMap((item) => parts(item, depth + 1)) : [];
-      if (value && typeof value === "object") return [`{${Object.keys(value).slice(0, 12).join(",")}}`];
-      return [];
-    };
-    const note = parts(args).join(" ").slice(0, 300);
-    this.write({ disposition, state: this._state, note: note.split(this.config.appSecret).join("***") });
   }
 
   get state(): LarkTransportState { return this._state; }
@@ -315,12 +236,11 @@ export class LarkTransport implements BotTransport {
   private async receive(value: unknown): Promise<void> {
     const event = value as any;
     const message = event?.message;
-    const drop = (reason: string): undefined => { this.trace(reason, event); return undefined; };
-    if (event?.sender?.sender_type !== "user") return drop("skip_non_user_sender");
-    if (!["p2p", "group"].includes(message?.chat_type)) return drop("skip_chat_type");
-    if (typeof message?.message_id !== "string" || typeof message?.chat_id !== "string") return drop("skip_malformed_ids");
+    if (event?.sender?.sender_type !== "user") return undefined;
+    if (!["p2p", "group"].includes(message?.chat_type)) return undefined;
+    if (typeof message?.message_id !== "string" || typeof message?.chat_id !== "string") return undefined;
     const userId = event.sender.sender_id?.open_id;
-    if (typeof userId !== "string" || !userId) return drop("skip_no_sender_open_id");
+    if (typeof userId !== "string" || !userId) return undefined;
     const group = message.chat_type === "group";
 
     // Decide whether the message is addressed to this bot before judging its
@@ -330,11 +250,11 @@ export class LarkTransport implements BotTransport {
     if (group) {
       if (!this.botOpenId) {
         this.report("Lark bot identity is unknown, so group mentions cannot be matched");
-        return drop("skip_bot_identity_unknown");
+        return undefined;
       }
-      if (!Array.isArray(message.mentions)) return drop("skip_no_mentions");
+      if (!Array.isArray(message.mentions)) return undefined;
       const mentions = message.mentions.filter((mention: any) => mention?.id?.open_id === this.botOpenId);
-      if (!mentions.length) return drop("skip_bot_not_mentioned"); // @all or mentioning somebody else is not a bot command
+      if (!mentions.length) return undefined; // @all or mentioning somebody else is not a bot command
       mentionKeys = mentions.map((mention: any) => mention.key).filter((key: any) => typeof key === "string" && key.length > 0);
     }
 
@@ -354,9 +274,10 @@ export class LarkTransport implements BotTransport {
   }
 
   private async dispatch(message: any, userId: string, text: string, group: boolean, unsupported?: IncomingMessage["unsupported"]): Promise<void> {
-    if (this._state === "stopped") return void this.trace("skip_stopped", { message });
-    if (!this.onMessage) return void this.trace("skip_no_handler", { message });
-    this.trace(unsupported ? `accepted_${unsupported}` : "accepted", { message });
+    // The SDK only hands over an event across a live connection, so what
+    // matters is whether this transport was stopped, not which phase of the
+    // connection lifecycle a status flag happens to hold.
+    if (this._state === "stopped" || !this.onMessage) return;
     try {
       await this.onMessage({ id: message.message_id, userId, chatId: message.chat_id, text,
         ...(unsupported ? { unsupported } : {}),

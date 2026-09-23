@@ -237,99 +237,7 @@ test("real SDK Client sends tenant-token and message HTTP through the timeout wr
   assert.equal(sends[0].data.uuid, sends[1].data.uuid);
 });
 
-test("events delivered while starting or reconnecting are handled, not silently dropped", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "lark-events-"));
-  try {
-    const fake = fakeSdk();
-    const log = join(dir, "events.log");
-    const transport = new LarkTransport(config, undefined, fake.sdk, undefined, log);
-    const received: any[] = [];
-    const starting = transport.start(async (message) => { received.push(message); });
-
-    // The SDK only delivers over a live socket, so a message that arrives before
-    // onReady lands is a real user message, not noise.
-    assert.equal(transport.state, "starting");
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_starting" } });
-    await fake.ready();
-    await starting;
-
-    fake.reconnecting();
-    assert.equal(transport.state, "reconnecting");
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_reconnecting" } });
-    fake.reconnected();
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_connected" } });
-    assert.deepEqual(received.map((m) => m.id), ["om_starting", "om_reconnecting", "om_connected"]);
-
-    // A stopped transport still refuses late callbacks.
-    await transport.stop();
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_after_stop" } });
-    assert.equal(received.length, 3);
-
-    const lines = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    assert.deepEqual(lines.filter((l) => l.disposition === "accepted").map((l) => l.messageId),
-      ["om_starting", "om_reconnecting", "om_connected"]);
-    assert.deepEqual(lines.filter((l) => l.messageId === "om_after_stop").map((l) => l.disposition), ["skip_stopped"]);
-    assert(lines.some((l) => l.disposition === "ws_reconnecting"), "state changes are traced too");
-    assert(!JSON.stringify(lines).includes("hello"), "the trace never records message text");
-  } finally { await rm(dir, { recursive: true, force: true }); }
-});
-
-test("each rejected event records why it was rejected", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "lark-events-drop-"));
-  try {
-    const fake = fakeSdk();
-    const log = join(dir, "events.log");
-    const transport = new LarkTransport(config, undefined, fake.sdk, undefined, log);
-    const starting = transport.start(async () => {});
-    await fake.ready(); await starting;
-    await fake.emit({ ...textEvent, sender: { sender_type: "bot", sender_id: { open_id: "ou_2" } } });
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_type: "post" } });
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, content: "not json" } });
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, chat_type: "group" } });
-    await transport.stop();
-    const reasons = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l).disposition);
-    for (const reason of ["skip_non_user_sender", "accepted_message_type", "accepted_content", "skip_no_mentions"]) {
-      assert(reasons.includes(reason), `missing ${reason}`);
-    }
-  } finally { await rm(dir, { recursive: true, force: true }); }
-});
-
-test("SDK diagnostics reach the trace instead of being silenced, with the secret redacted", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "lark-sdk-log-"));
-  try {
-    let captured: any;
-    const fake = fakeSdk();
-    const sdk = {
-      ...fake.sdk,
-      EventDispatcher: class {
-        constructor(options: any) { captured = options; }
-        register() { return this; }
-      },
-    } as unknown as LarkSdk;
-    const log = join(dir, "events.log");
-    new LarkTransport(config, undefined, sdk, undefined, log);
-
-    assert.equal(captured.loggerLevel, 2, "warnings must not be filtered out by level");
-    // The SDK's LoggerProxy passes its arguments as a single array.
-    captured.logger.warn(["no im.message.receive_v1 handle"]);
-    captured.logger.error(["[ws]", new Error("boom")], { text: "secret chat content" });
-    captured.logger.info("routine chatter");
-    captured.logger.debug("routine chatter");
-    // Anything the SDK echoes back must not leak the credential.
-    captured.logger.warn([`request failed with ${config.appSecret}`]);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    const lines = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
-    assert.deepEqual(lines.map((l) => l.disposition), ["sdk_warn", "sdk_error", "sdk_warn"],
-      "info and debug stay out of the trace");
-    assert.equal(lines[0].note, "no im.message.receive_v1 handle");
-    assert.equal(lines[1].note, "[ws] Error: boom {text}",
-      "arrays flatten, errors keep their message, objects contribute key names only");
-    assert(!lines[2].note.includes(config.appSecret) && lines[2].note.includes("***"));
-  } finally { await rm(dir, { recursive: true, force: true }); }
-});
-
-test("the WebSocket client gets plain credentials, not the REST call budget", async () => {
+test("the WebSocket client is constructed exactly as the shipping version did", async () => {
   let wsOptions: any, clientOptions: any;
   const fake = fakeSdk();
   const sdk = {
@@ -340,9 +248,10 @@ test("the WebSocket client gets plain credentials, not the REST call budget", as
   } as unknown as LarkSdk;
   new LarkTransport(config, undefined, sdk);
 
-  assert(clientOptions.httpInstance, "REST calls stay bounded");
-  assert.equal(wsOptions.httpInstance, undefined,
-    "a long connection must not inherit the REST request timeout");
-  assert.equal(wsOptions.handshakeTimeoutMs, undefined);
-  assert.equal(wsOptions.autoReconnect, true);
+  // Every option the SDK sees matches v0.1.0. Messages went missing each time
+  // this construction was "improved", so it is pinned rather than reasoned about.
+  assert.equal(wsOptions.httpInstance, clientOptions.httpInstance);
+  assert.equal(wsOptions.loggerLevel, 0);
+  assert.equal(wsOptions.logger, clientOptions.logger);
+  assert.equal(typeof wsOptions.handshakeTimeoutMs, "number");
 });
