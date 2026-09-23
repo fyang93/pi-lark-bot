@@ -58,7 +58,7 @@ export type WorkerEvent =
   | { type: "done"; text: string; error?: boolean };
 
 export interface ConversationWorker {
-  run(text: string, onEvent: (event: WorkerEvent) => void): Promise<void>;
+  run(text: string, onEvent: (event: WorkerEvent) => void, signal?: AbortSignal): Promise<void>;
   close(): Promise<void>;
 }
 

@@ -34,6 +34,10 @@ async function listenMock(fixture: string) {
         chunk({ role: "assistant", tool_calls: [{ index: 0, id: "fixture-read", type: "function", function: { name: "read", arguments: JSON.stringify({ path: fixture }) } }] }, "tool_calls");
       } else {
         chunk({ role: "assistant", content: "mock:" });
+        if (prompt === "interrupt me") {
+          await new Promise<void>((resolve) => response.once("close", resolve));
+          return;
+        }
         await delay(200); // cross worker/controller throttle windows
         chunk({ content: prompt }, "stop");
       }
@@ -106,6 +110,17 @@ test("real Zellij/pi: tools, streaming, native panes, isolation, crash recovery 
     await run(one, "second prompt");
     assert(mock.requests.at(-1)!.includes("first prompt"));
     assert(!mock.requests.at(-1)!.includes("separate user"));
+    const abort = new AbortController(), interrupted: WorkerEvent[] = [];
+    await timeout(one.run("interrupt me", (event) => {
+      interrupted.push(event);
+      if (event.type === "text" && event.text === "mock:") abort.abort();
+    }, abort.signal), 15000, "interrupt active Pi turn");
+    assert.equal(abort.signal.aborted, true);
+    assert.match(interrupted.at(-1)!.text, /已停止/);
+    assert.equal((interrupted.at(-1) as { error?: boolean }).error, false);
+    assert.strictEqual(await workers.open("user-one"), one);
+    await run(one, "after interrupt");
+    assert(mock.requests.at(-1)!.includes("first prompt"));
     const crashed = workers.list().find((pane) => pane.userId === "user-one")!.paneId!;
     await execFile("zellij", ["action", "close-pane", "--pane-id", crashed], { timeout: 5000 });
     await delay(100);

@@ -202,14 +202,21 @@ class PaneWorker implements ConversationWorker {
     });
   }
 
-  run(text: string, onEvent: (event: WorkerEvent) => void): Promise<void> {
-    const result = this.serial.then(() => {
+  run(text: string, onEvent: (event: WorkerEvent) => void, signal?: AbortSignal): Promise<void> {
+    const result = this.serial.then(async () => {
+      signal?.throwIfAborted();
       if (!this.isConnected()) throw new Error("Pi worker is not connected");
-      return new Promise<void>((resolve, reject) => {
-        const id = randomBytes(12).toString("hex");
-        this.active = { id, onEvent, resolve, reject };
-        this.socket!.write(`${JSON.stringify({ type: "prompt", id, text })}\n`, (error) => { if (error) this.failActive(new Error("Pi worker prompt delivery failed")); });
+      const id = randomBytes(12).toString("hex");
+      const interrupt = () => this.socket?.write(`${JSON.stringify({ type: "abort", id })}\n`, (error) => {
+        if (error) this.failActive(new Error("Pi worker interrupt delivery failed"));
       });
+      signal?.addEventListener("abort", interrupt, { once: true });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          this.active = { id, onEvent, resolve, reject };
+          this.socket!.write(`${JSON.stringify({ type: "prompt", id, text })}\n`, (error) => { if (error) this.failActive(new Error("Pi worker prompt delivery failed")); });
+        });
+      } finally { signal?.removeEventListener("abort", interrupt); }
     });
     this.serial = result.catch(() => {});
     return result;

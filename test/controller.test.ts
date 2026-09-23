@@ -129,9 +129,10 @@ test("same-user FIFO, different users concurrent, event handler does not wait fo
     transport.update = async (...args) => { await original(...args); if (args[1] === "other") otherDone.resolve(); };
     await otherDone.promise;
     assert.deepEqual(order, ["one", "other"]);
+    assert.equal(transport.sends.filter((x) => x.reply === "two").length, 0, "queued messages stay silent until execution");
     gate.resolve(); await bot.drain();
     assert.deepEqual(order, ["one", "other", "two"]);
-    assert(transport.sends.some((x) => x.text.includes("正在排队")));
+    assert.equal(transport.sends.filter((x) => x.reply === "two").length, 1, "execution creates only the normal reply bubble");
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -181,6 +182,72 @@ test("per-user queue and input-size limits reject excess work without invoking t
     assert.equal(count, 20);
     await bot.receive({ ...msg("long", "ou_b"), text: "中".repeat(22_000) }); await bot.drain();
     assert.equal(count, 20);
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("/stop bypasses a full FIFO, checks authorization, isolates chats and never retries the aborted turn", { timeout: 5000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-interrupt-"));
+  const started = deferred(), otherStarted = deferred(), otherGate = deferred();
+  const calls: string[] = [], errors: unknown[] = [];
+  const transport = new FakeTransport();
+  const workers: WorkerFactory = { async open(key) { return { async run(text, emit, signal) {
+    calls.push(`${key}|${text}`);
+    if (text === "ou_a: first") {
+      started.resolve();
+      await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
+      emit({ type: "done", text: "aborted", error: true });
+    } else {
+      if (text === "other") { otherStarted.resolve(); await otherGate.promise; assert.equal(signal!.aborted, false); }
+      emit({ type: "done", text: "ok" });
+    }
+  }, async close() {} }; }, async close() { otherGate.resolve(); } };
+  const bot = new BotController({ config, stateDir: dir, transport, workers, onError: (e) => errors.push(e),
+    authorizeUser: async (id) => id !== "ou_denied" });
+  const group = (id: string, text: string, userId = "ou_a"): IncomingMessage => ({ id, text, userId, chatId: "oc_room", chatType: "group", mentionedBot: true });
+  try {
+    await bot.start(); await bot.receive(group("first", "first")); await started.promise;
+    await bot.receive(msg("other", "ou_other")); await otherStarted.promise;
+    for (let i = 0; i < 19; i++) await bot.receive(group(`queued-${i}`, `queued-${i}`));
+    const denied = deferred(), stopped = deferred();
+    const send = transport.send.bind(transport);
+    transport.send = async (...args) => {
+      const id = await send(...args);
+      if (args[2] === "denied-stop") denied.resolve();
+      if (args[2] === "stop") stopped.resolve();
+      return id;
+    };
+    await bot.receive(group("denied-stop", "/stop", "ou_denied")); await denied.promise;
+    assert(transport.sends.some((s) => s.reply === "denied-stop" && s.text.includes("拒绝")));
+    assert.equal(calls.length, 2);
+    await bot.receive(group("stop", "/stop", "ou_b")); await stopped.promise;
+    assert(transport.sends.some((s) => s.reply === "stop" && s.text === "已请求停止。"));
+    otherGate.resolve(); await bot.drain();
+    assert.equal(calls.length, 21, "only the active group turn stops; queued messages still run");
+    assert.equal(calls.filter((s) => s.endsWith("|ou_a: first")).length, 1);
+    assert(transport.updates.includes("⏹ 已停止。"));
+    await bot.receive({ ...msg("idle-stop"), text: "/stop" }); await bot.drain();
+    assert(transport.sends.some((s) => s.reply === "idle-stop" && s.text === "当前没有任务。"));
+    assert.deepEqual(errors, []);
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("/stop during worker startup prevents the prompt from running", { timeout: 3000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-interrupt-start-"));
+  const opening = deferred(), ready = deferred(), stopped = deferred();
+  let runs = 0;
+  const transport = new FakeTransport(), send = transport.send.bind(transport);
+  transport.send = async (...args) => { const id = await send(...args); if (args[2] === "stop") stopped.resolve(); return id; };
+  const workers: WorkerFactory = { async open() {
+    opening.resolve(); await ready.promise;
+    return { async run() { runs++; }, async close() {} };
+  }, async close() { ready.resolve(); } };
+  const bot = new BotController({ config, stateDir: dir, transport, workers });
+  try {
+    await bot.start(); await bot.receive(msg("first")); await opening.promise;
+    await bot.receive({ ...msg("stop"), text: "/stop" }); await stopped.promise;
+    ready.resolve(); await bot.drain();
+    assert.equal(runs, 0);
+    assert(transport.updates.includes("⏹ 已停止。"));
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 

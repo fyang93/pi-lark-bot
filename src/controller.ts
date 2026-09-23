@@ -110,9 +110,9 @@ function unsupportedNote(message: IncomingMessage): string {
   return `暂时只能处理文字消息，这条是 ${message.text} 类型。请改用文字重新发送。`;
 }
 
-type BotCommand = { name: "new"; arg: "" } | { name: "model"; arg: string };
+type BotCommand = { name: "new" | "stop" | "model"; arg: string };
 function command(text: string): BotCommand | undefined {
-  const match = text.trim().match(/^\/(new|model)(?:\s+(.+?))?\s*$/i);
+  const match = text.trim().match(/^\/(new|stop|model)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as BotCommand["name"], arg: match[2]?.trim() ?? "" } as BotCommand;
 }
@@ -123,6 +123,7 @@ export class BotController {
   private readonly modelCards = new Map<string, { chatId: string; key: string; ownerId?: string }>();
   private stopping?: Promise<void>;
   private users = new Map<string, UserQueue>();
+  private readonly running = new Map<string, AbortController>();
   private seen = new Set<string>();
   private admission: Promise<void> = Promise.resolve();
   private authorizationTail: Promise<void> = Promise.resolve();
@@ -192,17 +193,7 @@ export class BotController {
       if (!this.active) return;
       const key = conversationKey(message);
       const botCommand = command(message.text);
-      let queue = this.users.get(key);
-      if (!queue) { queue = { tail: Promise.resolve(), count: 0 }; this.users.set(key, queue); }
-      if (queue.count >= 20 || Buffer.byteLength(message.text) + (message.chatType === "group" ? Buffer.byteLength(message.userId) + 2 : 0) > 64_000) {
-        void this.options.transport.send(message.chatId, "消息过长或队列已满（最多 20 条），请稍后重试。", message.id).catch(this.onError);
-        return;
-      }
-      const wasBusy = queue.count > 0;
-      queue.count++;
-      if (wasBusy) void this.options.transport.send(message.chatId, `正在排队，前方还有 ${queue.count - 1} 条消息。`, message.id).catch(this.onError);
-      const current = queue;
-      current.tail = current.tail.then(async () => {
+      const run = async () => {
         if (!this.active) return;
         if (!await this.isAllowed(message)) {
           if (this.active) await this.options.transport.send(message.chatId,
@@ -217,7 +208,18 @@ export class BotController {
         }
         if (botCommand) await this.executeCommand(message, key, botCommand);
         else await this.execute(message);
-      }).catch(this.onError).finally(() => { current.count--; this.options.onStatus?.(); });
+      };
+      // Interrupts must bypass the FIFO and its capacity limit, but not authorization.
+      if (botCommand?.name === "stop") { await run(); return; }
+      let queue = this.users.get(key);
+      if (!queue) { queue = { tail: Promise.resolve(), count: 0 }; this.users.set(key, queue); }
+      if (queue.count >= 20 || Buffer.byteLength(message.text) + (message.chatType === "group" ? Buffer.byteLength(message.userId) + 2 : 0) > 64_000) {
+        void this.options.transport.send(message.chatId, "消息过长或队列已满（最多 20 条），请稍后重试。", message.id).catch(this.onError);
+        return;
+      }
+      queue.count++;
+      const current = queue;
+      current.tail = current.tail.then(run).catch(this.onError).finally(() => { current.count--; this.options.onStatus?.(); });
       this.options.onStatus?.();
     });
     this.admission = admission.catch(this.onError);
@@ -255,6 +257,13 @@ export class BotController {
 
   private async executeCommand(message: IncomingMessage, key: string, value: BotCommand): Promise<void> {
     const { transport, workers } = this.options;
+    if (value.name === "stop") {
+      if (value.arg) { await transport.send(message.chatId, "用法：/stop", message.id); return; }
+      const current = this.running.get(key);
+      current?.abort();
+      await transport.send(message.chatId, current ? "已请求停止。" : "当前没有任务。", message.id);
+      return;
+    }
     if (value.name === "new") {
       if (!workers.reset) throw new Error("This worker does not support session reset");
       await workers.reset(key);
@@ -422,19 +431,25 @@ export class BotController {
 
   private async execute(message: IncomingMessage): Promise<void> {
     const { transport, workers } = this.options;
+    const key = conversationKey(message), abort = new AbortController();
+    this.running.set(key, abort);
+    const { signal } = abort;
     let progress: ProgressMessage | undefined, responseId: string | undefined;
     let answer = "", continuation = "", initialDone = false, status = "⏳ 正在处理中…", final: Extract<WorkerEvent, { type: "done" }> | undefined;
     try {
       const id = await transport.send(message.chatId, "⏳ 正在准备会话…", message.id);
       responseId = id;
       progress = new ProgressMessage(transport, id, this.options.streamInterval, this.onError);
+      signal.throwIfAborted();
       if (!this.active) { await progress.finish("⏹ 已停止，消息未执行。"); return; }
       if (transport.prepareMessage && message.parentMessageId) {
         progress.set("⏳ 正在读取引用的文件…");
         message = await transport.prepareMessage(message);
       }
       if (!this.active) { await progress.finish("⏹ 已停止，消息未执行。"); return; }
-      const worker = await workers.open(conversationKey(message));
+      signal.throwIfAborted();
+      const worker = await workers.open(key);
+      signal.throwIfAborted();
       if (!this.active) { await progress.finish("⏹ 已停止，消息未执行。"); return; }
       const attachmentText = message.attachments?.length ? [
         "Referenced attachments for this request:",
@@ -448,8 +463,8 @@ export class BotController {
         : "";
       const request = [message.text, attachmentText, preparationWarning].filter(Boolean).join("\n\n");
       const prompt = message.chatType === "group" ? `${message.userId}: ${request}` : request;
-      const key = conversationKey(message);
       const onEvent = (event: WorkerEvent) => {
+        if (signal.aborted) return;
         if (initialDone) {
           if (event.type === "text") continuation = event.text;
           if (event.type === "done") {
@@ -467,19 +482,19 @@ export class BotController {
         else status = event.text;
         progress?.set(`${status}\n\n${answer}`);
       };
-      await worker.run(prompt, onEvent);
+      await worker.run(prompt, onEvent, signal);
       // A Pi session that has never completed a turn can fail while it is still
       // coming up, before the request has had any effect. Losing the message to
       // that is worse than running it twice, which cannot have happened yet.
-      if (this.active && final?.error && !this.warmed.has(key)) {
+      if (this.active && !signal.aborted && final?.error && !this.warmed.has(key)) {
         progress.set("⏳ 会话启动失败，正在重试…");
         answer = ""; status = "⏳ 正在重试…"; final = undefined; initialDone = false;
-        await worker.run(prompt, onEvent);
+        await worker.run(prompt, onEvent, signal);
       }
       if (final && !final.error) this.warmed.add(key);
       const cancelled = async () => {
-        if (this.active) return false;
-        await progress!.finish("⏹ 已停止，执行已中断；本地历史已保留。");
+        if (this.active && !signal.aborted) return false;
+        await progress!.finish("⏹ 已停止。");
         return true;
       };
       if (await cancelled()) return;
@@ -490,13 +505,13 @@ export class BotController {
       await progress.finish(result.text || (result.error ? "执行失败，请检查会话 pane。" : "（没有文本回复）"));
       await cancelled();
     } catch (error) {
-      this.onError(error);
+      if (!signal.aborted) this.onError(error);
       // Keep errors in the existing progress card too, rather than creating a
       // second bubble after a streamed response.
-      await progress?.finish(this.active
-        ? "❌ 执行或回复失败；本地历史已保留。请检查 Pi 和会话 pane，然后发送新消息继续。"
-        : "⏹ 机器人已停止，执行已中断；重启后可继续已保存的会话。");
-    }
+      await progress?.finish(signal.aborted ? "⏹ 已停止。" : this.active
+        ? "❌ 执行或回复失败，请检查 Pi 会话。"
+        : "⏹ 机器人已停止。");
+    } finally { this.running.delete(key); }
   }
 
   /** Used by tests and shutdown; includes asynchronous admission and all queued jobs. */
