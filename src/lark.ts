@@ -246,17 +246,23 @@ export class LarkTransport implements BotTransport {
     // Decide whether the message is addressed to this bot before judging its
     // content: an unsupported message in a group we merely sit in stays silent,
     // but one aimed at us must never disappear without an answer.
-    let mentionKeys: string[] = [];
+    const mentioned = Array.isArray(message.mentions) && this.botOpenId
+      ? message.mentions.filter((mention: any) => mention?.id?.open_id === this.botOpenId)
+      : [];
     if (group) {
       if (!this.botOpenId) {
         this.report("Lark bot identity is unknown, so group mentions cannot be matched");
         return undefined;
       }
       if (!Array.isArray(message.mentions)) return undefined;
-      const mentions = message.mentions.filter((mention: any) => mention?.id?.open_id === this.botOpenId);
-      if (!mentions.length) return undefined; // @all or mentioning somebody else is not a bot command
-      mentionKeys = mentions.map((mention: any) => mention.key).filter((key: any) => typeof key === "string" && key.length > 0);
+      if (!mentioned.length) return undefined; // @all or mentioning somebody else is not a bot command
     }
+    // A mention placeholder is a key like "@_user_1", never the text the sender
+    // typed. Leaving one in a direct message hid "/new" behind it, so the
+    // command went to the model, which confirmed a reset that never happened.
+    const mentionKeys: string[] = mentioned
+      .map((mention: any) => mention.key)
+      .filter((key: any) => typeof key === "string" && key.length > 0);
 
     // Addressed but unusable: hand it on anyway, carrying the reason. The
     // controller answers it after the allowlist check, so an unauthorized

@@ -255,3 +255,24 @@ test("the WebSocket client is constructed exactly as the shipping version did", 
   assert.equal(wsOptions.logger, clientOptions.logger);
   assert.equal(typeof wsOptions.handshakeTimeoutMs, "number");
 });
+
+test("a mention of the bot is stripped in a direct chat too, so commands survive it", async () => {
+  const fake = fakeSdk();
+  const transport = new LarkTransport(config, undefined, fake.sdk);
+  const received: any[] = [];
+  const starting = transport.start(async (message) => { received.push(message); });
+  await fake.ready(); await starting;
+  try {
+    // Tapping the bot's avatar in a direct chat puts a placeholder key in the
+    // text. Left in place it hides "/new" from the command parser, and the
+    // model answers instead of the session being reset.
+    await fake.emit({ ...textEvent, message: { ...textEvent.message,
+      content: JSON.stringify({ text: "@_user_1 /new" }),
+      mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" } }] } });
+    // Someone else's mention is the sender's own text and stays untouched.
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_2",
+      content: JSON.stringify({ text: "@_user_1 看看" }),
+      mentions: [{ key: "@_user_1", id: { open_id: "ou_other" } }] } });
+    assert.deepEqual(received.map((m) => m.text), ["/new", "@_user_1 看看"]);
+  } finally { await transport.stop(); }
+});
