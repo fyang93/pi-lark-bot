@@ -28,7 +28,13 @@ test("loading extension is inert; /lark-bot defaults to status and never writes 
     const h = harness(cwd);
     assert.deepEqual([...h.commands.keys()], ["lark-bot"]);
     assert.deepEqual([...h.tools.keys()], [], "loading registers no tool");
-    assert.deepEqual([...h.handlers.keys()], ["session_shutdown"]);
+    assert.deepEqual([...h.handlers.keys()], ["session_before_switch", "session_before_fork", "session_shutdown"]);
+    // No listener means no interruption: /new must stay silent when the bot is off.
+    let asked = 0;
+    const probe = { ui: { confirm: async () => { asked++; return true; } } };
+    assert.equal(await h.handlers.get("session_before_switch")({ reason: "new" }, probe), undefined);
+    assert.equal(await h.handlers.get("session_before_fork")({ position: "at" }, probe), undefined);
+    assert.equal(asked, 0);
     assert.deepEqual(await readdir(cwd), []);
     await h.commands.get("lark-bot").handler("", h.ctx);
     assert(h.messages.at(-1)?.includes("not connected"));

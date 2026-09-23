@@ -64,6 +64,8 @@ pi install -l /absolute/path/to/pi-lark-bot
 
 **安装、加载、连接或重启都不会自动开始监听。** 每次要接收消息时，都需显式执行 `/lark-bot on`。
 
+在主 pi 中执行 `/new`、`/resume`、`/fork` 或 `/clone` 会替换会话并重新加载扩展，监听**无法**在这个过程中存活：长连接断开、worker pane 全部关闭、排队消息丢弃。为避免它无声消失，监听中执行这些命令会先弹出确认，可以取消；聊天历史不受影响，之后重新执行 `/lark-bot on` 即可继续。
+
 ## 开放平台设置
 
 在 [飞书开放平台](https://open.feishu.cn/app) 或 [Lark 开放平台](https://open.larksuite.com/app) 配置应用：

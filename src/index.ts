@@ -60,6 +60,18 @@ export default function larkBot(pi: ExtensionAPI): void {
     try { await old?.stop(); }
     finally { const unlock = release; release = undefined; await unlock?.(); }
   }
+  // /new, /resume, /fork and /clone reload the extension, so the listener cannot
+  // survive them: session_shutdown tears it down and this instance is discarded.
+  // Warn while the action can still be cancelled instead of letting the bot
+  // disappear with nothing but the status bar going quiet.
+  async function confirmReplacement(ctx: { ui: { confirm(title: string, body: string): Promise<boolean> } } | undefined) {
+    if (shuttingDown || !controller?.status.active || !ctx) return undefined;
+    const ok = await ctx.ui.confirm("Stop the Lark bot?",
+      "Replacing this pi session stops the listener, closes every worker pane and drops queued messages. Chat history is preserved; run /lark-bot on afterwards to start listening again. Continue?");
+    return ok ? undefined : { cancel: true as const };
+  }
+  pi.on("session_before_switch", (_event, ctx) => confirmReplacement(ctx));
+  pi.on("session_before_fork", (_event, ctx) => confirmReplacement(ctx));
   pi.on("session_shutdown", async (_event, ctx) => {
     shuttingDown = true; setupAbort.abort();
     ctx?.ui.setStatus("lark-bot", undefined);
