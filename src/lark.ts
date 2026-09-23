@@ -71,11 +71,12 @@ export class LarkTransport implements BotTransport {
       // when it really mentions it. The channel enforces both, so nothing here
       // parses mentions or compares open_ids.
       policy: { dmMode: "open", requireMention: true },
-      // Every message is its own request with its own reply target, so merging
-      // consecutive ones would lose that association.
-      safety: { batch: { text: { delayMs: 0 } } },
-      loggerLevel: sdk.LoggerLevel?.warn ?? 2,
+      // Nothing else is overridden. The channel's defaults for deduplication,
+      // staleness, batching and per-chat queueing are what the bots that never
+      // lost a message ran on; tuning them from here is how messages go missing.
       logger: {
+        // A console logger would write through the pi TUI, so failures are
+        // reported to the extension instead. This changes no delivery decision.
         fatal: () => this.report("Lark SDK reported a fatal error"),
         error: () => this.report("Lark SDK reported an error"),
         warn: () => {}, info: () => {}, debug: () => {}, trace: () => {},

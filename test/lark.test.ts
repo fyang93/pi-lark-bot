@@ -50,16 +50,15 @@ function fakeSdk() {
 
 const message = { messageId: "om_1", chatId: "oc_1", chatType: "p2p", senderId: "ou_1", content: "hello", rawContentType: "text" };
 
-test("the channel is configured to decide mentions and never merge messages", async () => {
+test("the channel is configured for mentions and otherwise left at its defaults", async () => {
   const fake = fakeSdk();
   new LarkTransport(config, undefined, fake.sdk);
   const options = fake.options();
   assert.equal(options.transport, "websocket");
   assert.deepEqual(options.policy, { dmMode: "open", requireMention: true });
-  assert.deepEqual(options.safety, { batch: { text: { delayMs: 0 } } },
-    "merging consecutive messages would lose each one's own reply target");
   assert.equal(options.domain, "lark", "the brand picks the endpoint");
-  assert.equal(options.loggerLevel, 2, "the SDK's own warnings are not filtered away");
+  assert.equal(options.safety, undefined, "the channel's own safety defaults are left alone");
+  assert.equal(options.loggerLevel, undefined, "and so is its logging level");
 });
 
 test("connects, maps direct and group messages, then disconnects", async () => {
@@ -186,3 +185,4 @@ test("a quoted attachment download failure is isolated from the text request", a
     assert(!JSON.stringify(prepared).includes("secret SDK detail"));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
