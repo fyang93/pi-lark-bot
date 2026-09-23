@@ -442,3 +442,41 @@ test("a message addressed to the bot is always answered, even when it cannot be 
     await bot.stop();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("a cold Pi session that fails its first turn is retried once, not lost", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-coldstart-"));
+  try {
+    const transport = new FakeTransport();
+    const runs: string[] = [];
+    let failNext = true;
+    const workers: WorkerFactory = {
+      async open() {
+        return {
+          async run(text, emit) {
+            runs.push(text);
+            if (failNext) { failNext = false; emit({ type: "done", text: "处理失败：请稍后重试。", error: true }); return; }
+            emit({ type: "done", text: `Answer ${text}` });
+          },
+          async close() {},
+        };
+      },
+      async close() {},
+    };
+    const bot = new BotController({ config, stateDir: dir, transport, workers });
+    await bot.start();
+
+    await bot.receive(msg("cold"));
+    await bot.drain();
+    assert.deepEqual(runs, ["cold", "cold"], "the first turn is retried");
+    assert.equal(transport.updates.at(-1), "Answer cold", "the retry's answer replaces the failure");
+
+    // Once a turn has succeeded, a later failure is reported rather than repeated.
+    failNext = true;
+    runs.length = 0;
+    await bot.receive(msg("warm"));
+    await bot.drain();
+    assert.deepEqual(runs, ["warm"], "a warmed session never re-runs a request");
+    assert.equal(transport.updates.at(-1), "处理失败：请稍后重试。");
+    await bot.stop();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

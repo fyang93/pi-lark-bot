@@ -131,6 +131,8 @@ export class BotController {
   private allowlist = new Set<string>();
   /** Conversation key to its chat, so "set the push target here" needs no ID from the model. */
   private readonly chats = new Map<string, { chatId: string; chatType: "p2p" | "group" }>();
+  /** Conversations whose Pi session has completed a turn, so a failure there is real. */
+  private readonly warmed = new Set<string>();
   private pushTarget?: PushTarget;
   private pushTimes: number[] = [];
   private denied: DeniedSender[] = [];
@@ -446,7 +448,8 @@ export class BotController {
         : "";
       const request = [message.text, attachmentText, preparationWarning].filter(Boolean).join("\n\n");
       const prompt = message.chatType === "group" ? `${message.userId}: ${request}` : request;
-      await worker.run(prompt, (event) => {
+      const key = conversationKey(message);
+      const onEvent = (event: WorkerEvent) => {
         if (initialDone) {
           if (event.type === "text") continuation = event.text;
           if (event.type === "done") {
@@ -463,7 +466,17 @@ export class BotController {
         if (event.type === "text") answer = event.text;
         else status = event.text;
         progress?.set(`${status}\n\n${answer}`);
-      });
+      };
+      await worker.run(prompt, onEvent);
+      // A Pi session that has never completed a turn can fail while it is still
+      // coming up, before the request has had any effect. Losing the message to
+      // that is worse than running it twice, which cannot have happened yet.
+      if (this.active && final?.error && !this.warmed.has(key)) {
+        progress.set("⏳ 会话启动失败，正在重试…");
+        answer = ""; status = "⏳ 正在重试…"; final = undefined; initialDone = false;
+        await worker.run(prompt, onEvent);
+      }
+      if (final && !final.error) this.warmed.add(key);
       const cancelled = async () => {
         if (this.active) return false;
         await progress!.finish("⏹ 已停止，执行已中断；本地历史已保留。");
