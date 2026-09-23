@@ -1,169 +1,216 @@
+import { randomUUID } from "node:crypto";
+import { appendFile, writeFile } from "node:fs/promises";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { BotConfig, BotTransport, IncomingMessage } from "./types.js";
 import { AttachmentCache, MAX_ATTACHMENT_BYTES } from "./attachment-cache.js";
 
-/** An inbound message, already normalized by the SDK channel. */
-interface ChannelMessage {
-  messageId: string;
-  chatId: string;
-  chatType: string;
-  senderId: string;
-  content: string;
-  rawContentType?: string;
-  resources?: unknown[];
-  replyToMessageId?: string;
-}
-
-interface Channel {
-  botIdentity?: { openId: string; name: string };
-  rawClient: any;
-  connect(): Promise<void>;
-  disconnect(): Promise<void>;
-  on(handlers: Record<string, (...args: any[]) => unknown>): unknown;
-  send(to: string, input: object, options?: { replyTo?: string }): Promise<{ messageId: string }>;
-  editMessage(messageId: string, text: string): Promise<void>;
-  updateCard(messageId: string, card: object): Promise<void>;
-}
-
-/** The SDK surface used here; exported so tests can supply a real-shaped fake. */
+/** The SDK surface used here; exported so integration tests can supply a real-shaped fake. */
 export interface LarkSdk {
-  createLarkChannel(options: Record<string, unknown>): Channel;
+  Client: new (options: Record<string, unknown>) => any;
+  EventDispatcher: new (options?: Record<string, unknown>) => {
+    register(handles: Record<string, (event: unknown) => Promise<void> | void>): unknown;
+  };
+  WSClient: new (options: Record<string, unknown>) => {
+    start(options: { eventDispatcher: unknown }): Promise<void>;
+    close(options?: { force?: boolean }): void;
+  };
+  defaultHttpInstance?: { request(options: Record<string, unknown>): Promise<unknown> };
   Domain?: { Feishu: unknown; Lark: unknown };
-  LoggerLevel?: Record<string, number>;
 }
 
-export type LarkTransportState = "stopped" | "starting" | "connected";
+export type LarkTransportState = "stopped" | "starting" | "connected" | "reconnecting";
 
+const API_TIMEOUT_MS = 10_000;
+const START_TIMEOUT_MS = 30_000;
 const MAX_ATTEMPTS = 3;
 const RETRYABLE_CODES = new Set([90002, 90013, 99991400, 99991663]);
+/** The event trace is always on, so it rewrites itself rather than growing without end. */
+const EVENT_LOG_MAX_BYTES = 2 * 1024 * 1024;
+/** Chatter the SDK emits per request; only fatal/error/warn are worth recording. */
+const quietLogger = Object.freeze({ info() {}, debug() {}, trace() {} });
 
-/**
- * Tenant-bot Lark/Feishu transport.
- *
- * Connection lifecycle, reconnection, mention matching and message
- * normalization belong to the SDK's channel. Reimplementing them here is how
- * messages went missing: a hand-rolled connection flag discarded events that
- * arrived outside it, and a silenced logger hid what the SDK had to say. This
- * class maps between the channel's shapes and the controller's, and little else.
- */
+type PendingStart = { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+
+/** Tenant-bot Lark/Feishu transport using the SDK's persistent WebSocket. */
 export class LarkTransport implements BotTransport {
-  private readonly channel: Channel;
+  private readonly client: any;
+  private readonly dispatcher: InstanceType<LarkSdk["EventDispatcher"]>;
+  private readonly ws: InstanceType<LarkSdk["WSClient"]>;
   private onMessage?: (message: IncomingMessage) => Promise<void>;
   private onCardAction?: (messageId: string, chatId: string, operatorId: string | undefined, value: unknown) => Promise<void>;
+  private pendingStart?: PendingStart;
   private _state: LarkTransportState = "stopped";
+  private botOpenId?: string;
   private readonly attachmentCache?: AttachmentCache;
+  private readonly eventLogPath?: string;
+  private eventLogBytes = 0;
 
   constructor(
     private readonly config: BotConfig,
     private readonly onError: (error: Error) => void = () => {},
     sdk: LarkSdk = Lark as unknown as LarkSdk,
     attachmentCacheDir?: string,
+    /** Opt-in metadata log for diagnosing dropped events. Never records message text. */
+    eventLogPath?: string,
   ) {
     if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
+    // Assign before the SDK objects below: their logger writes through it.
+    this.eventLogPath = eventLogPath;
+    const domain = config.brand === "lark" ? sdk.Domain?.Lark : sdk.Domain?.Feishu;
+    // Generated endpoint methods' second parameter is IRequestOptions, not an
+    // Axios config, so a timeout there is ignored. This wrapper bounds normal
+    // API calls, tenant-token exchange, and WS endpoint discovery for real SDKs.
+    const httpInstance = boundedHttp(sdk.defaultHttpInstance);
+    // The SDK drops events of its own accord and only says so through warnings.
+    // Silencing those made a dropped event indistinguishable from one that was
+    // never delivered, so they are recorded instead.
+    const logger = Object.assign({
+      fatal: (...args: unknown[]) => this.traceSdk("sdk_fatal", args),
+      error: (...args: unknown[]) => this.traceSdk("sdk_error", args),
+      warn: (...args: unknown[]) => this.traceSdk("sdk_warn", args),
+    }, quietLogger);
+    const credentials = { appId: config.appId, appSecret: config.appSecret, domain, logger, loggerLevel: 2 };
+    // The bounded HTTP instance exists to cap REST calls. It was also handed to
+    // the WebSocket client, which the two implementations this one replaced
+    // never did, and a long connection has no business inheriting a 10s
+    // request budget.
+    this.client = new sdk.Client({ ...credentials, httpInstance });
     this.attachmentCache = attachmentCacheDir ? new AttachmentCache(attachmentCacheDir) : undefined;
-    this.channel = sdk.createLarkChannel({
-      appId: config.appId,
-      appSecret: config.appSecret,
-      domain: config.brand === "lark" ? sdk.Domain?.Lark : sdk.Domain?.Feishu,
-      transport: "websocket",
-      source: "pi-lark-bot",
-      // A direct message is always addressed to the bot; a group message only
-      // when it really mentions it. The channel enforces both, so nothing here
-      // parses mentions or compares open_ids.
-      policy: { dmMode: "open", requireMention: true },
-      // Nothing else is overridden. The channel's defaults for deduplication,
-      // staleness, batching and per-chat queueing are what the bots that never
-      // lost a message ran on; tuning them from here is how messages go missing.
-      logger: {
-        // A console logger would write through the pi TUI, so failures are
-        // reported to the extension instead. This changes no delivery decision.
-        fatal: () => this.report("Lark SDK reported a fatal error"),
-        error: () => this.report("Lark SDK reported an error"),
-        warn: () => {}, info: () => {}, debug: () => {}, trace: () => {},
-      },
+    this.dispatcher = new sdk.EventDispatcher({ logger, loggerLevel: 2 });
+    this.dispatcher.register({
+      "im.message.receive_v1": (event) => this.receive(event),
+      "card.action.trigger": (event) => this.cardAction(event),
+      // Subscribed by the platform alongside messages. Handled so the SDK stops
+      // reporting it as unregistered on every read receipt.
+      "im.message.message_read_v1": () => { this.trace("skip_read_receipt"); return undefined; },
     });
+    this.ws = new sdk.WSClient({
+      ...credentials,
+      autoReconnect: true,
+      onReady: () => { this.trace("ws_ready"); this.ready(); },
+      onReconnecting: () => {
+        this.trace("ws_reconnecting");
+        if (this._state === "connected") this._state = "reconnecting";
+      },
+      onReconnected: () => {
+        this.trace("ws_reconnected");
+        if (this._state === "starting") this.ready();
+        else if (this._state !== "stopped") this._state = "connected";
+      },
+      onError: () => { this.trace("ws_error"); this.connectionFailed(); },
+    });
+  }
+
+  /**
+   * Append one line of event metadata. Message text, sender names and file keys
+   * are never written: this exists to explain why an event was or was not
+   * handled, not to mirror the conversation.
+   */
+  private trace(disposition: string, event?: any): void {
+    if (!this.eventLogPath) return;
+    const message = event?.message;
+    this.write({
+      disposition, state: this._state,
+      ...(event ? {
+        senderType: event?.sender?.sender_type, chatType: message?.chat_type,
+        messageType: message?.message_type, messageId: message?.message_id,
+        mentions: Array.isArray(message?.mentions) ? message.mentions.length : undefined,
+        hasParent: typeof message?.parent_id === "string" || undefined,
+      } : {}),
+    });
+  }
+
+  /** Append one bounded line. The trace must never be why a disk fills up. */
+  private write(record: object): void {
+    const path = this.eventLogPath;
+    if (!path) return;
+    const line = `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`;
+    this.eventLogBytes += Buffer.byteLength(line);
+    if (this.eventLogBytes > EVENT_LOG_MAX_BYTES) {
+      this.eventLogBytes = Buffer.byteLength(line);
+      writeFile(path, line, { mode: 0o600 }).catch(() => {});
+      return;
+    }
+    appendFile(path, line, { mode: 0o600 }).catch(() => {});
+  }
+
+  /**
+   * Record an SDK diagnostic. The SDK's LoggerProxy hands its arguments over as
+   * one array, so they are flattened. Objects contribute their key names only:
+   * an SDK payload can carry message text, and this log promises not to hold any.
+   */
+  private traceSdk(disposition: string, args: unknown[]): void {
+    if (!this.eventLogPath) return;
+    const parts = (value: unknown, depth = 0): string[] => {
+      if (typeof value === "string") return [value];
+      if (typeof value === "number" || typeof value === "boolean") return [String(value)];
+      if (value instanceof Error) return [`${value.name}: ${value.message}`];
+      if (Array.isArray(value)) return depth < 3 ? value.flatMap((item) => parts(item, depth + 1)) : [];
+      if (value && typeof value === "object") return [`{${Object.keys(value).slice(0, 12).join(",")}}`];
+      return [];
+    };
+    const note = parts(args).join(" ").slice(0, 300);
+    this.write({ disposition, state: this._state, note: note.split(this.config.appSecret).join("***") });
   }
 
   get state(): LarkTransportState { return this._state; }
 
-  setCardActionHandler(handler: (messageId: string, chatId: string, operatorId: string | undefined, value: unknown) => Promise<void>): void {
-    this.onCardAction = handler;
-  }
+  setCardActionHandler(handler: (messageId: string, chatId: string, operatorId: string | undefined, value: unknown) => Promise<void>): void { this.onCardAction = handler; }
 
-  async start(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void> {
-    if (this._state !== "stopped") throw new Error("Lark transport is already started");
+  start(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void> {
+    if (this._state !== "stopped") return Promise.reject(new Error("Lark transport is already started"));
     this.onMessage = onMessage;
     this._state = "starting";
-    this.channel.on({
-      message: (message: ChannelMessage) => this.receive(message),
-      cardAction: (event: any) => this.cardAction(event),
-      // The channel's account of what it chose not to deliver. Surfacing it
-      // keeps a policy decision from looking like a lost message.
-      reject: (event: any) => this.report(`Lark channel rejected a message (${String(event?.reason ?? "unknown").slice(0, 60)})`),
-      error: () => this.report("Lark connection error"),
+    const ready = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => this.failStart("Lark connection timed out"), START_TIMEOUT_MS);
+      this.pendingStart = { resolve, reject, timer };
     });
-    try { await this.channel.connect(); }
-    catch (error) {
-      this._state = "stopped";
-      this.report("Lark connection failed");
-      throw error instanceof Error ? error : new Error("Lark connection failed");
+    try {
+      // Do not await WSClient.start: it can itself hang while endpoint discovery
+      // is in flight. `ready` remains bounded by START_TIMEOUT_MS instead.
+      void (async () => {
+        const info = await this.request(() => this.client.request({ method: "GET", url: "/open-apis/bot/v3/info" }));
+        if (typeof info?.bot?.open_id !== "string" || !info.bot.open_id) throw new Error("Missing bot identity");
+        this.botOpenId = info.bot.open_id;
+        if (this._state === "starting") await this.ws.start({ eventDispatcher: this.dispatcher });
+      })().catch(() => this.failStart("Lark connection could not be started"));
+    } catch (_error) {
+      this.failStart("Lark connection could not be started");
     }
-    this._state = "connected";
+    return ready;
   }
 
   async stop(): Promise<void> {
-    if (this._state === "stopped") return;
-    this._state = "stopped";
+    if (this._state === "starting") {
+      this.failStart("Lark connection was stopped"); // also force-closes exactly once
+      return;
+    }
+    this._state = "stopped"; // ignores late SDK callbacks and prevents reconnect resurrection
     this.onMessage = undefined;
-    try { await this.channel.disconnect(); } catch { /* an already closed connection needs no teardown */ }
+    this.close();
   }
 
   async send(chatId: string, text: string, replyTo?: string): Promise<string> {
-    const result = await this.channel.send(chatId, { markdown: text }, replyTo ? { replyTo } : undefined);
-    if (!result?.messageId) throw this.failure();
-    return result.messageId;
+    // Lark uses uuid for idempotency. Keep it stable across retries of this one send.
+    const data = { msg_type: "interactive", content: JSON.stringify(card(text)), uuid: randomUUID() };
+    const response = replyTo
+      ? await this.request(() => this.client.im.v1.message.reply({ data, path: { message_id: replyTo } }))
+      : await this.request(() => this.client.im.v1.message.create({
+        data: { ...data, receive_id: chatId }, params: { receive_id_type: "chat_id" },
+      }));
+    const messageId = response?.data?.message_id;
+    if (typeof messageId !== "string" || !messageId) throw this.failure();
+    return messageId;
   }
 
-  async update(messageId: string, text: string): Promise<void> {
-    await this.channel.editMessage(messageId, text);
-  }
-
-  /**
-   * Map the channel's message onto the controller's, deciding nothing the
-   * channel already decided. An addressed message with nothing runnable still
-   * travels on, carrying the reason, so it is answered rather than dropped.
-   */
-  private async receive(message: ChannelMessage): Promise<void> {
-    const handler = this.onMessage;
-    if (!handler || this._state === "stopped") return;
-    if (!message?.messageId || !message.chatId || !message.senderId) return;
-    const group = message.chatType !== "p2p";
-    const text = typeof message.content === "string" ? message.content.trim() : "";
-    const unsupported = text ? undefined : message.resources?.length ? "message_type" as const : "empty_text" as const;
-    try {
-      await handler({
-        id: message.messageId, userId: message.senderId, chatId: message.chatId,
-        text: text || `(${message.rawContentType ?? "empty"})`,
-        ...(unsupported ? { unsupported } : {}),
-        ...(message.replyToMessageId ? { parentMessageId: message.replyToMessageId } : {}),
-        ...(group ? { chatType: "group" as const, mentionedBot: true } : {}),
-      });
-    } catch { this.report("Lark message handler failed"); }
-  }
-
-  private async cardAction(event: any): Promise<void> {
-    const messageId = event?.messageId, chatId = event?.chatId;
-    if (typeof messageId !== "string" || typeof chatId !== "string" || !this.onCardAction) return;
-    try { await this.onCardAction(messageId, chatId, event?.operator?.openId, event?.action?.value); }
-    catch { this.report("Lark card action handler failed"); }
-  }
+  async update(messageId: string, text: string): Promise<void> { await this.updateCard(messageId, card(text)); }
 
   /** Resolve directly quoted resources after authorization; one failed resource never drops the text request. */
   async prepareMessage(message: IncomingMessage): Promise<IncomingMessage> {
     if (!message.parentMessageId || !this.attachmentCache) return message;
     let item: any;
     try {
-      const response = await this.request(() => this.channel.rawClient.im.v1.message.get({ path: { message_id: message.parentMessageId } }));
+      const response = await this.request(() => this.client.im.v1.message.get({ path: { message_id: message.parentMessageId } }));
       item = response?.data?.items?.find((candidate: any) => candidate?.message_id === message.parentMessageId);
     } catch {
       return { ...message, preparationWarning: "referenced_message_unavailable" };
@@ -196,19 +243,132 @@ export class LarkTransport implements BotTransport {
   }
 
   async sendCard(chatId: string, value: object, replyTo?: string): Promise<string> {
-    const result = await this.channel.send(chatId, { card: value }, replyTo ? { replyTo } : undefined);
-    if (!result?.messageId) throw this.failure();
-    return result.messageId;
+    const data = { msg_type: "interactive", content: JSON.stringify(value), uuid: randomUUID() };
+    const response = replyTo
+      ? await this.request(() => this.client.im.v1.message.reply({ data, path: { message_id: replyTo } }))
+      : await this.request(() => this.client.im.v1.message.create({ data: { ...data, receive_id: chatId }, params: { receive_id_type: "chat_id" } }));
+    const messageId = response?.data?.message_id;
+    if (typeof messageId !== "string" || !messageId) throw this.failure();
+    return messageId;
   }
 
   async updateCard(messageId: string, value: object): Promise<void> {
-    await this.channel.updateCard(messageId, value);
+    await this.request(() => this.client.im.v1.message.patch({
+      path: { message_id: messageId }, data: { content: JSON.stringify(value) },
+    }));
+  }
+
+  private ready(): void {
+    if (this._state !== "starting") return;
+    this._state = "connected";
+    this.settleStart();
+  }
+
+  private connectionFailed(): void {
+    if (this._state === "stopped") return;
+    if (this._state === "starting") this.failStart("Lark connection failed");
+    else {
+      this._state = "stopped";
+      this.close();
+      this.report("Lark connection failed");
+    }
+  }
+
+  private failStart(message: string): void {
+    if (this._state !== "starting") return;
+    this._state = "stopped";
+    this.onMessage = undefined;
+    const pending = this.pendingStart;
+    this.pendingStart = undefined;
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(message));
+    }
+    this.close();
+    this.report(message);
+  }
+
+  private settleStart(): void {
+    const pending = this.pendingStart;
+    this.pendingStart = undefined;
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.resolve();
+    }
+  }
+
+  private close(): void {
+    try { this.ws.close({ force: true }); }
+    catch (_error) { this.report("Lark connection could not be stopped"); }
+  }
+
+  private async cardAction(value: unknown): Promise<void> {
+    const event = value as any;
+    const messageId = event?.context?.open_message_id ?? event?.open_message_id ?? event?.message_id;
+    const chatId = event?.context?.open_chat_id ?? event?.open_chat_id ?? event?.chat_id;
+    const operatorId = event?.operator?.open_id;
+    if (typeof messageId !== "string" || typeof chatId !== "string" || !this.onCardAction) return;
+    try { await this.onCardAction(messageId, chatId, typeof operatorId === "string" ? operatorId : undefined, event?.action?.value); }
+    catch { this.report("Lark card action handler failed"); }
+  }
+
+  private async receive(value: unknown): Promise<void> {
+    const event = value as any;
+    const message = event?.message;
+    const drop = (reason: string): undefined => { this.trace(reason, event); return undefined; };
+    if (event?.sender?.sender_type !== "user") return drop("skip_non_user_sender");
+    if (!["p2p", "group"].includes(message?.chat_type)) return drop("skip_chat_type");
+    if (typeof message?.message_id !== "string" || typeof message?.chat_id !== "string") return drop("skip_malformed_ids");
+    const userId = event.sender.sender_id?.open_id;
+    if (typeof userId !== "string" || !userId) return drop("skip_no_sender_open_id");
+    const group = message.chat_type === "group";
+
+    // Decide whether the message is addressed to this bot before judging its
+    // content: an unsupported message in a group we merely sit in stays silent,
+    // but one aimed at us must never disappear without an answer.
+    let mentionKeys: string[] = [];
+    if (group) {
+      if (!this.botOpenId) {
+        this.report("Lark bot identity is unknown, so group mentions cannot be matched");
+        return drop("skip_bot_identity_unknown");
+      }
+      if (!Array.isArray(message.mentions)) return drop("skip_no_mentions");
+      const mentions = message.mentions.filter((mention: any) => mention?.id?.open_id === this.botOpenId);
+      if (!mentions.length) return drop("skip_bot_not_mentioned"); // @all or mentioning somebody else is not a bot command
+      mentionKeys = mentions.map((mention: any) => mention.key).filter((key: any) => typeof key === "string" && key.length > 0);
+    }
+
+    // Addressed but unusable: hand it on anyway, carrying the reason. The
+    // controller answers it after the allowlist check, so an unauthorized
+    // sender still gets no more than the usual refusal.
+    const deliver = (text: string, unsupported?: IncomingMessage["unsupported"]) => this.dispatch(message, userId, text, group, unsupported);
+    if (message.message_type !== "text") return deliver(`(${message.message_type})`, "message_type");
+    let content: unknown;
+    try { content = JSON.parse(message.content); } catch { return deliver("(unparsable)", "content"); }
+    if (!content || typeof (content as { text?: unknown }).text !== "string") return deliver("(no text)", "content");
+    let text = (content as { text: string }).text;
+    for (const key of mentionKeys) if (text.includes(key)) text = text.split(key).join("");
+    text = text.trim();
+    if (!text) return deliver("(empty)", "empty_text");
+    return deliver(text);
+  }
+
+  private async dispatch(message: any, userId: string, text: string, group: boolean, unsupported?: IncomingMessage["unsupported"]): Promise<void> {
+    if (this._state === "stopped") return void this.trace("skip_stopped", { message });
+    if (!this.onMessage) return void this.trace("skip_no_handler", { message });
+    this.trace(unsupported ? `accepted_${unsupported}` : "accepted", { message });
+    try {
+      await this.onMessage({ id: message.message_id, userId, chatId: message.chat_id, text,
+        ...(unsupported ? { unsupported } : {}),
+        ...(typeof message.parent_id === "string" && message.parent_id ? { parentMessageId: message.parent_id } : {}),
+        ...(group ? { chatType: "group" as const, mentionedBot: true } : {}) });
+    } catch (_error) { this.report("Lark message handler failed"); }
   }
 
   private async downloadResource(messageId: string, fileKey: string, type: "file" | "image"): Promise<any> {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
-        const response = await this.channel.rawClient.im.v1.messageResource.get({
+        const response = await this.client.im.v1.messageResource.get({
           path: { message_id: messageId, file_key: fileKey }, params: { type },
         });
         if (response && typeof response.getReadableStream === "function") return response;
@@ -247,6 +407,29 @@ export class LarkTransport implements BotTransport {
   }
 }
 
+function boundedHttp(http: LarkSdk["defaultHttpInstance"]): LarkSdk["defaultHttpInstance"] | undefined {
+  if (!http) return undefined; // enables minimal SDK test doubles
+  const options = (value: Record<string, unknown> = {}) => ({
+    ...value, timeout: Math.min(Number(value.timeout) || API_TIMEOUT_MS, API_TIMEOUT_MS),
+  });
+  // Tenant token exchange calls HttpInstance.post(), whereas generated OpenAPI
+  // methods call request(). Proxy both forms without changing SDK internals.
+  return new Proxy(http, {
+    get(target, key, receiver) {
+      const method = Reflect.get(target, key, receiver);
+      if (typeof method !== "function") return method;
+      if (key === "request") return (value: Record<string, unknown>) => method.call(target, options(value));
+      if (key === "get" || key === "delete" || key === "head" || key === "options") {
+        return (url: string, value?: Record<string, unknown>) => method.call(target, url, options(value));
+      }
+      if (key === "post" || key === "put" || key === "patch") {
+        return (url: string, data?: unknown, value?: Record<string, unknown>) => method.call(target, url, data, options(value));
+      }
+      return method.bind(target);
+    },
+  }) as LarkSdk["defaultHttpInstance"];
+}
+
 function delay(attempt: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
 }
@@ -277,3 +460,6 @@ function referencedResources(messageType: unknown, value: unknown): ReferencedRe
   }
 }
 
+function card(text: string): object {
+  return { config: { wide_screen_mode: true }, elements: [{ tag: "markdown", content: text }] };
+}
