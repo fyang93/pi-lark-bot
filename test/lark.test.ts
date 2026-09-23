@@ -4,102 +4,142 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import * as ActualLark from "@larksuiteoapi/node-sdk";
 import { LarkTransport, type LarkSdk } from "../src/lark.ts";
 import type { BotConfig } from "../src/types.ts";
 
 const config: BotConfig = { version: 1, brand: "lark", appId: "cli_123", appSecret: "secret" };
 
+/**
+ * The SDK channel owns the connection, mention matching and normalization, so
+ * this double only has to behave like the channel: deliver normalized messages
+ * and record what was sent.
+ */
 function fakeSdk() {
-  let handler: ((event: unknown) => Promise<void>) | undefined;
-  let clientOptions: any;
-  const calls: { create: any[]; reply: any[]; patch: any[]; get: any[]; resource: any[]; start: number; close: any[]; http: any[] } = {
-    create: [], reply: [], patch: [], get: [], resource: [], start: 0, close: [], http: [],
+  let options: any;
+  let handlers: Record<string, (...args: any[]) => any> = {};
+  const calls: { sent: any[]; edited: any[]; cards: any[]; connect: number; disconnect: number; get: any[]; resource: any[] } = {
+    sent: [], edited: [], cards: [], connect: 0, disconnect: 0, get: [], resource: [],
   };
-  let callbacks: Record<string, (() => void) | undefined> = {};
-  let started!: () => void;
-  const startEvent = new Promise<void>((resolve) => { started = resolve; });
   const api: any = {
-    create: async (payload: unknown) => { calls.create.push(payload); return { code: 0, data: { message_id: "out-1" } }; },
-    reply: async (payload: unknown) => { calls.reply.push(payload); return { code: 0, data: { message_id: "out-2" } }; },
-    patch: async (payload: unknown) => { calls.patch.push(payload); return { code: 0, data: {} }; },
     get: async (payload: unknown) => { calls.get.push(payload); return { code: 0, data: { items: [] } }; },
   };
   const messageResource = {
     get: async (payload: unknown) => { calls.resource.push(payload); return { headers: {}, getReadableStream: () => Readable.from([]) }; },
   };
-  class Client {
-    constructor(options: any) { clientOptions = options; }
-    im = { v1: { message: api, messageResource } };
-    async request(payload: any) { assert.equal(payload.url, "/open-apis/bot/v3/info"); return { code: 0, bot: { open_id: "ou_bot" } }; }
-  }
-  class EventDispatcher { constructor(_options?: any) {} register(handles: any) { handler = handles["im.message.receive_v1"]; } }
-  class WSClient {
-    constructor(options: any) { callbacks = options; }
-    async start(_options: any) { calls.start++; started(); }
-    close(options?: any) { calls.close.push(options); }
-  }
-  const defaultHttpInstance = {
-    request: async (options: any) => { calls.http.push(options); return {}; },
-    post: async (url: string, data: any, options: any) => { calls.http.push({ url, data, ...options }); return {}; },
+  let failConnect: Error | undefined;
+  const channel = {
+    rawClient: { im: { v1: { message: api, messageResource } } },
+    async connect() { calls.connect++; if (failConnect) throw failConnect; },
+    async disconnect() { calls.disconnect++; },
+    on(next: Record<string, (...args: any[]) => any>) { handlers = { ...handlers, ...next }; return () => {}; },
+    async send(to: string, input: any, opts?: any) { calls.sent.push({ to, input, opts }); return { messageId: `out-${calls.sent.length}` }; },
+    async editMessage(messageId: string, text: string) { calls.edited.push({ messageId, text }); },
+    async updateCard(messageId: string, card: object) { calls.cards.push({ messageId, card }); },
   };
   return {
-    sdk: { Client, EventDispatcher, WSClient, defaultHttpInstance, Domain: { Feishu: "feishu", Lark: "lark" } } as unknown as LarkSdk,
-    calls, api, messageResource, clientOptions: () => clientOptions, emit: async (event: unknown) => handler?.(event),
-    ready: async () => { await startEvent; callbacks.onReady?.(); }, error: () => callbacks.onError?.(),
-    reconnecting: () => callbacks.onReconnecting?.(), reconnected: () => callbacks.onReconnected?.(),
+    sdk: { createLarkChannel: (value: any) => { options = value; return channel; },
+      Domain: { Feishu: "feishu", Lark: "lark" }, LoggerLevel: { warn: 2 } } as unknown as LarkSdk,
+    calls, api, messageResource, channel,
+    options: () => options,
+    emit: (message: unknown) => handlers.message?.(message),
+    cardAction: (event: unknown) => handlers.cardAction?.(event),
+    reject: (event: unknown) => handlers.reject?.(event),
+    failConnect(error: Error) { failConnect = error; },
   };
 }
 
-const textEvent = { sender: { sender_type: "user", sender_id: { open_id: "ou_1" } }, message: {
-  message_id: "om_1", chat_id: "oc_1", chat_type: "p2p", message_type: "text", content: '{"text":"hello"}',
-} };
+const message = { messageId: "om_1", chatId: "oc_1", chatType: "p2p", senderId: "ou_1", content: "hello", rawContentType: "text" };
 
-test("waits for readiness, filters messages, handles reconnect, and force-closes", async () => {
+test("the channel is configured to decide mentions and never merge messages", async () => {
+  const fake = fakeSdk();
+  new LarkTransport(config, undefined, fake.sdk);
+  const options = fake.options();
+  assert.equal(options.transport, "websocket");
+  assert.deepEqual(options.policy, { dmMode: "open", requireMention: true });
+  assert.deepEqual(options.safety, { batch: { text: { delayMs: 0 } } },
+    "merging consecutive messages would lose each one's own reply target");
+  assert.equal(options.domain, "lark", "the brand picks the endpoint");
+  assert.equal(options.loggerLevel, 2, "the SDK's own warnings are not filtered away");
+});
+
+test("connects, maps direct and group messages, then disconnects", async () => {
   const fake = fakeSdk();
   const transport = new LarkTransport(config, undefined, fake.sdk);
   const received: any[] = [];
-  const starting = transport.start(async (message) => { received.push(message); });
-  assert.equal(transport.state, "starting");
-  await fake.ready();
-  await starting;
+  assert.equal(transport.state, "stopped");
+  await transport.start(async (value) => { received.push(value); });
   assert.equal(transport.state, "connected");
-  fake.reconnecting();
-  assert.equal(transport.state, "reconnecting");
-  fake.reconnected();
-  assert.equal(transport.state, "connected");
-  await fake.emit(textEvent);
-  await fake.emit({ ...textEvent, sender: { sender_type: "bot", sender_id: { open_id: "ou_2" } } });
-  await fake.emit({ ...textEvent, message: { ...textEvent.message, content: "not json" } });
-  await fake.emit({ ...textEvent, message: { ...textEvent.message, chat_type: "group" } });
+  assert.equal(fake.calls.connect, 1);
+
+  await fake.emit(message);
+  await fake.emit({ ...message, messageId: "om_2", chatType: "group", content: "build it", replyToMessageId: "om_parent" });
   assert.deepEqual(received, [
     { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "hello" },
-    // Unreadable content in a direct chat is still addressed to the bot.
-    { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "(unparsable)", unsupported: "content" },
-  ], "only a group message with no bot mention is dropped outright");
+    { id: "om_2", userId: "ou_1", chatId: "oc_1", text: "build it",
+      parentMessageId: "om_parent", chatType: "group", mentionedBot: true },
+  ]);
+
   await transport.stop();
-  assert.deepEqual(fake.calls.close, [{ force: true }]);
   assert.equal(transport.state, "stopped");
+  assert.equal(fake.calls.disconnect, 1);
+  await fake.emit({ ...message, messageId: "om_late" });
+  assert.equal(received.length, 2, "a stopped transport ignores late deliveries");
 });
 
-test("groups require a real bot mention; an addressed but empty prompt is answered, not ignored", async () => {
-  const fake = fakeSdk(); const transport = new LarkTransport(config, undefined, fake.sdk);
+test("an addressed message with nothing runnable travels on with its reason", async () => {
+  const fake = fakeSdk();
+  const transport = new LarkTransport(config, undefined, fake.sdk);
   const received: any[] = [];
-  const starting = transport.start(async (message) => { received.push(message); });
-  await fake.ready(); await starting;
+  await transport.start(async (value) => { received.push(value); });
   try {
-    const event = { ...textEvent, message: { ...textEvent.message, chat_type: "group",
-      content: JSON.stringify({ text: "@_user_1 hello" }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" } }] } };
-    await fake.emit(event);
-    await fake.emit({ ...event, message: { ...event.message, mentions: [] } });
-    await fake.emit({ ...event, message: { ...event.message, mentions: [{ key: "@_user_1", id: { open_id: "ou_other" } }] } });
-    await fake.emit({ ...event, message: { ...event.message, content: JSON.stringify({ text: "@_user_1" }) } });
-    assert.deepEqual(received, [
-      { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "hello", chatType: "group", mentionedBot: true },
-      // A bare mention reaches the controller so it can say what is missing.
-      { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "(empty)", unsupported: "empty_text", chatType: "group", mentionedBot: true },
+    await fake.emit({ ...message, messageId: "om_img", content: "", rawContentType: "image", resources: [{ type: "image" }] });
+    await fake.emit({ ...message, messageId: "om_bare", content: "   ", rawContentType: "text" });
+    assert.deepEqual(received.map((value) => [value.id, value.text, value.unsupported]), [
+      ["om_img", "(image)", "message_type"],
+      ["om_bare", "(text)", "empty_text"],
     ]);
   } finally { await transport.stop(); }
+});
+
+test("sends markdown, edits in place, and passes cards through", async () => {
+  const fake = fakeSdk();
+  const transport = new LarkTransport(config, undefined, fake.sdk);
+  await transport.start(async () => {});
+  try {
+    assert.equal(await transport.send("oc_1", "hi"), "out-1");
+    assert.equal(await transport.send("oc_1", "quoted", "om_1"), "out-2");
+    assert.equal(await transport.sendCard("oc_1", { tag: "picker" }), "out-3");
+    await transport.update("out-1", "updated");
+    await transport.updateCard("out-3", { tag: "chosen" });
+    assert.deepEqual(fake.calls.sent, [
+      { to: "oc_1", input: { markdown: "hi" }, opts: undefined },
+      { to: "oc_1", input: { markdown: "quoted" }, opts: { replyTo: "om_1" } },
+      { to: "oc_1", input: { card: { tag: "picker" } }, opts: undefined },
+    ]);
+    assert.deepEqual(fake.calls.edited, [{ messageId: "out-1", text: "updated" }]);
+    assert.deepEqual(fake.calls.cards, [{ messageId: "out-3", card: { tag: "chosen" } }]);
+  } finally { await transport.stop(); }
+});
+
+test("card actions reach the handler; a refused connection leaves the transport stopped", async () => {
+  const fake = fakeSdk();
+  const errors: string[] = [];
+  const transport = new LarkTransport(config, (error) => errors.push(error.message), fake.sdk);
+  const actions: any[] = [];
+  transport.setCardActionHandler(async (messageId, chatId, operatorId, value) => { actions.push({ messageId, chatId, operatorId, value }); });
+  await transport.start(async () => {});
+  await fake.cardAction({ messageId: "om_card", chatId: "oc_1", operator: { openId: "ou_9" }, action: { value: { key: "x" } } });
+  assert.deepEqual(actions, [{ messageId: "om_card", chatId: "oc_1", operatorId: "ou_9", value: { key: "x" } }]);
+  // A policy decision by the channel is reported, so silence never looks like loss.
+  fake.reject({ reason: "not_mentioned" });
+  assert(errors.some((text) => text.includes("not_mentioned")));
+  await transport.stop();
+
+  const refused = fakeSdk();
+  refused.failConnect(new Error("handshake refused"));
+  const failing = new LarkTransport(config, undefined, refused.sdk);
+  await assert.rejects(failing.start(async () => {}), /handshake refused/);
+  assert.equal(failing.state, "stopped");
 });
 
 test("captures a reply parent and caches its file resource for the authorized controller", async () => {
@@ -117,9 +157,8 @@ test("captures a reply parent and caches its file resource for the authorized co
   const transport = new LarkTransport(config, undefined, fake.sdk, root);
   const received: any[] = [];
   try {
-    const starting = transport.start(async (message) => { received.push(message); });
-    await fake.ready(); await starting;
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, parent_id: "om_file" } });
+    await transport.start(async (value) => { received.push(value); });
+    await fake.emit({ ...message, replyToMessageId: "om_file" });
     assert.equal(received[0].parentMessageId, "om_file");
     const prepared = await transport.prepareMessage(received[0]);
     const attachment = prepared.attachments?.[0];
@@ -140,209 +179,10 @@ test("a quoted attachment download failure is isolated from the text request", a
   fake.messageResource.get = async () => { throw new Error("secret SDK detail"); };
   const transport = new LarkTransport(config, undefined, fake.sdk, root);
   try {
-    const prepared = await transport.prepareMessage({ ...textEvent.message, id: "request", userId: "ou_1", chatId: "oc_1",
+    const prepared = await transport.prepareMessage({ id: "request", userId: "ou_1", chatId: "oc_1",
       text: "analyze it", parentMessageId: "om_image" });
     assert.deepEqual(prepared.attachments, [{ status: "failed", type: "image", name: "image.bin",
       sourceMessageId: "om_image", error: "download_failed" }]);
     assert(!JSON.stringify(prepared).includes("secret SDK detail"));
   } finally { await rm(root, { recursive: true, force: true }); }
-});
-
-test("rejects a pending start on SDK failure or explicit stop and cleans up", async () => {
-  const failed = fakeSdk();
-  const failedTransport = new LarkTransport(config, undefined, failed.sdk);
-  const failedStart = failedTransport.start(async () => {});
-  failed.error();
-  await assert.rejects(failedStart, /Lark connection failed/);
-  assert.equal(failedTransport.state, "stopped");
-  assert.deepEqual(failed.calls.close, [{ force: true }]);
-
-  const stopped = fakeSdk();
-  const stoppedTransport = new LarkTransport(config, undefined, stopped.sdk);
-  const stoppedStart = stoppedTransport.start(async () => {});
-  await stoppedTransport.stop();
-  await assert.rejects(stoppedStart, /Lark connection was stopped/);
-  assert.equal(stoppedTransport.state, "stopped");
-  assert.deepEqual(stopped.calls.close, [{ force: true }]);
-});
-
-test("times out an initial handshake and force-closes", async (t) => {
-  (t.mock.timers as any).enable({ apis: ["setTimeout"] });
-  const fake = fakeSdk();
-  const transport = new LarkTransport(config, undefined, fake.sdk);
-  const starting = transport.start(async () => {});
-  (t.mock.timers as any).tick(30_000);
-  await assert.rejects(starting, /Lark connection timed out/);
-  assert.equal(transport.state, "stopped");
-  assert.deepEqual(fake.calls.close, [{ force: true }]);
-});
-
-test("uses idempotent create/reply/patch cards and bounded HTTP/retries", async () => {
-  const fake = fakeSdk();
-  const transport = new LarkTransport(config, undefined, fake.sdk);
-  assert.equal(await transport.send("oc_1", "progress"), "out-1");
-  assert.equal(await transport.send("oc_1", "reply", "om_1"), "out-2");
-  await transport.update("out-1", "updated");
-  const create = fake.calls.create[0];
-  assert.deepEqual(create.params, { receive_id_type: "chat_id" });
-  assert.equal(create.data.receive_id, "oc_1");
-  assert.equal(create.data.msg_type, "interactive");
-  assert.match(create.data.uuid, /^[0-9a-f-]{36}$/);
-  assert.equal(JSON.parse(create.data.content).elements[0].content, "progress");
-  assert.equal(fake.calls.reply[0].path.message_id, "om_1");
-  assert.equal(fake.calls.reply[0].data.uuid, fake.calls.reply[0].data.uuid);
-  assert.equal(fake.calls.patch[0].path.message_id, "out-1");
-  await fake.clientOptions().httpInstance.request({ timeout: 50_000, url: "token" });
-  assert.equal(fake.calls.http[0].timeout, 10_000);
-
-  let attempts = 0;
-  const retriedUuids: string[] = [];
-  (transport as any).client.im.v1.message.create = async (payload: any) => {
-    retriedUuids.push(payload.data.uuid);
-    return ++attempts < 3 ? { code: 90002 } : { code: 0, data: { message_id: "retried" } };
-  };
-  assert.equal(await transport.send("oc_1", "x"), "retried");
-  assert.equal(attempts, 3);
-  assert.equal(new Set(retriedUuids).size, 1);
-
-  attempts = 0;
-  (transport as any).client.im.v1.message.create = async () => { attempts++; return { code: 12345, data: { message_id: "bad" } }; };
-  await assert.rejects(transport.send("oc_1", "x"), /Lark API request failed/);
-  assert.equal(attempts, 1);
-});
-
-test("real SDK Client sends tenant-token and message HTTP through the timeout wrapper", async () => {
-  const fake = fakeSdk();
-  const rawCalls: any[] = [];
-  let messageRequests = 0;
-  (fake.sdk as any).defaultHttpInstance = {
-    request: async (options: any) => {
-      rawCalls.push(options);
-      if (++messageRequests === 1) throw new Error("temporary HTTP failure, secret details must not leak");
-      return { code: 0, data: { message_id: "from-real-sdk" } };
-    },
-    post: async (url: string, data: any, options: any) => {
-      rawCalls.push({ url, data, ...options });
-      return { code: 0, tenant_access_token: "tenant-token", expire: 7200 };
-    },
-  };
-  const sdk = { ...fake.sdk, Client: ActualLark.Client } as unknown as LarkSdk;
-  const transport = new LarkTransport(config, undefined, sdk);
-  assert.equal(await transport.send("oc_1", "hello"), "from-real-sdk");
-  assert.ok(rawCalls.some((call) => String(call.url).includes("tenant_access_token")));
-  assert.ok(rawCalls.some((call) => String(call.url).includes("/im/v1/messages")));
-  assert.ok(rawCalls.every((call) => call.timeout === 10_000));
-  assert.equal(messageRequests, 2);
-  const sends = rawCalls.filter((call) => String(call.url).includes("/im/v1/messages"));
-  assert.equal(sends[0].data.uuid, sends[1].data.uuid);
-});
-
-test("events delivered while starting or reconnecting are handled, not silently dropped", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "lark-events-"));
-  try {
-    const fake = fakeSdk();
-    const log = join(dir, "events.log");
-    const transport = new LarkTransport(config, undefined, fake.sdk, undefined, log);
-    const received: any[] = [];
-    const starting = transport.start(async (message) => { received.push(message); });
-
-    // The SDK only delivers over a live socket, so a message that arrives before
-    // onReady lands is a real user message, not noise.
-    assert.equal(transport.state, "starting");
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_starting" } });
-    await fake.ready();
-    await starting;
-
-    fake.reconnecting();
-    assert.equal(transport.state, "reconnecting");
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_reconnecting" } });
-    fake.reconnected();
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_connected" } });
-    assert.deepEqual(received.map((m) => m.id), ["om_starting", "om_reconnecting", "om_connected"]);
-
-    // A stopped transport still refuses late callbacks.
-    await transport.stop();
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_after_stop" } });
-    assert.equal(received.length, 3);
-
-    const lines = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    assert.deepEqual(lines.filter((l) => l.disposition === "accepted").map((l) => l.messageId),
-      ["om_starting", "om_reconnecting", "om_connected"]);
-    assert.deepEqual(lines.filter((l) => l.messageId === "om_after_stop").map((l) => l.disposition), ["skip_stopped"]);
-    assert(lines.some((l) => l.disposition === "ws_reconnecting"), "state changes are traced too");
-    assert(!JSON.stringify(lines).includes("hello"), "the trace never records message text");
-  } finally { await rm(dir, { recursive: true, force: true }); }
-});
-
-test("each rejected event records why it was rejected", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "lark-events-drop-"));
-  try {
-    const fake = fakeSdk();
-    const log = join(dir, "events.log");
-    const transport = new LarkTransport(config, undefined, fake.sdk, undefined, log);
-    const starting = transport.start(async () => {});
-    await fake.ready(); await starting;
-    await fake.emit({ ...textEvent, sender: { sender_type: "bot", sender_id: { open_id: "ou_2" } } });
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_type: "post" } });
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, content: "not json" } });
-    await fake.emit({ ...textEvent, message: { ...textEvent.message, chat_type: "group" } });
-    await transport.stop();
-    const reasons = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l).disposition);
-    for (const reason of ["skip_non_user_sender", "accepted_message_type", "accepted_content", "skip_no_mentions"]) {
-      assert(reasons.includes(reason), `missing ${reason}`);
-    }
-  } finally { await rm(dir, { recursive: true, force: true }); }
-});
-
-test("SDK diagnostics reach the trace instead of being silenced, with the secret redacted", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "lark-sdk-log-"));
-  try {
-    let captured: any;
-    const fake = fakeSdk();
-    const sdk = {
-      ...fake.sdk,
-      EventDispatcher: class {
-        constructor(options: any) { captured = options; }
-        register() { return this; }
-      },
-    } as unknown as LarkSdk;
-    const log = join(dir, "events.log");
-    new LarkTransport(config, undefined, sdk, undefined, log);
-
-    assert.equal(captured.loggerLevel, 2, "warnings must not be filtered out by level");
-    // The SDK's LoggerProxy passes its arguments as a single array.
-    captured.logger.warn(["no im.message.receive_v1 handle"]);
-    captured.logger.error(["[ws]", new Error("boom")], { text: "secret chat content" });
-    captured.logger.info("routine chatter");
-    captured.logger.debug("routine chatter");
-    // Anything the SDK echoes back must not leak the credential.
-    captured.logger.warn([`request failed with ${config.appSecret}`]);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    const lines = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
-    assert.deepEqual(lines.map((l) => l.disposition), ["sdk_warn", "sdk_error", "sdk_warn"],
-      "info and debug stay out of the trace");
-    assert.equal(lines[0].note, "no im.message.receive_v1 handle");
-    assert.equal(lines[1].note, "[ws] Error: boom {text}",
-      "arrays flatten, errors keep their message, objects contribute key names only");
-    assert(!lines[2].note.includes(config.appSecret) && lines[2].note.includes("***"));
-  } finally { await rm(dir, { recursive: true, force: true }); }
-});
-
-test("the WebSocket client gets plain credentials, not the REST call budget", async () => {
-  let wsOptions: any, clientOptions: any;
-  const fake = fakeSdk();
-  const sdk = {
-    ...fake.sdk,
-    Client: class { constructor(options: any) { clientOptions = options; } im = {} as any;
-      async request() { return { code: 0, bot: { open_id: "ou_bot" } }; } },
-    WSClient: class { constructor(options: any) { wsOptions = options; } async start() {} close() {} },
-  } as unknown as LarkSdk;
-  new LarkTransport(config, undefined, sdk);
-
-  assert(clientOptions.httpInstance, "REST calls stay bounded");
-  assert.equal(wsOptions.httpInstance, undefined,
-    "a long connection must not inherit the REST request timeout");
-  assert.equal(wsOptions.handshakeTimeoutMs, undefined);
-  assert.equal(wsOptions.autoReconnect, true);
 });
