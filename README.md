@@ -16,10 +16,10 @@
 
 ## 安装与连接
 
-在目标项目目录安装正式版：
+在目标项目目录安装：
 
 ```sh
-pi install -l git:github.com/fyang93/pi-lark-bot@v0.3.0
+pi install -l git:github.com/fyang93/pi-lark-bot
 ```
 
 在 Zellij 中启动 pi；如果 pi 已在运行，先执行 `/reload`。然后输入：
@@ -98,7 +98,7 @@ pi install -l git:github.com/fyang93/pi-lark-bot@v0.3.0
 
 ## 更新与排查
 
-版本标签安装会固定版本，升级时用新标签重新安装。若安装的是 `@main`，在目标项目执行 `pi update --extensions` 即可更新。然后在 pi 中依次执行：
+在目标项目执行 `pi update --extensions` 即可更新。然后在 pi 中依次执行：
 
 ```text
 /lark-bot off
