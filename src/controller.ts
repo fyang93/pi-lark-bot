@@ -112,7 +112,11 @@ function unsupportedNote(message: IncomingMessage): string {
 
 type BotCommand = { name: "new"; arg: "" } | { name: "model"; arg: string };
 function command(text: string): BotCommand | undefined {
-  const match = text.trim().match(/^\/(new|model)(?:\s+(.+?))?\s*$/i);
+  // A phone's Chinese IME produces a full-width solidus and full-width spaces.
+  // Missing the command over that sends "/new" to the model, which answers with
+  // a confirmation of its own and resets nothing.
+  const normalized = text.replace(/[\uff0f\u2044\u2215]/g, "/").replace(/[\u3000\u00a0]/g, " ").trim();
+  const match = normalized.match(/^\/(new|model)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as BotCommand["name"], arg: match[2]?.trim() ?? "" } as BotCommand;
 }
@@ -520,3 +524,5 @@ export class BotController {
     return this.stopping;
   }
 }
+
+export const __controllerTest__ = { command };

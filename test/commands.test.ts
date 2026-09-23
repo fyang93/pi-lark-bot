@@ -3,7 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { BotController } from "../src/controller.ts";
+import { BotController, __controllerTest__ } from "../src/controller.ts";
+const { command } = __controllerTest__;
 import type { BotTransport, IncomingMessage, WorkerFactory } from "../src/types.ts";
 
 class Transport implements BotTransport {
@@ -45,4 +46,14 @@ test("/new and /model are scoped to the sender's DM or the current group", async
     assert(transport.sent.includes("已开启新的 Pi 会话。"));
     assert(transport.sent.some((text) => text.includes("当前模型：openai/fast") && text.includes("openai/default")));
   } finally { await bot.stop(); await rm(stateDir, { recursive: true, force: true }); }
+});
+
+test("a command typed on a phone keyboard is still a command", () => {
+  // A Chinese IME gives a full-width solidus and full-width spaces; missing the
+  // command over that hands "/new" to the model, which confirms a reset that
+  // never happened.
+  assert.deepEqual(command("／new"), { name: "new", arg: "" });
+  assert.deepEqual(command("　/new　"), { name: "new", arg: "" });
+  assert.deepEqual(command("／model anthropic/claude"), { name: "model", arg: "anthropic/claude" });
+  assert.equal(command("请帮我 /new 一下"), undefined, "it still has to be the whole message");
 });
