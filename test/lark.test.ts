@@ -228,3 +228,60 @@ test("real SDK Client sends tenant-token and message HTTP through the timeout wr
   const sends = rawCalls.filter((call) => String(call.url).includes("/im/v1/messages"));
   assert.equal(sends[0].data.uuid, sends[1].data.uuid);
 });
+
+test("events delivered while starting or reconnecting are handled, not silently dropped", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-events-"));
+  try {
+    const fake = fakeSdk();
+    const log = join(dir, "events.log");
+    const transport = new LarkTransport(config, undefined, fake.sdk, undefined, log);
+    const received: any[] = [];
+    const starting = transport.start(async (message) => { received.push(message); });
+
+    // The SDK only delivers over a live socket, so a message that arrives before
+    // onReady lands is a real user message, not noise.
+    assert.equal(transport.state, "starting");
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_starting" } });
+    await fake.ready();
+    await starting;
+
+    fake.reconnecting();
+    assert.equal(transport.state, "reconnecting");
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_reconnecting" } });
+    fake.reconnected();
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_connected" } });
+    assert.deepEqual(received.map((m) => m.id), ["om_starting", "om_reconnecting", "om_connected"]);
+
+    // A stopped transport still refuses late callbacks.
+    await transport.stop();
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_id: "om_after_stop" } });
+    assert.equal(received.length, 3);
+
+    const lines = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(lines.filter((l) => l.disposition === "accepted").map((l) => l.messageId),
+      ["om_starting", "om_reconnecting", "om_connected"]);
+    assert.deepEqual(lines.filter((l) => l.messageId === "om_after_stop").map((l) => l.disposition), ["skip_stopped"]);
+    assert(lines.some((l) => l.disposition === "ws_reconnecting"), "state changes are traced too");
+    assert(!JSON.stringify(lines).includes("hello"), "the trace never records message text");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("each rejected event records why it was rejected", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-events-drop-"));
+  try {
+    const fake = fakeSdk();
+    const log = join(dir, "events.log");
+    const transport = new LarkTransport(config, undefined, fake.sdk, undefined, log);
+    const starting = transport.start(async () => {});
+    await fake.ready(); await starting;
+    await fake.emit({ ...textEvent, sender: { sender_type: "bot", sender_id: { open_id: "ou_2" } } });
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_type: "post" } });
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, content: "not json" } });
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, chat_type: "group" } });
+    await transport.stop();
+    const reasons = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l).disposition);
+    for (const reason of ["skip_non_user_sender", "skip_message_type", "skip_unparsable_content", "skip_no_mentions"]) {
+      assert(reasons.includes(reason), `missing ${reason}`);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

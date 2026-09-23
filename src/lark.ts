@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { appendFile } from "node:fs/promises";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { BotConfig, BotTransport, IncomingMessage } from "./types.js";
 import { AttachmentCache, MAX_ATTACHMENT_BYTES } from "./attachment-cache.js";
@@ -40,12 +41,15 @@ export class LarkTransport implements BotTransport {
   private _state: LarkTransportState = "stopped";
   private botOpenId?: string;
   private readonly attachmentCache?: AttachmentCache;
+  private readonly eventLogPath?: string;
 
   constructor(
     private readonly config: BotConfig,
     private readonly onError: (error: Error) => void = () => {},
     sdk: LarkSdk = Lark as unknown as LarkSdk,
     attachmentCacheDir?: string,
+    /** Opt-in metadata log for diagnosing dropped events. Never records message text. */
+    eventLogPath?: string,
   ) {
     if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
     const domain = config.brand === "lark" ? sdk.Domain?.Lark : sdk.Domain?.Feishu;
@@ -56,19 +60,44 @@ export class LarkTransport implements BotTransport {
     const common = { appId: config.appId, appSecret: config.appSecret, domain, httpInstance, logger: silentLogger, loggerLevel: 0 };
     this.client = new sdk.Client(common);
     this.attachmentCache = attachmentCacheDir ? new AttachmentCache(attachmentCacheDir) : undefined;
+    this.eventLogPath = eventLogPath;
     this.dispatcher = new sdk.EventDispatcher({ logger: silentLogger, loggerLevel: 0 });
     this.dispatcher.register({ "im.message.receive_v1": (event) => this.receive(event), "card.action.trigger": (event) => this.cardAction(event) });
     this.ws = new sdk.WSClient({
       ...common,
       handshakeTimeoutMs: API_TIMEOUT_MS,
-      onReady: () => this.ready(),
-      onReconnecting: () => { if (this._state === "connected") this._state = "reconnecting"; },
+      onReady: () => { this.trace("ws_ready"); this.ready(); },
+      onReconnecting: () => {
+        this.trace("ws_reconnecting");
+        if (this._state === "connected") this._state = "reconnecting";
+      },
       onReconnected: () => {
+        this.trace("ws_reconnected");
         if (this._state === "starting") this.ready();
         else if (this._state !== "stopped") this._state = "connected";
       },
-      onError: () => this.connectionFailed(),
+      onError: () => { this.trace("ws_error"); this.connectionFailed(); },
     });
+  }
+
+  /**
+   * Append one line of event metadata. Message text, sender names and file keys
+   * are never written: this exists to explain why an event was or was not
+   * handled, not to mirror the conversation.
+   */
+  private trace(disposition: string, event?: any): void {
+    if (!this.eventLogPath) return;
+    const message = event?.message;
+    const line = `${JSON.stringify({
+      at: new Date().toISOString(), disposition, state: this._state,
+      ...(event ? {
+        senderType: event?.sender?.sender_type, chatType: message?.chat_type,
+        messageType: message?.message_type, messageId: message?.message_id,
+        mentions: Array.isArray(message?.mentions) ? message.mentions.length : undefined,
+        hasParent: typeof message?.parent_id === "string" || undefined,
+      } : {}),
+    })}\n`;
+    appendFile(this.eventLogPath, line, { mode: 0o600 }).catch(() => {});
   }
 
   get state(): LarkTransportState { return this._state; }
@@ -233,27 +262,35 @@ export class LarkTransport implements BotTransport {
   private async receive(value: unknown): Promise<void> {
     const event = value as any;
     const message = event?.message;
-    if (
-      event?.sender?.sender_type !== "user" || !["p2p", "group"].includes(message?.chat_type) ||
-      message?.message_type !== "text" || typeof message?.message_id !== "string" ||
-      typeof message?.chat_id !== "string"
-    ) return;
+    const drop = (reason: string): undefined => { this.trace(reason, event); return undefined; };
+    if (event?.sender?.sender_type !== "user") return drop("skip_non_user_sender");
+    if (!["p2p", "group"].includes(message?.chat_type)) return drop("skip_chat_type");
+    if (message?.message_type !== "text") return drop("skip_message_type");
+    if (typeof message?.message_id !== "string" || typeof message?.chat_id !== "string") return drop("skip_malformed_ids");
     const userId = event.sender.sender_id?.open_id;
-    if (typeof userId !== "string" || !userId) return;
+    if (typeof userId !== "string" || !userId) return drop("skip_no_sender_open_id");
     let content: unknown;
-    try { content = JSON.parse(message.content); } catch { return; }
-    if (!content || typeof (content as { text?: unknown }).text !== "string") return;
+    try { content = JSON.parse(message.content); } catch { return drop("skip_unparsable_content"); }
+    if (!content || typeof (content as { text?: unknown }).text !== "string") return drop("skip_no_text_field");
     let text = (content as { text: string }).text;
     const group = message.chat_type === "group";
     if (group) {
-      if (!this.botOpenId || !Array.isArray(message.mentions)) return;
+      if (!this.botOpenId) return drop("skip_bot_identity_unknown");
+      if (!Array.isArray(message.mentions)) return drop("skip_no_mentions");
       const mentions = message.mentions.filter((mention: any) => mention?.id?.open_id === this.botOpenId &&
         typeof mention.key === "string" && mention.key.length > 0 && text.includes(mention.key));
-      if (!mentions.length) return; // @all or mentioning somebody else is not a bot command
+      if (!mentions.length) return drop("skip_bot_not_mentioned"); // @all or mentioning somebody else is not a bot command
       for (const mention of mentions) text = text.split(mention.key).join("");
       text = text.trim();
     }
-    if (!text.trim() || !this.onMessage || this._state !== "connected") return;
+    if (!text.trim()) return drop("skip_empty_text");
+    // The SDK only hands us an event over a live connection, so honouring it
+    // depends on whether this transport has been stopped, not on which phase of
+    // the connection lifecycle a status flag happens to be in. Dropping events
+    // during "starting" or "reconnecting" silently loses real user messages.
+    if (this._state === "stopped") return drop("skip_stopped");
+    if (!this.onMessage) return drop("skip_no_handler");
+    this.trace("accepted", event);
     try { await this.onMessage({ id: message.message_id, userId, chatId: message.chat_id, text,
       ...(typeof message.parent_id === "string" && message.parent_id ? { parentMessageId: message.parent_id } : {}),
       ...(group ? { chatType: "group" as const, mentionedBot: true } : {}) }); }

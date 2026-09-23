@@ -223,7 +223,9 @@ export default function larkBot(pi: ExtensionAPI): void {
               ? ` (${error.message.slice(0, 240)})` : "";
             ctx.ui.notify(`Lark bot operation failed${detail}. Check connectivity, app permissions and the session pane. Generated history is preserved locally.`, "error");
           };
-          const transport = new LarkTransport(config, onError, undefined, join(stateDir, "attachments"));
+          // Opt-in: explains why an inbound event was or was not handled.
+          const eventLog = process.env.PI_LARK_BOT_EVENT_LOG === "1" ? join(stateDir, "events.log") : undefined;
+          const transport = new LarkTransport(config, onError, undefined, join(stateDir, "attachments"), eventLog);
           // Worker panes hold no credentials: their push and push-target requests
           // are served here, and the chat is resolved from the worker's own key.
           let served: BotController | undefined;

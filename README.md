@@ -161,6 +161,7 @@ pi install -l /absolute/path/to/pi-lark-bot
   allowlist.json    # 已由本机操作者确认的用户 open_id（私聊与群聊共用）
   push-target.json  # 全局唯一的推送目标聊天；缺失即停用推送
   attachments/      # 被引用附件的持久缓存（按消息资源哈希去重）
+  events.log        # 仅在 PI_LARK_BOT_EVENT_LOG=1 时生成的事件处置日志
   controller.lock   # 项目独占锁
 ```
 
@@ -169,6 +170,20 @@ pi install -l /absolute/path/to/pi-lark-bot
 附件仅在发送者通过白名单检查后下载；同一消息资源会复用缓存。单个资源最大 100 MB，缓存最多约 1 GB；30 天未使用的资源和超出容量时最旧的资源会被清理。文件名会净化，下载采用私有临时文件并原子落盘。当前处理直接引用的独立附件消息，不展开多层引用、富文本内嵌资源或合并转发。若应用是此前连接的，请重新执行 `/lark-bot link` 或在开放平台补充 `im:message:readonly` 权限。
 
 接收去重优先防止重复执行：若进程在记录消息后、执行前崩溃，该消息不会自动重放，需要用户重新发送。若遇到旧锁，请先确认原进程及 pane 已退出，再手动删除 `controller.lock`。
+
+## 排查消息未被处理
+
+设置 `PI_LARK_BOT_EVENT_LOG=1` 后启动 pi，再执行 `/lark-bot on`，扩展会把每一条入站事件的**处置结果**逐行追加到 `<project>/.pi/lark-bot/events.log`：
+
+```json
+{"at":"…","disposition":"accepted","state":"connected","chatType":"p2p","messageId":"om_…"}
+{"at":"…","disposition":"skip_bot_not_mentioned","state":"connected","chatType":"group","mentions":1}
+{"at":"…","disposition":"ws_reconnecting","state":"connected"}
+```
+
+`disposition` 说明该事件被接收还是被哪一条规则拦下（发送者非用户、消息类型非文本、内容不可解析、群里没有 @ 到本机器人、文本为空、传输已停止等），并记录长连接的状态变化。**日志只含元数据，不记录消息文本、发送者昵称或文件标识。**
+
+如果某条消息在飞书里发出却完全没有反应，先看这个日志：有对应行说明事件到达了，`disposition` 直接指出原因；没有任何行则说明事件根本没被推送到本机。
 
 ## 开发
 
