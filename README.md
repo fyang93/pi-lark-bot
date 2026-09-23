@@ -181,7 +181,7 @@ pi install -l /absolute/path/to/pi-lark-bot
 {"at":"…","disposition":"ws_reconnecting","state":"connected"}
 ```
 
-`disposition` 说明该事件被接收（`accepted*`）还是被哪一条规则拦下（`skip_*`），并记录长连接的状态变化。**日志只含元数据，不记录消息文本、发送者昵称或文件标识。**
+`disposition` 说明该事件被接收（`accepted*`）还是被哪一条规则拦下（`skip_*`），并记录长连接的状态变化，以及 SDK 自己的告警（`sdk_warn` / `sdk_error` / `sdk_fatal`）——SDK 会自行丢弃事件且只通过告警说明，压掉这些告警会让"被丢弃"和"没送达"无从分辨。**日志只含元数据，不记录消息文本、发送者昵称或文件标识；SDK 告警只保留其中的字符串参数并抹去密钥。**
 
 **发给机器人的消息一定会有回应。** 私聊的全部消息、群里真正 @机器人的消息，即使内容无法执行也会收到明确答复，而不是石沉大海：
 

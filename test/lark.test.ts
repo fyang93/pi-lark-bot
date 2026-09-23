@@ -293,3 +293,36 @@ test("each rejected event records why it was rejected", async () => {
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("SDK diagnostics reach the trace instead of being silenced, with the secret redacted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-sdk-log-"));
+  try {
+    let captured: any;
+    const fake = fakeSdk();
+    const sdk = {
+      ...fake.sdk,
+      EventDispatcher: class {
+        constructor(options: any) { captured = options; }
+        register() { return this; }
+      },
+    } as unknown as LarkSdk;
+    const log = join(dir, "events.log");
+    new LarkTransport(config, undefined, sdk, undefined, log);
+
+    assert.equal(captured.loggerLevel, 2, "warnings must not be filtered out by level");
+    captured.logger.warn("no im.message.receive_v1 handle");
+    captured.logger.error("boom", { payload: "ignored" });
+    captured.logger.info("routine chatter");
+    captured.logger.debug("routine chatter");
+    // Anything the SDK echoes back must not leak the credential.
+    captured.logger.warn(`request failed with ${config.appSecret}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const lines = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(lines.map((l) => l.disposition), ["sdk_warn", "sdk_error", "sdk_warn"],
+      "info and debug stay out of the trace");
+    assert.equal(lines[0].note, "no im.message.receive_v1 handle");
+    assert.equal(lines[1].note, "boom", "non-string arguments are never recorded");
+    assert(!lines[2].note.includes(config.appSecret) && lines[2].note.includes("***"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

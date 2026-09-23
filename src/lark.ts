@@ -26,9 +26,8 @@ const MAX_ATTEMPTS = 3;
 const RETRYABLE_CODES = new Set([90002, 90013, 99991400, 99991663]);
 /** The event trace is always on, so it rewrites itself rather than growing without end. */
 const EVENT_LOG_MAX_BYTES = 2 * 1024 * 1024;
-const silentLogger = Object.freeze({
-  fatal() {}, error() {}, warn() {}, info() {}, debug() {}, trace() {},
-});
+/** Chatter the SDK emits per request; only fatal/error/warn are worth recording. */
+const quietLogger = Object.freeze({ info() {}, debug() {}, trace() {} });
 
 type PendingStart = { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 
@@ -55,16 +54,25 @@ export class LarkTransport implements BotTransport {
     eventLogPath?: string,
   ) {
     if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
+    // Assign before the SDK objects below: their logger writes through it.
+    this.eventLogPath = eventLogPath;
     const domain = config.brand === "lark" ? sdk.Domain?.Lark : sdk.Domain?.Feishu;
     // Generated endpoint methods' second parameter is IRequestOptions, not an
     // Axios config, so a timeout there is ignored. This wrapper bounds normal
     // API calls, tenant-token exchange, and WS endpoint discovery for real SDKs.
     const httpInstance = boundedHttp(sdk.defaultHttpInstance);
-    const common = { appId: config.appId, appSecret: config.appSecret, domain, httpInstance, logger: silentLogger, loggerLevel: 0 };
+    // The SDK drops events of its own accord and only says so through warnings.
+    // Silencing those made a dropped event indistinguishable from one that was
+    // never delivered, so they are recorded instead.
+    const logger = Object.assign({
+      fatal: (...args: unknown[]) => this.traceSdk("sdk_fatal", args),
+      error: (...args: unknown[]) => this.traceSdk("sdk_error", args),
+      warn: (...args: unknown[]) => this.traceSdk("sdk_warn", args),
+    }, quietLogger);
+    const common = { appId: config.appId, appSecret: config.appSecret, domain, httpInstance, logger, loggerLevel: 2 };
     this.client = new sdk.Client(common);
     this.attachmentCache = attachmentCacheDir ? new AttachmentCache(attachmentCacheDir) : undefined;
-    this.eventLogPath = eventLogPath;
-    this.dispatcher = new sdk.EventDispatcher({ logger: silentLogger, loggerLevel: 0 });
+    this.dispatcher = new sdk.EventDispatcher({ logger, loggerLevel: 2 });
     this.dispatcher.register({ "im.message.receive_v1": (event) => this.receive(event), "card.action.trigger": (event) => this.cardAction(event) });
     this.ws = new sdk.WSClient({
       ...common,
@@ -91,24 +99,36 @@ export class LarkTransport implements BotTransport {
   private trace(disposition: string, event?: any): void {
     if (!this.eventLogPath) return;
     const message = event?.message;
-    const line = `${JSON.stringify({
-      at: new Date().toISOString(), disposition, state: this._state,
+    this.write({
+      disposition, state: this._state,
       ...(event ? {
         senderType: event?.sender?.sender_type, chatType: message?.chat_type,
         messageType: message?.message_type, messageId: message?.message_id,
         mentions: Array.isArray(message?.mentions) ? message.mentions.length : undefined,
         hasParent: typeof message?.parent_id === "string" || undefined,
       } : {}),
-    })}\n`;
-    // Bounded: the trace must never be the reason a disk fills up.
-    this.eventLogBytes += Buffer.byteLength(line);
+    });
+  }
+
+  /** Append one bounded line. The trace must never be why a disk fills up. */
+  private write(record: object): void {
     const path = this.eventLogPath;
+    if (!path) return;
+    const line = `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`;
+    this.eventLogBytes += Buffer.byteLength(line);
     if (this.eventLogBytes > EVENT_LOG_MAX_BYTES) {
       this.eventLogBytes = Buffer.byteLength(line);
       writeFile(path, line, { mode: 0o600 }).catch(() => {});
       return;
     }
     appendFile(path, line, { mode: 0o600 }).catch(() => {});
+  }
+
+  /** Record an SDK diagnostic. Only string arguments are kept, and never the app secret. */
+  private traceSdk(disposition: string, args: unknown[]): void {
+    if (!this.eventLogPath) return;
+    const note = args.filter((arg): arg is string => typeof arg === "string").join(" ").slice(0, 300);
+    this.write({ disposition, state: this._state, note: note.split(this.config.appSecret).join("***") });
   }
 
   get state(): LarkTransportState { return this._state; }
