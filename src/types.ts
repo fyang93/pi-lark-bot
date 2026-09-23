@@ -1,3 +1,6 @@
+/** Reclaim quiet panes without discarding their saved sessions. */
+export const PANE_IDLE_MS = 5 * 60_000;
+
 export interface BotConfig {
   version: 1;
   brand: "feishu" | "lark";

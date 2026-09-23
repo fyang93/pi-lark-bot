@@ -24,6 +24,8 @@ export interface ZellijWorkersOptions {
   env?: NodeJS.ProcessEnv;
   /** Serve a worker-initiated request. The key is the worker's own conversation key. */
   onRequest?: (key: string, request: WorkerRequest) => Promise<WorkerResponse>;
+  /** Parent-side inactivity and queue check; the worker rechecks local activity. */
+  canCloseIdle?: (key: string) => boolean;
 }
 
 /** A worker may only ask for these; it never supplies a chat ID of its own. */
@@ -89,6 +91,8 @@ class PaneWorker implements ConversationWorker {
   private closing?: Promise<void>;
   private rejectReady?: (error: Error) => void;
   private serial: Promise<void> = Promise.resolve();
+  retiring?: Promise<void>;
+  private finishRetirement?: () => void;
   private active?: { id: string; onEvent: (event: WorkerEvent) => void; resolve: () => void; reject: (error: Error) => void };
   /** Keep the callback after a turn settles: extensions may trigger a later continuation in this same Pi session. */
   private readonly continuations = new Map<string, (event: WorkerEvent) => void>();
@@ -222,6 +226,21 @@ class PaneWorker implements ConversationWorker {
     return result;
   }
   private handle(message: any): void {
+    if (message.type === "idle") {
+      if (!this.closed && !this.active && !this.retiring && this.options.canCloseIdle?.(this.userId)) {
+        this.retiring = new Promise<void>((resolve) => { this.finishRetirement = resolve; })
+          .finally(() => { this.retiring = undefined; this.finishRetirement = undefined; });
+        this.socket!.write(`${JSON.stringify({ type: "retire" })}\n`);
+      }
+      return;
+    }
+    if (message.type === "retired") {
+      if (this.retiring) {
+        if (message.accepted === true) void this.close();
+        else this.finishRetirement?.();
+      }
+      return;
+    }
     if (message.type === "request") { void this.respond(message); return; }
     if (typeof message.text !== "string" || !["progress", "text", "done"].includes(message.type)) return;
     const event: WorkerEvent = message.type === "done"
@@ -273,7 +292,7 @@ class PaneWorker implements ConversationWorker {
         catch { /* An already-closed pane needs no cleanup. IPC loss also stops pi. */ }
       }
       if (this.tempDir) await rm(this.tempDir, { recursive: true, force: true });
-    })();
+    })().finally(() => this.finishRetirement?.());
     return this.closing;
   }
 }
@@ -286,10 +305,12 @@ export class ZellijWorkers implements WorkerFactory {
   constructor(private options: ZellijWorkersOptions) {
     if (!options.cwd || !options.appId) throw new Error("ZellijWorkers requires cwd and appId");
   }
-  list(): PaneSnapshot[] { return [...this.entries.values()].map((entry) => entry.worker.snapshot()); }
+  list(): PaneSnapshot[] { return [...this.entries.values()].filter((entry) => !entry.started || entry.worker.isConnected()).map((entry) => entry.worker.snapshot()); }
   open(userId: string): Promise<ConversationWorker> {
     if (this.closed) return Promise.reject(new Error("ZellijWorkers is closed"));
     const old = this.entries.get(userId);
+    // New messages wait for the idle handshake, then reuse or reopen the pane.
+    if (old?.worker.retiring) return old.worker.retiring.then(() => this.open(userId));
     if (old && (old.worker.isConnected() || !old.started)) return old.promise;
     const worker = new PaneWorker({ ...this.options, model: this.models.get(userId) ?? this.options.model }, userId);
     const entry = { worker, promise: undefined as unknown as Promise<PaneWorker>, started: false };

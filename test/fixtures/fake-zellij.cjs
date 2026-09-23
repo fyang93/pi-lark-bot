@@ -21,6 +21,10 @@ if (process.argv[2] === "--child") {
     let end;
     while ((end = buffer.indexOf("\n")) >= 0) {
       const message = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
+      if (message.type === "retire") {
+        send({ type: "retired", accepted: config.env.TEST_RETIRE_ACCEPT !== "0" });
+        continue;
+      }
       if (message.type !== "prompt") continue;
       if (message.text === "CRASH") process.exit(0);
       fs.appendFileSync(session, JSON.stringify(message) + "\n");
@@ -32,6 +36,7 @@ if (process.argv[2] === "--child") {
       setImmediate(() => {
         socket.write(line.subarray(offset));
         send({ type: "done", id: message.id, text: message.text });
+        if (message.text === "IDLE") send({ type: "idle" });
       });
     }
   });

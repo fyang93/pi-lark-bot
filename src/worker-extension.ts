@@ -2,7 +2,7 @@ import { createConnection, type Socket } from "node:net";
 import { randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerPushTools } from "./push-tools.ts";
-import type { WorkerEvent, WorkerRequest, WorkerResponse } from "./types.ts";
+import { PANE_IDLE_MS, type WorkerEvent, type WorkerRequest, type WorkerResponse } from "./types.ts";
 
 type Prompt = { id: string; text: string; cancelled?: boolean };
 const MAX_FRAME_BYTES = 512 * 1024;
@@ -33,6 +33,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   let stopping = false, promptOpen = false, waiting = false;
   let handoffTimer: NodeJS.Timeout | undefined, textTimer: NodeJS.Timeout | undefined, retryTimer: NodeJS.Timeout | undefined;
   let queuedText: { id: string; text: string } | undefined;
+  let lastActivity = Date.now(), idleTimer: NodeJS.Timeout | undefined;
   const requests = new Map<string, (response: WorkerResponse) => void>();
 
   const send = (message: object): void => {
@@ -55,8 +56,13 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     waiting = value;
     ctx?.ui.setStatus("lark-bot", value ? ctx.ui.theme.fg("warning", "Lark: waiting") : undefined);
   };
+  const isIdle = (): boolean => !stopping && !!ctx?.isIdle() && !ctx.hasPendingMessages()
+    && !ctx.ui.getEditorText().trim() && !pending && !dispatching && !active && !promptOpen
+    && !localTurnPending && !awaitingSubagent && !spawnedSubagentThisTurn && !requests.size
+    && Date.now() - lastActivity >= PANE_IDLE_MS;
   const cleanup = (): void => {
     stopping = true;
+    clearInterval(idleTimer);
     clearTimeout(handoffTimer); clearTimeout(textTimer); clearTimeout(retryTimer);
     for (const resolve of requests.values()) resolve({ ok: false, text: "Lark 会话正在关闭。" });
     requests.clear();
@@ -114,6 +120,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   };
   const settled = (): void => {
     if (stopping || !ctx?.isIdle()) return;
+    lastActivity = Date.now();
     if (active?.started) {
       if (!active.cancelled) {
         if (spawnedSubagentThisTurn) {
@@ -141,6 +148,12 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
       const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
       let message: any;
       try { message = JSON.parse(line); } catch { socket?.destroy(); return; }
+      if (message?.type === "retire") {
+        const accepted = isIdle();
+        send({ type: "retired", accepted });
+        if (accepted) { socket?.end(); shutdown(); return; }
+        continue;
+      }
       if (message?.type === "abort" && typeof message.id === "string") {
         if (active && active.id === message.id) {
           active.cancelled = true;
@@ -168,6 +181,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
         typeof message.text !== "string" || Buffer.byteLength(message.text) > MAX_PROMPT_BYTES || pending || dispatching || active) {
         socket?.destroy(); return;
       }
+      lastActivity = Date.now();
       pending = { id: message.id, text: message.text };
       dispatch();
     }
@@ -193,9 +207,12 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     socket.on("data", receive);
     socket.on("error", () => socket?.destroy());
     socket.on("close", shutdown);
+    idleTimer = setInterval(() => { if (isIdle()) send({ type: "idle" }); }, 60_000);
+    idleTimer.unref();
   });
   pi.on("input", (event) => {
     if (stopping) return;
+    lastActivity = Date.now();
     if (event.source === "interactive") { localTurnPending = true; return; }
     if (event.source !== "extension" || !dispatching || event.text !== dispatching.text) return;
     const prompt = dispatching;
@@ -208,6 +225,8 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     active = { id: prompt.id, prompt: prompt.text, text: "", failed: false, started: false };
   });
   pi.on("before_agent_start", (event) => {
+    lastActivity = Date.now();
+    if (!active) spawnedSubagentThisTurn = false;
     // Session metadata is supplied on every model turn, so it remains
     // available after compaction without adding a visible conversation entry.
     const sessionContext = directUserId
@@ -273,6 +292,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     else if (pending) send({ type: "progress", id: pending.id, text: "正在等待本地确认…" });
   });
   pi.on("ui_prompt_end", () => {
+    lastActivity = Date.now();
     promptOpen = false;
     if (active?.started) emit({ type: "progress", text: "正在处理中…" });
     else queueMicrotask(dispatch);

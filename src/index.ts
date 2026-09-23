@@ -241,6 +241,7 @@ export default function larkBot(pi: ExtensionAPI): void {
           const workers = new ZellijWorkers({ cwd, stateDir, appId: config.appId,
             model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
             thinkingLevel: pi.getThinkingLevel(),
+            canCloseIdle: (key) => served?.canCloseIdle(key) ?? false,
             onRequest: (key, request) => served
               ? served.handleWorkerRequest(key, request)
               : Promise.resolve({ ok: false, text: "Lark 控制端尚未就绪。" }) });

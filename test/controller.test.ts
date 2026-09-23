@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BotController, ProgressMessage, senderCode, splitText } from "../src/controller.ts";
-import type { BotTransport, IncomingMessage, WorkerFactory } from "../src/types.ts";
+import { PANE_IDLE_MS, type BotTransport, type IncomingMessage, type WorkerFactory } from "../src/types.ts";
 
 const config = { version: 1 as const, brand: "feishu" as const, appId: "cli_test", appSecret: "secret" };
 const msg = (id: string, userId = "ou_a"): IncomingMessage => ({ id, userId, chatId: `chat_${userId}`, text: id });
@@ -231,6 +231,28 @@ test("/stop bypasses a full FIFO, checks authorization, isolates chats and never
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
+test("idle reclamation rejects running work and resets as soon as a new message arrives", { timeout: 3000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000 });
+  const dir = await mkdtemp(join(tmpdir(), "lark-idle-"));
+  const started = deferred(), gate = deferred();
+  const workers: WorkerFactory = { async open() { return { async run(_text, emit) {
+    started.resolve(); await gate.promise; emit({ type: "done", text: "ok" });
+  }, async close() {} }; }, async close() { gate.resolve(); } };
+  const bot = new BotController({ config, stateDir: dir, transport: new FakeTransport(), workers });
+  try {
+    await bot.start(); await bot.receive(msg("first")); await started.promise;
+    t.mock.timers.tick(PANE_IDLE_MS);
+    assert.equal(bot.canCloseIdle("ou_a"), false);
+    gate.resolve(); await bot.drain();
+    assert.equal(bot.canCloseIdle("ou_a"), true);
+    await bot.receive(msg("next"));
+    assert.equal(bot.canCloseIdle("ou_a"), false, "receipt protects even before asynchronous admission finishes");
+    await bot.drain(); t.mock.timers.tick(PANE_IDLE_MS);
+    assert.equal(bot.canCloseIdle("ou_a"), true);
+    assert.equal(bot.canCloseIdle("unknown"), false);
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
 test("/stop during worker startup prevents the prompt from running", { timeout: 3000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "lark-interrupt-start-"));
   const opening = deferred(), ready = deferred(), stopped = deferred();
@@ -244,10 +266,24 @@ test("/stop during worker startup prevents the prompt from running", { timeout: 
   const bot = new BotController({ config, stateDir: dir, transport, workers });
   try {
     await bot.start(); await bot.receive(msg("first")); await opening.promise;
+    assert.equal(transport.sends.length, 0, "worker preparation stays silent");
     await bot.receive({ ...msg("stop"), text: "/stop" }); await stopped.promise;
     ready.resolve(); await bot.drain();
     assert.equal(runs, 0);
-    assert(transport.updates.includes("⏹ 已停止。"));
+    assert.deepEqual(transport.sends.map((s) => s.reply), ["stop"], "only the stop command needs a reply");
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("worker startup failures still get a reply without a preparation bubble", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-start-failure-"));
+  const transport = new FakeTransport();
+  const workers: WorkerFactory = { async open() { throw new Error("startup failed"); }, async close() {} };
+  const bot = new BotController({ config, stateDir: dir, transport, workers });
+  try {
+    await bot.start(); await bot.receive(msg("first")); await bot.drain();
+    assert.equal(transport.sends.length, 1);
+    assert.equal(transport.sends[0]!.reply, "first");
+    assert.match(transport.sends[0]!.text, /失败/);
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -270,7 +306,7 @@ test("stop closes workers, skips queued work and is idempotent", async () => {
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("stop during pane startup finalizes the preparing card without running a prompt", async () => {
+test("stop during pane startup stays silent without running a prompt", async () => {
   const dir = await mkdtemp(join(tmpdir(), "lark-open-stop-"));
   const opened = deferred(); const gate = deferred(); let runs = 0;
   const transport = new FakeTransport();
@@ -283,7 +319,8 @@ test("stop during pane startup finalizes the preparing card without running a pr
     await bot.start(); await bot.receive(msg("one")); await opened.promise;
     await bot.stop();
     assert.equal(runs, 0);
-    assert(transport.updates.at(-1)?.includes("已停止"));
+    assert.equal(transport.sends.length, 0);
+    assert.equal(transport.updates.length, 0);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

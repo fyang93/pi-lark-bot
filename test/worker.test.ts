@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import workerExtension from "../src/worker-extension.ts";
+import { PANE_IDLE_MS } from "../src/types.ts";
 
 async function harness(t: TestContext, options: { idle?: boolean; accept?: boolean; directUserId?: string; groupChat?: boolean; groupChatId?: string } = {}) {
   const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_DIRECT_USER_ID", "PI_LARK_BOT_GROUP_CHAT", "PI_LARK_BOT_GROUP_CHAT_ID"];
@@ -42,14 +43,14 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
   else delete process.env.PI_LARK_BOT_GROUP_CHAT_ID;
   delete process.env.PI_LARK_BOT_WORKER; // never use a real process-exit fallback inside a unit test
   const handlers = new Map<string, Function>();
-  let idle = options.idle ?? true;
+  let idle = options.idle ?? true, pendingMessages = false, draft = "";
   const prompts: string[] = [];
   let shutdownResolve!: () => void, submittedResolve!: () => void, abortResolve!: () => void;
   let aborts = 0;
   const aborted = new Promise<void>((resolve) => { abortResolve = resolve; });
   const shutdown = new Promise<void>((resolve) => { shutdownResolve = resolve; });
   const submitted = new Promise<void>((resolve) => { submittedResolve = resolve; });
-  const context = { isIdle: () => idle, async abort() { aborts++; abortResolve(); }, shutdown: shutdownResolve, ui: { notify() {}, setStatus() {}, theme: { fg: (_color: string, text: string) => text } } };
+  const context = { isIdle: () => idle, hasPendingMessages: () => pendingMessages, async abort() { aborts++; abortResolve(); }, shutdown: shutdownResolve, ui: { notify() {}, setStatus() {}, getEditorText: () => draft, theme: { fg: (_color: string, text: string) => text } } };
   const emit = (name: string, event: unknown = {}) => handlers.get(name)?.(event, context);
   const tools = new Map<string, any>();
   workerExtension({ on(name: string, handler: Function) { handlers.set(name, handler); },
@@ -69,6 +70,9 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
     interrupt(id = "p1") { peer!.write(`${JSON.stringify({ type: "abort", id })}\n`); },
     reply(id: string, response: { ok: boolean; text: string }) { peer!.write(`${JSON.stringify({ type: "response", id, ...response })}\n`); },
     idle(value: boolean) { idle = value; },
+    pendingMessages(value: boolean) { pendingMessages = value; },
+    draft(value: string) { draft = value; },
+    retire() { peer!.write(`${JSON.stringify({ type: "retire" })}\n`); return until("retired"); },
     prompt(text = "hello") { peer!.write(`${JSON.stringify({ type: "prompt", id: "p1", text })}\n`); },
     disconnect() { peer!.destroy(); },
     finish(text: string, failed = false) {
@@ -78,6 +82,42 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
     },
   };
 }
+
+test("idle retirement requires five quiet minutes and rechecks busy state, queues, drafts and dialogs", { timeout: 3000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000 });
+  const h = await harness(t);
+  t.mock.timers.tick(PANE_IDLE_MS - 60_000);
+  assert.equal((await h.retire()).accepted, false);
+  h.idle(false); t.mock.timers.tick(60_000);
+  assert.equal((await h.retire()).accepted, false);
+  h.idle(true); h.pendingMessages(true);
+  assert.equal((await h.retire()).accepted, false);
+  h.pendingMessages(false); h.draft("unsent local input");
+  assert.equal((await h.retire()).accepted, false);
+  h.draft(""); h.emit("ui_prompt_start");
+  assert.equal((await h.retire()).accepted, false);
+  h.emit("ui_prompt_end");
+  t.mock.timers.tick(PANE_IDLE_MS); await h.until("idle");
+  // Activity after the idle report must invalidate the parent's retirement request.
+  h.emit("input", { source: "interactive", text: "local" });
+  h.emit("before_agent_start", { prompt: "local" }); h.finish("local answer");
+  assert.equal((await h.retire()).accepted, false);
+  t.mock.timers.tick(PANE_IDLE_MS); await h.until("idle");
+  assert.equal((await h.retire()).accepted, true); await h.shutdown;
+});
+
+test("idle retirement does not close a remote turn waiting for subagent results", { timeout: 3000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000 });
+  const h = await harness(t); h.prompt(); await h.until("progress");
+  h.emit("tool_execution_start", { toolName: "subagent" }); await h.until("progress");
+  h.emit("agent_settled"); await h.until("progress");
+  t.mock.timers.tick(PANE_IDLE_MS);
+  assert.equal((await h.retire()).accepted, false);
+  h.emit("before_agent_start", { prompt: "result" }); h.finish("done"); await h.until("done");
+  assert.equal((await h.retire()).accepted, false);
+  t.mock.timers.tick(PANE_IDLE_MS); await h.until("idle");
+  assert.equal((await h.retire()).accepted, true); await h.shutdown;
+});
 
 test("worker authenticates IPC, coalesces text and forces its final snapshot", { timeout: 3000 }, async (t) => {
   const h = await harness(t); h.prompt();

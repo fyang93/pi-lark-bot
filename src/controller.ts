@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { isMissing, loadAllowlist, loadPushTarget, readPrivateJson, saveAllowlist, savePushTarget, writePrivateJson } from "./storage.ts";
-import { conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type ModelSpec, type PushTarget, type WorkerFactory, type WorkerEvent, type WorkerRequest, type WorkerResponse } from "./types.ts";
+import { PANE_IDLE_MS, conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type ModelSpec, type PushTarget, type WorkerFactory, type WorkerEvent, type WorkerRequest, type WorkerResponse } from "./types.ts";
 import { modelPickerCard, modelSelectedCard, parseModelCardAction } from "./model-card.ts";
 
 /** Conservative UTF-8 payload bound, including room for card JSON overhead. */
@@ -19,7 +19,7 @@ export function splitText(text: string, maxBytes = 12_000): string[] {
 
 /** One in-flight edit and one coalesced pending snapshot, never an unbounded token queue. */
 export class ProgressMessage {
-  private latest = "⏳ 正在准备会话…";
+  private latest = "⏳ 正在处理中…";
   private sent = "";
   private timer?: ReturnType<typeof setTimeout>;
   private pending: Promise<void> = Promise.resolve();
@@ -124,6 +124,7 @@ export class BotController {
   private stopping?: Promise<void>;
   private users = new Map<string, UserQueue>();
   private readonly running = new Map<string, AbortController>();
+  private readonly lastMessages = new Map<string, number>();
   private seen = new Set<string>();
   private admission: Promise<void> = Promise.resolve();
   private authorizationTail: Promise<void> = Promise.resolve();
@@ -173,6 +174,7 @@ export class BotController {
     if (!this.active) return Promise.resolve();
     if (message.chatType !== undefined && message.chatType !== "p2p" && message.chatType !== "group") return Promise.resolve();
     if (message.chatType === "group" && !message.mentionedBot) return Promise.resolve();
+    this.lastMessages.set(conversationKey(message), Date.now());
     const admission = this.admission.then(async () => {
       if (!this.active || this.seen.has(message.id)) return;
       this.seen.add(message.id);
@@ -225,6 +227,12 @@ export class BotController {
     this.admission = admission.catch(this.onError);
     // Do not make the SDK's event acknowledgement wait for disk or model work.
     return Promise.resolve();
+  }
+
+  /** The worker separately checks local Pi activity before accepting retirement. */
+  canCloseIdle(key: string): boolean {
+    return this.active && !this.users.get(key)?.count && !this.running.has(key)
+      && Date.now() - (this.lastMessages.get(key) ?? Date.now()) >= PANE_IDLE_MS;
   }
 
   private async isAllowed(message: IncomingMessage): Promise<boolean> {
@@ -437,20 +445,16 @@ export class BotController {
     let progress: ProgressMessage | undefined, responseId: string | undefined;
     let answer = "", continuation = "", initialDone = false, status = "⏳ 正在处理中…", final: Extract<WorkerEvent, { type: "done" }> | undefined;
     try {
-      const id = await transport.send(message.chatId, "⏳ 正在准备会话…", message.id);
-      responseId = id;
-      progress = new ProgressMessage(transport, id, this.options.streamInterval, this.onError);
+      if (transport.prepareMessage && message.parentMessageId) message = await transport.prepareMessage(message);
       signal.throwIfAborted();
-      if (!this.active) { await progress.finish("⏹ 已停止，消息未执行。"); return; }
-      if (transport.prepareMessage && message.parentMessageId) {
-        progress.set("⏳ 正在读取引用的文件…");
-        message = await transport.prepareMessage(message);
-      }
-      if (!this.active) { await progress.finish("⏹ 已停止，消息未执行。"); return; }
-      signal.throwIfAborted();
+      if (!this.active) return;
       const worker = await workers.open(key);
       signal.throwIfAborted();
-      if (!this.active) { await progress.finish("⏹ 已停止，消息未执行。"); return; }
+      if (!this.active) return;
+      responseId = await transport.send(message.chatId, status, message.id);
+      progress = new ProgressMessage(transport, responseId, this.options.streamInterval, this.onError);
+      signal.throwIfAborted();
+      if (!this.active) { await progress.finish("⏹ 已停止。"); return; }
       const attachmentText = message.attachments?.length ? [
         "Referenced attachments for this request:",
         ...message.attachments.map((file) => file.status === "ready"
@@ -508,9 +512,11 @@ export class BotController {
       if (!signal.aborted) this.onError(error);
       // Keep errors in the existing progress card too, rather than creating a
       // second bubble after a streamed response.
-      await progress?.finish(signal.aborted ? "⏹ 已停止。" : this.active
+      const text = signal.aborted ? "⏹ 已停止。" : this.active
         ? "❌ 执行或回复失败，请检查 Pi 会话。"
-        : "⏹ 机器人已停止。");
+        : "⏹ 机器人已停止。";
+      if (progress) await progress.finish(text);
+      else if (this.active && !signal.aborted) await transport.send(message.chatId, text, message.id);
     } finally { this.running.delete(key); }
   }
 

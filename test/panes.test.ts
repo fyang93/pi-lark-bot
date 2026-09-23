@@ -68,6 +68,30 @@ test("real socket/subprocess bridge reuses users, preserves Unicode, filters wro
   } finally { await factory.close(); await resumed?.close(); await f.cleanup(); }
 });
 
+test("idle handshake waits before reopening, keeps history and can be declined by a newly busy worker", { timeout: 10000 }, async () => {
+  const f = await fixture();
+  try {
+    for (const accepted of [true, false]) {
+      let reported!: () => void;
+      const idle = new Promise<void>((resolve) => { reported = resolve; });
+      const factory = new ZellijWorkers({ ...f.options, env: { TEST_RETIRE_ACCEPT: accepted ? "1" : "0" },
+        canCloseIdle: () => { reported(); return true; } });
+      try {
+        const first = await factory.open("ou_a");
+        const file = factory.list()[0]!.sessionFile;
+        await first.run("IDLE", () => {}); await idle;
+        const next = await factory.open("ou_a");
+        if (accepted) assert.notEqual(next, first);
+        else assert.equal(next, first);
+        assert.equal(factory.list()[0]!.sessionFile, file);
+        await next.run("resumed", () => {});
+        const history = await readFile(file, "utf8");
+        assert(history.includes("IDLE") && history.includes("resumed"));
+      } finally { await factory.close(); }
+    }
+  } finally { await f.cleanup(); }
+});
+
 test("missing project directory fails before invoking Zellij or recreating it", async () => {
   const f = await fixture();
   const factory = new ZellijWorkers({ ...f.options, cwd: join(f.root, "missing-project") });
