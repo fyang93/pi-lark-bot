@@ -1,11 +1,11 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Input, Text, matchesKey } from "@earendil-works/pi-tui";
 import { registerBot } from "./registration.ts";
 import type { BotConfig } from "./types.ts";
 import { validateConfig } from "./storage.ts";
 import { renderQrCode } from "./qr.ts";
 
-async function secretInput(ctx: ExtensionCommandContext, signal: AbortSignal): Promise<string | undefined> {
+async function secretInput(ctx: ExtensionContext, signal: AbortSignal): Promise<string | undefined> {
   return ctx.ui.custom<string | undefined>((tui, _theme, _keys, done) => {
     const input = new Input();
     let finished = false;
@@ -31,7 +31,7 @@ async function secretInput(ctx: ExtensionCommandContext, signal: AbortSignal): P
   });
 }
 
-export async function connectBot(ctx: ExtensionCommandContext, signal: AbortSignal): Promise<BotConfig | undefined> {
+export async function connectBot(ctx: ExtensionContext, signal: AbortSignal): Promise<BotConfig | undefined> {
   const brandChoice = await ctx.ui.select("Platform", ["Feishu", "Lark"], { signal });
   if (!brandChoice || signal.aborted) return;
   const brand = brandChoice === "Feishu" ? "feishu" : "lark";

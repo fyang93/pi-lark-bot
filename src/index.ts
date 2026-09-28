@@ -1,4 +1,4 @@
-import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { realpath } from "node:fs/promises";
 import { acquireLock, inspectLock, loadAllowlist, loadConfig, loadPushTarget, prepareState, saveAllowlist, savePushTarget, writePrivateJson } from "./storage.ts";
@@ -19,6 +19,12 @@ const help = [
 ].join("\n");
 
 const PUSH_TOOL = "lark_push";
+// Only a one-shot handoff within this process, never persisted to disk.
+// globalThis survives Pi replacing the extension module on /new.
+const handoff = globalThis as typeof globalThis & {
+  __piLarkBotNewSession?: { cwd: string; appId: string };
+};
+
 const OPEN_ID = /^o[a-z]_[A-Za-z0-9_-]{6,120}$/;
 
 /** Without a listener there is no rejection history, so only a full open_id can be resolved. */
@@ -51,32 +57,45 @@ export default function larkBot(pi: ExtensionAPI): void {
   if (process.env.PI_LARK_BOT_WORKER === "1") return;
   let controller: BotController | undefined;
   let release: (() => Promise<void>) | undefined;
+  let started: { cwd: string; appId: string } | undefined;
   let operation = false;
   let shuttingDown = false;
   const setupAbort = new AbortController();
   async function stop(): Promise<void> {
     // Never let tool bookkeeping block teardown: the lock and the panes matter more.
     try { disablePushTool(); } catch { /* the session may already be tearing down */ }
-    const old = controller; controller = undefined;
+    const old = controller; controller = undefined; started = undefined;
     try { await old?.stop(); }
     finally { const unlock = release; release = undefined; await unlock?.(); }
   }
-  // /new, /resume, /fork and /clone reload the extension, so the listener cannot
-  // survive them: session_shutdown tears it down and this instance is discarded.
-  // Warn while the action can still be cancelled instead of letting the bot
-  // disappear with nothing but the status bar going quiet.
+  // Other session replacements still stop listening; /new gets a one-shot
+  // restart in the fresh runtime after the old resources and lock are released.
   async function confirmReplacement(ctx: { ui: { confirm(title: string, body: string): Promise<boolean> } } | undefined) {
     if (shuttingDown || !controller?.status.active || !ctx) return undefined;
     const ok = await ctx.ui.confirm("Stop the Lark bot?",
       "Replacing this pi session stops the listener, closes every worker pane and drops queued messages. Chat history is preserved; run /lark-bot on afterwards to start listening again. Continue?");
     return ok ? undefined : { cancel: true as const };
   }
-  pi.on("session_before_switch", (_event, ctx) => confirmReplacement(ctx));
+  pi.on("session_before_switch", (event, ctx) => event.reason === "new" ? undefined : confirmReplacement(ctx));
   pi.on("session_before_fork", (_event, ctx) => confirmReplacement(ctx));
-  pi.on("session_shutdown", async (_event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
+    const restart = event?.reason === "new" && controller?.status.active ? started : undefined;
+    delete handoff.__piLarkBotNewSession;
     shuttingDown = true; setupAbort.abort();
     ctx?.ui.setStatus("lark-bot", undefined);
     await stop();
+    if (restart) handoff.__piLarkBotNewSession = restart;
+  });
+  pi.on("session_start", async (event, ctx) => {
+    const restart = handoff.__piLarkBotNewSession;
+    delete handoff.__piLarkBotNewSession;
+    if (!restart || event.reason !== "new" || ctx.mode !== "tui" || !ctx.isProjectTrusted()) return;
+    try {
+      if (await realpath(ctx.cwd) !== restart.cwd) return;
+      await run("on", ctx, restart.appId);
+    } catch {
+      ctx.ui.notify("Could not restore Lark bot. Run /lark-bot on to retry.", "error");
+    }
   });
   // The same tool as in a worker pane; this pi hosts the controller, so it needs
   // no IPC hop. "set this chat" has no meaning here, so only lark_push is offered.
@@ -103,7 +122,9 @@ export default function larkBot(pi: ExtensionAPI): void {
     getArgumentCompletions(prefix) {
       return commands.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
     },
-    handler: async (args, ctx: ExtensionCommandContext) => {
+    handler: (args, ctx) => run(args, ctx),
+  });
+  async function run(args: string, ctx: ExtensionContext, restoreAppId?: string): Promise<void> {
       if (ctx.mode !== "tui") { ctx.ui.notify("/lark-bot requires an interactive pi TUI.", "error"); return; }
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const [command] = parts;
@@ -214,13 +235,14 @@ export default function larkBot(pi: ExtensionAPI): void {
         let config = await loadConfig(stateDir);
         if (!config) throw new Error("Run /lark-bot link first.");
         requireZellij();
-        if (!await ctx.ui.confirm("Enable remote code execution?", "New users require local approval (10-second timeout; default choice is Confirm), whether they contact the bot directly or @mention it in a group. Sessions share project files, and group replies are visible to group members.", { signal: setupAbort.signal })) return;
+        if (restoreAppId !== undefined && config.appId !== restoreAppId) throw new Error("Bot configuration changed. Run /lark-bot on to enable it again.");
+        if (restoreAppId === undefined && !await ctx.ui.confirm("Enable remote code execution?", "New users require local approval (10-second timeout; default choice is Confirm), whether they contact the bot directly or @mention it in a group. Sessions share project files, and group replies are visible to group members.", { signal: setupAbort.signal })) return;
         if (shuttingDown) return;
         release = await acquireLock(stateDir);
         try {
           // Configuration may have changed during the confirmation dialog.
           config = await loadConfig(stateDir);
-          if (!config) throw new Error("Configuration changed. Check and retry.");
+          if (!config || (restoreAppId !== undefined && config.appId !== restoreAppId)) throw new Error("Configuration changed. Check and retry.");
           const [{ LarkTransport }, { ZellijWorkers }, { BotController }] = await Promise.all([
             import("./lark.ts"), import("./panes.ts"), import("./controller.ts"),
           ]);
@@ -268,11 +290,11 @@ export default function larkBot(pi: ExtensionAPI): void {
           await instance.start();
           if (shuttingDown) { await stop(); return; }
           enablePushTool();
+          started = { cwd, appId: config.appId };
           ctx.ui.notify("Lark bot enabled: only allowlisted users can use direct messages or group @mentions. Run /lark-bot off to disable.", "info");
         } catch (error) { await stop(); throw error; }
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : "Lark bot operation failed", "error");
       } finally { operation = false; }
-    },
-  });
+  }
 }

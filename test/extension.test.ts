@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import extension from "../src/index.ts";
+import { LarkTransport } from "../src/lark.ts";
 import { permissionInstructions } from "../src/registration.ts";
 import { acquireLock, prepareState, readPrivateJson, writePrivateJson } from "../src/storage.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -13,11 +14,13 @@ function harness(cwd: string) {
   const tools = new Map<string, any>(); let activeTools: string[] = ["read", "bash"];
   extension({ registerCommand(name: string, value: unknown) { commands.set(name, value); },
     registerTool(tool: any) { tools.set(tool.name, tool); },
+    getThinkingLevel: () => "off",
     getActiveTools: () => activeTools,
     setActiveTools(names: string[]) { activeTools = names; },
     on(name: string, handler: unknown) { handlers.set(name, handler); } } as unknown as ExtensionAPI);
   const selections: string[] = [];
   const ctx = { cwd, mode: "tui", isProjectTrusted: () => true,
+    modelRegistry: { getAvailable: () => [] },
     ui: { notify: (text: string) => messages.push(text), setStatus() {}, theme: { fg: (_color: string, text: string) => text },
       select: async (_title: string, options: string[]) => { selections.push(...options); return undefined; } } } as unknown as ExtensionCommandContext;
   return { commands, handlers, messages, tools, selections, ctx, activeTools: () => activeTools };
@@ -29,7 +32,7 @@ test("loading extension is inert; /lark-bot defaults to status and never writes 
     const h = harness(cwd);
     assert.deepEqual([...h.commands.keys()], ["lark-bot"]);
     assert.deepEqual([...h.tools.keys()], [], "loading registers no tool");
-    assert.deepEqual([...h.handlers.keys()], ["session_before_switch", "session_before_fork", "session_shutdown"]);
+    assert.deepEqual([...h.handlers.keys()], ["session_before_switch", "session_before_fork", "session_shutdown", "session_start"]);
     // No listener means no interruption: /new must stay silent when the bot is off.
     let asked = 0;
     const probe = { ui: { confirm: async () => { asked++; return true; } } };
@@ -43,6 +46,76 @@ test("loading extension is inert; /lark-bot defaults to status and never writes 
     assert.deepEqual(await readdir(cwd), []);
     await h.handlers.get("session_shutdown")();
   } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test("/new restores an enabled listener once in a fresh runtime; off and quit stay off", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "lark-new-"));
+  const env = { PATH: process.env.PATH, ZELLIJ: process.env.ZELLIJ, ZELLIJ_PANE_ID: process.env.ZELLIJ_PANE_ID };
+  let starts = 0, stops = 0, confirmations = 0;
+  t.mock.method(LarkTransport.prototype, "start", async () => { starts++; });
+  t.mock.method(LarkTransport.prototype, "stop", async () => { stops++; });
+  let h = harness(cwd);
+  const configure = () => { h.ctx.ui.confirm = async () => { confirmations++; return true; }; };
+  try {
+    await writeFile(join(cwd, "zellij"), '#!/bin/sh\necho "zellij 0.44.0"\n', { mode: 0o700 });
+    process.env.PATH = `${cwd}:${env.PATH}`;
+    process.env.ZELLIJ = "1"; process.env.ZELLIJ_PANE_ID = "0";
+    const stateDir = await prepareState(cwd, ".pi");
+    await writePrivateJson(join(stateDir, "config.json"),
+      { version: 1, brand: "feishu", appId: "cli_test", appSecret: "secret" });
+    configure();
+    await h.commands.get("lark-bot").handler("on", h.ctx);
+    assert.equal(starts, 1, h.messages.join("\n"));
+    assert(h.activeTools().includes("lark_push"));
+    for (let i = 0; i < 2; i++) {
+      await h.handlers.get("session_before_switch")({ reason: "new" }, h.ctx);
+      assert.equal(confirmations, 1, "/new needs no further authorization");
+      await h.handlers.get("session_shutdown")({ reason: "new" }, h.ctx);
+      assert(!h.activeTools().includes("lark_push"));
+      assert.equal(stops, i + 1);
+      h = harness(cwd); configure();
+      await h.handlers.get("session_start")({ reason: "new" }, h.ctx);
+      assert.equal(starts, i + 2, h.messages.join("\n"));
+      assert(h.activeTools().includes("lark_push"));
+      await h.handlers.get("session_start")({ reason: "new" }, h.ctx);
+      assert.equal(starts, i + 2, "handoff is consumed once");
+    }
+    await h.commands.get("lark-bot").handler("off", h.ctx);
+    await h.handlers.get("session_shutdown")({ reason: "new" }, h.ctx);
+    h = harness(cwd); configure();
+    await h.handlers.get("session_start")({ reason: "new" }, h.ctx);
+    assert.equal(starts, 3, "off must not be restored");
+    for (const reason of ["quit", "reload", "resume", "fork"]) {
+      await h.commands.get("lark-bot").handler("on", h.ctx);
+      const before: number = starts;
+      await h.handlers.get("session_shutdown")({ reason }, h.ctx);
+      h = harness(cwd); configure();
+      await h.handlers.get("session_start")({ reason: reason === "quit" ? "startup" : reason }, h.ctx);
+      assert.equal(starts, before, `${reason} must not restore listening`);
+    }
+    for (const guard of ["trust", "cwd", "mode", "credentials"]) {
+      await h.commands.get("lark-bot").handler("on", h.ctx);
+      const before: number = starts;
+      await h.handlers.get("session_shutdown")({ reason: "new" }, h.ctx);
+      h = harness(cwd); configure();
+      const ctx = { ...h.ctx };
+      if (guard === "trust") ctx.isProjectTrusted = () => false;
+      if (guard === "cwd") ctx.cwd = tmpdir();
+      if (guard === "mode") ctx.mode = "rpc";
+      if (guard === "credentials") await writePrivateJson(join(stateDir, "config.json"),
+        { version: 1, brand: "feishu", appId: "cli_changed", appSecret: "secret" });
+      await h.handlers.get("session_start")({ reason: "new" }, ctx);
+      assert.equal(starts, before, `${guard} must prevent automatic restoration`);
+      await h.handlers.get("session_start")({ reason: "new" }, h.ctx);
+      assert.equal(starts, before, "rejected handoff must not linger");
+    }
+  } finally {
+    await h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx);
+    for (const [key, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("status reports a project lock held by another controller instance", async () => {
