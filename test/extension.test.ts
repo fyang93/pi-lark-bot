@@ -7,12 +7,14 @@ import { tmpdir } from "node:os";
 import extension from "../src/index.ts";
 import { pushViaOwner } from "../src/push-ipc.ts";
 import { LarkTransport } from "../src/lark.ts";
+import { BotController } from "../src/controller.ts";
 import { permissionInstructions } from "../src/registration.ts";
 import { acquireLock, inspectLock, prepareState, readPrivateJson, writePrivateJson } from "../src/storage.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 function harness(cwd: string) {
   const commands = new Map<string, any>(); const handlers = new Map<string, any>(); const messages: string[] = [];
+  const statuses: Array<string | undefined> = [];
   const tools = new Map<string, any>(); let activeTools: string[] = ["read", "bash"];
   extension({ registerCommand(name: string, value: unknown) { commands.set(name, value); },
     registerTool(tool: any) { tools.set(tool.name, tool); activeTools.push(tool.name); },
@@ -23,9 +25,9 @@ function harness(cwd: string) {
   const selections: string[] = [];
   const ctx = { cwd, mode: "tui", isProjectTrusted: () => true,
     modelRegistry: { getAvailable: () => [] },
-    ui: { notify: (text: string) => messages.push(text), setStatus() {}, theme: { fg: (_color: string, text: string) => text },
+    ui: { notify: (text: string) => messages.push(text), setStatus(_key: string, text?: string) { statuses.push(text); }, theme: { fg: (_color: string, text: string) => text },
       select: async (_title: string, options: string[]) => { selections.push(...options); return undefined; } } } as unknown as ExtensionCommandContext;
-  return { commands, handlers, messages, tools, selections, ctx, activeTools: () => activeTools };
+  return { commands, handlers, messages, statuses, tools, selections, ctx, activeTools: () => activeTools };
 }
 
 test("loading extension is inert; /lark-bot defaults to status and never writes credentials", async () => {
@@ -71,6 +73,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
     const first = next();
     await first.handlers.get("session_start")({ reason: "startup" }, first.ctx);
     assert.equal(starts, 0, "unlinked projects stay off");
+    assert.equal(first.statuses.at(-1), undefined, "unlinked project has no Lark status");
     await writePrivateJson(join(stateDir, "config.json"),
       { version: 1, brand: "feishu", appId: "cli_test", appSecret: "secret" });
     await writePrivateJson(join(stateDir, "push-target.json"),
@@ -78,11 +81,19 @@ test("linked on persists across launches; two sessions elect one listener; off s
     const second = next();
     await second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
     assert.equal(starts, 0, "link alone stays off");
+    assert.equal(second.statuses.length, 0, "link alone has no Lark status");
     await first.commands.get("lark-bot").handler("on", first.ctx);
     assert.equal(starts, 1, first.messages.join("\n"));
+    assert.equal(first.statuses.at(-1), "🤖 Lark: listening");
     assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: true });
     await second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
     assert.equal(starts, 1, "the existing owner keeps the sole listener");
+    assert.equal(second.statuses.at(-1), "🤖 Lark: push_only");
+    await first.handlers.get("session_start")({ reason: "resume" }, first.ctx);
+    assert.equal(first.statuses.at(-1), "🤖 Lark: listening", "owner never downgrades to push_only");
+    const untrusted = next(); untrusted.ctx.isProjectTrusted = () => false;
+    await untrusted.handlers.get("session_start")({ reason: "startup" }, untrusted.ctx);
+    assert.equal(untrusted.statuses.length, 0, "untrusted session has no Lark status");
     assert(second.activeTools().includes("lark_push"), "non-owner has a real push tool");
     assert(first.activeTools().includes("lark_push"));
     const push = (h: ReturnType<typeof harness>, text: string) =>
@@ -110,16 +121,25 @@ test("linked on persists across launches; two sessions elect one listener; off s
     assert.equal(stops, 1);
     await assert.rejects(readPrivateJson(join(stateDir, "push-endpoint.json")), /ENOENT/);
     const third = next();
-    await third.handlers.get("session_start")({ reason: "startup" }, third.ctx);
+    const status = Object.getOwnPropertyDescriptor(BotController.prototype, "status")!;
+    Object.defineProperty(BotController.prototype, "status", {
+      ...status, get() { return { ...status.get!.call(this), queued: 2 }; },
+    });
+    try {
+      await third.handlers.get("session_start")({ reason: "startup" }, third.ctx);
+      assert.equal(third.statuses.at(-1), "🤖 Lark: listening · 2 pending handoffs");
+    } finally { Object.defineProperty(BotController.prototype, "status", status); }
     assert.equal(starts, 2, "new Pi launch restores listening");
     assert.equal(confirmations, 1, "automatic startup does not re-prompt");
     await third.commands.get("lark-bot").handler("off", third.ctx);
+    assert.equal(third.statuses.at(-1), undefined, "owner off clears status");
     await assert.rejects(push(second, "after off"), /not listening/);
     await assert.rejects(readPrivateJson(join(stateDir, "push-endpoint.json")), /ENOENT/);
     assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: false });
     const fourth = next();
     await fourth.handlers.get("session_start")({ reason: "startup" }, fourth.ctx);
     assert.equal(starts, 2, "off disables future startup");
+    assert.equal(fourth.statuses.length, 0, "off project has no status on new session");
     await fourth.commands.get("lark-bot").handler("on", fourth.ctx);
     await fourth.handlers.get("session_shutdown")({ reason: "new" }, fourth.ctx);
     const fifth = next();
@@ -173,8 +193,11 @@ test("status reports a project lock held by another controller instance", async 
   const cwd = await mkdtemp(join(tmpdir(), "lark-extension-lock-"));
   const stateDir = await prepareState(cwd, ".pi"); const unlock = await acquireLock(stateDir);
   try {
+    await writePrivateJson(join(stateDir, "enabled.json"), { appId: "cli_test", enabled: true });
     const h = harness(cwd); await h.commands.get("lark-bot").handler("", h.ctx);
     assert(h.messages.at(-1)?.includes("another pi holds the project lock"));
+    await h.handlers.get("session_start")({ reason: "startup" }, h.ctx);
+    assert.equal(h.statuses.length, 0, "a live PID without a verified owner socket is not push_only");
   } finally { await unlock(); await rm(cwd, { recursive: true, force: true }); }
 });
 

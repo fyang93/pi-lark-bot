@@ -1,10 +1,11 @@
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { realpath } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { acquireLock, inspectLock, isMissing, loadAllowlist, loadConfig, loadPushTarget, prepareState, readPrivateJson, saveAllowlist, savePushTarget, writePrivateJson } from "./storage.ts";
 import type { BotController } from "./controller.ts";
 import { registerPushTools } from "./push-tools.ts";
-import { pushViaOwner, servePush } from "./push-ipc.ts";
+import { pushViaOwner, servePush, type Endpoint } from "./push-ipc.ts";
 import { requireZellij } from "./zellij.ts";
 import { missingBotPermissions, permissionInstructions } from "./registration.ts";
 
@@ -18,6 +19,31 @@ const help = [
   "/lark-bot deny <open_id> — Remove a sender from the allowlist",
   "/lark-bot push [off] — Show or clear the global push target",
 ].join("\n");
+
+// inspectLock conservatively treats a live PID with a missing socket as "running"
+// during startup. Status requires a responding owner, not that PID fallback.
+async function verifiedOwner(stateDir: string, endpoint: { cwd: string; appId: string; socket: string; token: string; ownerToken: string }): Promise<boolean> {
+  const lock = await readPrivateJson(join(stateDir, "controller.lock"), false) as { token?: unknown };
+  if (lock?.token !== endpoint.ownerToken) return false;
+  return new Promise((resolve) => {
+    const socket = createConnection(endpoint.socket); let data = "", done = false;
+    const finish = (ok: boolean) => { if (done) return; done = true; clearTimeout(timer); socket.destroy(); resolve(ok); };
+    const timer = setTimeout(() => finish(false), 1000);
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write(JSON.stringify({ type: "ping", token: endpoint.token, cwd: endpoint.cwd, appId: endpoint.appId }) + "\n"));
+    socket.on("error", () => finish(false)); socket.on("close", () => finish(false));
+    socket.on("data", (chunk: string) => {
+      data += chunk;
+      if (Buffer.byteLength(data) > 4096) { finish(false); return; }
+      const end = data.indexOf("\n"); if (end < 0) return;
+      try {
+        const response = JSON.parse(data.slice(0, end));
+        finish(response.ok === true && response.type === "status" && response.cwd === endpoint.cwd &&
+          response.appId === endpoint.appId && response.socket === endpoint.socket && response.ownerToken === endpoint.ownerToken);
+      } catch { finish(false); }
+    });
+  });
+}
 
 async function enabledFor(stateDir: string, appId: string): Promise<boolean> {
   try {
@@ -92,8 +118,18 @@ export default function larkBot(pi: ExtensionAPI): void {
     try {
       const cwd = await realpath(ctx.cwd);
       const stateDir = join(cwd, CONFIG_DIR_NAME, "lark-bot");
+      if (controller?.status.active && started?.cwd === cwd) return;
       // Never read credentials while another Pi already owns the inbound listener.
       const lock = await inspectLock(stateDir);
+      if (lock.state === "running") {
+        const endpoint = await readPrivateJson(join(stateDir, "push-endpoint.json"))
+          .catch((error) => { if (isMissing(error)) return undefined; throw error; }) as Endpoint | undefined;
+        if (endpoint?.cwd === cwd && typeof endpoint.appId === "string" && typeof endpoint.socket === "string" &&
+          typeof endpoint.token === "string" && typeof endpoint.ownerToken === "string" &&
+          await enabledFor(stateDir, endpoint.appId) && await verifiedOwner(stateDir, endpoint))
+          ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", "🤖 Lark: push_only"));
+        return;
+      }
       if (lock.state !== "none" && lock.state !== "stale") return;
       const config = await loadConfig(stateDir);
       if (!config || !await enabledFor(stateDir, config.appId)) return;
@@ -291,7 +327,7 @@ export default function larkBot(pi: ExtensionAPI): void {
               if (shuttingDown) return;
               const pending = controller?.status.active ? controller.status.queued : undefined;
               ctx.ui.setStatus("lark-bot", pending === undefined ? undefined
-                : ctx.ui.theme.fg("accent", pending > 0 ? `Lark: ${pending} pending handoff${pending === 1 ? "" : "s"}` : "Lark: on"));
+                : ctx.ui.theme.fg("accent", `🤖 Lark: listening${pending > 0 ? ` · ${pending} pending handoff${pending === 1 ? "" : "s"}` : ""}`));
             },
           });
           transport.setCardActionHandler((messageId, chatId, operatorId, value) => instance.handleModelCardAction(messageId, chatId, operatorId, value));
