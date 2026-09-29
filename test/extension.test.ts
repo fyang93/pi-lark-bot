@@ -84,13 +84,13 @@ test("linked on persists across launches; two sessions elect one listener; off s
     assert.equal(second.statuses.length, 0, "link alone has no Lark status");
     await first.commands.get("lark-bot").handler("on", first.ctx);
     assert.equal(starts, 1, first.messages.join("\n"));
-    assert.equal(first.statuses.at(-1), "🤖 Lark: listening");
+    assert.equal(first.statuses.at(-1), "🐤 Feishu: listening");
     assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: true });
     await second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
     assert.equal(starts, 1, "the existing owner keeps the sole listener");
-    assert.equal(second.statuses.at(-1), "🤖 Lark: push_only");
+    assert.equal(second.statuses.at(-1), "🐤 Feishu: push_only");
     await first.handlers.get("session_start")({ reason: "resume" }, first.ctx);
-    assert.equal(first.statuses.at(-1), "🤖 Lark: listening", "owner never downgrades to push_only");
+    assert.equal(first.statuses.at(-1), "🐤 Feishu: listening", "owner never downgrades to push_only");
     const untrusted = next(); untrusted.ctx.isProjectTrusted = () => false;
     await untrusted.handlers.get("session_start")({ reason: "startup" }, untrusted.ctx);
     assert.equal(untrusted.statuses.length, 0, "untrusted session has no Lark status");
@@ -127,7 +127,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
     });
     try {
       await third.handlers.get("session_start")({ reason: "startup" }, third.ctx);
-      assert.equal(third.statuses.at(-1), "🤖 Lark: listening · 2 pending handoffs");
+      assert.equal(third.statuses.at(-1), "🐤 Feishu: listening · 2 pending handoffs");
     } finally { Object.defineProperty(BotController.prototype, "status", status); }
     assert.equal(starts, 2, "new Pi launch restores listening");
     assert.equal(confirmations, 1, "automatic startup does not re-prompt");

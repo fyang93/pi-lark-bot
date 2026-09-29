@@ -126,8 +126,11 @@ export default function larkBot(pi: ExtensionAPI): void {
           .catch((error) => { if (isMissing(error)) return undefined; throw error; }) as Endpoint | undefined;
         if (endpoint?.cwd === cwd && typeof endpoint.appId === "string" && typeof endpoint.socket === "string" &&
           typeof endpoint.token === "string" && typeof endpoint.ownerToken === "string" &&
-          await enabledFor(stateDir, endpoint.appId) && await verifiedOwner(stateDir, endpoint))
-          ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", "🤖 Lark: push_only"));
+          await enabledFor(stateDir, endpoint.appId) && await verifiedOwner(stateDir, endpoint)) {
+          const config = await loadConfig(stateDir);
+          const brand = config?.brand === "lark" ? "Lark" : "Feishu";
+          ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", `🐤 ${brand}: push_only`));
+        }
         return;
       }
       if (lock.state !== "none" && lock.state !== "stale") return;
@@ -303,6 +306,7 @@ export default function larkBot(pi: ExtensionAPI): void {
               ? ` (${error.message.slice(0, 240)})` : "";
             ctx.ui.notify(`Lark bot operation failed${detail}. Check connectivity, app permissions and the session pane. Generated history is preserved locally.`, "error");
           };
+          const brand = config.brand === "lark" ? "Lark" : "Feishu";
           const transport = new LarkTransport(config, onError, undefined, join(stateDir, "attachments"));
           // Worker panes hold no credentials: their push and push-target requests
           // are served here, and the chat is resolved from the worker's own key.
@@ -327,7 +331,7 @@ export default function larkBot(pi: ExtensionAPI): void {
               if (shuttingDown) return;
               const pending = controller?.status.active ? controller.status.queued : undefined;
               ctx.ui.setStatus("lark-bot", pending === undefined ? undefined
-                : ctx.ui.theme.fg("accent", `🤖 Lark: listening${pending > 0 ? ` · ${pending} pending handoff${pending === 1 ? "" : "s"}` : ""}`));
+                : ctx.ui.theme.fg("accent", `🐤 ${brand}: listening${pending > 0 ? ` · ${pending} pending handoff${pending === 1 ? "" : "s"}` : ""}`));
             },
           });
           transport.setCardActionHandler((messageId, chatId, operatorId, value) => instance.handleModelCardAction(messageId, chatId, operatorId, value));
