@@ -89,6 +89,28 @@ export default function larkBot(pi: ExtensionAPI): void {
   let started: { cwd: string; appId: string } | undefined;
   let operation = false;
   let shuttingDown = false;
+  let statusTimer: NodeJS.Timeout | undefined;
+  let statusCwd: string | undefined;
+  let peerStatus: string | undefined;
+  let checkingPeer = false;
+  async function refreshPeer(ctx: ExtensionContext, cwd: string, stateDir: string): Promise<void> {
+    if (checkingPeer || shuttingDown || controller) return;
+    checkingPeer = true;
+    try {
+      let status: string | undefined;
+      const endpoint = await readPrivateJson(join(stateDir, "push-endpoint.json"), false)
+        .catch((error) => { if (isMissing(error)) return undefined; throw error; }) as Endpoint | undefined;
+      if (endpoint?.cwd === cwd && typeof endpoint.appId === "string" && typeof endpoint.socket === "string" &&
+        typeof endpoint.token === "string" && typeof endpoint.ownerToken === "string" &&
+        await enabledFor(stateDir, endpoint.appId) && await verifiedOwner(stateDir, endpoint)) {
+        const config = await loadConfig(stateDir);
+        if (config?.appId === endpoint.appId) status = `🐤 ${config.brand === "lark" ? "Lark" : "Feishu"}: push`;
+      }
+      if (shuttingDown || controller || status === peerStatus) return;
+      peerStatus = status;
+      ctx.ui.setStatus("lark-bot", status ? ctx.ui.theme.fg("accent", status) : undefined);
+    } finally { checkingPeer = false; }
+  }
   const setupAbort = new AbortController();
   async function stop(): Promise<void> {
     const old = controller; controller = undefined; started = undefined;
@@ -109,7 +131,7 @@ export default function larkBot(pi: ExtensionAPI): void {
   pi.on("session_before_switch", (event, ctx) => event.reason === "new" ? undefined : confirmReplacement(ctx));
   pi.on("session_before_fork", (_event, ctx) => confirmReplacement(ctx));
   pi.on("session_shutdown", async (event, ctx) => {
-    shuttingDown = true; setupAbort.abort();
+    shuttingDown = true; setupAbort.abort(); clearInterval(statusTimer);
     ctx?.ui.setStatus("lark-bot", undefined);
     await stop();
   });
@@ -118,21 +140,19 @@ export default function larkBot(pi: ExtensionAPI): void {
     try {
       const cwd = await realpath(ctx.cwd);
       const stateDir = join(cwd, CONFIG_DIR_NAME, "lark-bot");
+      if (statusCwd !== cwd) {
+        clearInterval(statusTimer);
+        if (peerStatus) ctx.ui.setStatus("lark-bot", undefined);
+        statusCwd = cwd;
+        peerStatus = undefined;
+        // Non-owners may already be open when another Pi toggles listening.
+        statusTimer = setInterval(() => { void refreshPeer(ctx, cwd, stateDir).catch(() => {}); }, 1500);
+        statusTimer.unref();
+      }
       if (controller?.status.active && started?.cwd === cwd) return;
       // Never read credentials while another Pi already owns the inbound listener.
       const lock = await inspectLock(stateDir);
-      if (lock.state === "running") {
-        const endpoint = await readPrivateJson(join(stateDir, "push-endpoint.json"))
-          .catch((error) => { if (isMissing(error)) return undefined; throw error; }) as Endpoint | undefined;
-        if (endpoint?.cwd === cwd && typeof endpoint.appId === "string" && typeof endpoint.socket === "string" &&
-          typeof endpoint.token === "string" && typeof endpoint.ownerToken === "string" &&
-          await enabledFor(stateDir, endpoint.appId) && await verifiedOwner(stateDir, endpoint)) {
-          const config = await loadConfig(stateDir);
-          const brand = config?.brand === "lark" ? "Lark" : "Feishu";
-          ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", `🐤 ${brand}: push_only`));
-        }
-        return;
-      }
+      if (lock.state === "running") { await refreshPeer(ctx, cwd, stateDir); return; }
       if (lock.state !== "none" && lock.state !== "stale") return;
       const config = await loadConfig(stateDir);
       if (!config || !await enabledFor(stateDir, config.appId)) return;
@@ -207,7 +227,7 @@ export default function larkBot(pi: ExtensionAPI): void {
               if (config) await writePrivateJson(join(stateDir, "enabled.json"), { appId: config.appId, enabled: false });
             } finally { await unlock(); }
           }
-          await stop(); ctx.ui.setStatus("lark-bot", undefined);
+          await stop(); peerStatus = undefined; ctx.ui.setStatus("lark-bot", undefined);
           ctx.ui.notify("Lark bot stopped. Automatic listening disabled; session history preserved.", "info"); return;
         }
         if (command === "allow" || command === "deny" || command === "push") {
@@ -331,12 +351,13 @@ export default function larkBot(pi: ExtensionAPI): void {
               if (shuttingDown) return;
               const pending = controller?.status.active ? controller.status.queued : undefined;
               ctx.ui.setStatus("lark-bot", pending === undefined ? undefined
-                : ctx.ui.theme.fg("accent", `🐤 ${brand}: listening${pending > 0 ? ` · ${pending} pending handoff${pending === 1 ? "" : "s"}` : ""}`));
+                : ctx.ui.theme.fg("accent", `🐤 ${brand}: on${pending > 0 ? ` · ${pending} pending handoff${pending === 1 ? "" : "s"}` : ""}`));
             },
           });
           transport.setCardActionHandler((messageId, chatId, operatorId, value) => instance.handleModelCardAction(messageId, chatId, operatorId, value));
           served = instance;
           controller = instance;
+          peerStatus = undefined;
           await instance.start();
           if (shuttingDown) { await stop(); return; }
           closePush = await servePush(stateDir, cwd, config.appId, release!.token, (text) => instance.push(text));
