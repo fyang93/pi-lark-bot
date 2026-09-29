@@ -1,8 +1,10 @@
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, lstat, mkdir, open, readFile, rename, rm, rmdir, unlink } from "node:fs/promises";
+import { createConnection } from "node:net";
+import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { BotConfig, PushTarget } from "./types.ts";
+import type { Endpoint } from "./push-ipc.ts";
 
 export function isMissing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -125,44 +127,100 @@ export async function prepareState(cwd: string, configDirName: string): Promise<
   return dir;
 }
 
+type Lock = { pid: number; token: string };
+async function probe(stateDir: string, lock: Lock): Promise<"live" | "dead" | "unknown"> {
+  let endpoint: Endpoint;
+  try { endpoint = await readPrivateJson(join(stateDir, "push-endpoint.json"), false) as Endpoint; }
+  catch (error) { return isMissing(error) ? "dead" : "unknown"; }
+  if (!endpoint || typeof endpoint.token !== "string" || endpoint.ownerToken !== lock.token ||
+    typeof endpoint.cwd !== "string" || typeof endpoint.appId !== "string" || typeof endpoint.socket !== "string" ||
+    basename(endpoint.socket) !== "push.sock") return "unknown";
+  try {
+    const directory = await lstat(dirname(endpoint.socket));
+    if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== process.getuid?.() ||
+      (directory.mode & 0o777) !== 0o700) return "unknown";
+    const socket = await lstat(endpoint.socket);
+    if (!socket.isSocket() || socket.uid !== process.getuid?.() || (socket.mode & 0o777) !== 0o600) return "unknown";
+  } catch (error) { if (isMissing(error)) return "dead"; return "unknown"; }
+  return new Promise((resolve) => {
+    const socket = createConnection(endpoint.socket); let data = "", done = false;
+    const finish = (state: "live" | "dead" | "unknown") => {
+      if (done) return; done = true; clearTimeout(timer); socket.destroy(); resolve(state);
+    };
+    const timer = setTimeout(() => finish("unknown"), 1000);
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write(JSON.stringify({ type: "ping", token: endpoint.token, cwd: endpoint.cwd, appId: endpoint.appId }) + "\n"));
+    socket.on("error", (error: NodeJS.ErrnoException) => finish(error.code === "ENOENT" || error.code === "ECONNREFUSED" ? "dead" : "unknown"));
+    socket.on("close", () => finish("unknown"));
+    socket.on("data", (chunk: string) => {
+      data += chunk;
+      if (Buffer.byteLength(data) > 4096) { finish("unknown"); return; }
+      const end = data.indexOf("\n"); if (end < 0) return;
+      try {
+        const response = JSON.parse(data.slice(0, end));
+        finish(response.ok === true && response.type === "status" && response.ownerToken === lock.token &&
+          response.cwd === endpoint.cwd && response.appId === endpoint.appId && response.socket === endpoint.socket ? "live" : "unknown");
+      } catch { finish("unknown"); }
+    });
+  });
+}
+
 export async function inspectLock(stateDir: string): Promise<{ state: "none" | "running" | "stale" | "invalid"; pid?: number }> {
   try {
-    const record = await readPrivateJson(join(stateDir, "controller.lock"), false) as { pid?: number };
-    if (!record || !Number.isSafeInteger(record.pid) || record.pid! <= 0) return { state: "invalid" };
-    try { process.kill(record.pid!, 0); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") return { state: "stale", pid: record.pid };
-    }
-    return { state: "running", pid: record.pid };
+    const record = await readPrivateJson(join(stateDir, "controller.lock"), false) as Lock;
+    if (!record || !Number.isSafeInteger(record.pid) || record.pid <= 0 || typeof record.token !== "string") return { state: "invalid" };
+    const peer = await probe(stateDir, record);
+    if (peer === "live") return { state: "running", pid: record.pid };
+    if (peer === "unknown") return { state: "invalid", pid: record.pid }; // unresponsive owners fail closed
+    try { process.kill(record.pid, 0); return { state: "running", pid: record.pid }; }
+    catch (error) { return { state: (error as NodeJS.ErrnoException).code === "ESRCH" ? "stale" : "running", pid: record.pid }; }
   } catch (error) { return { state: isMissing(error) ? "none" : "invalid" }; }
 }
 
-/** Atomic exclusive project lock. Never steal a live or ambiguous lock. */
-export async function acquireLock(stateDir: string): Promise<() => Promise<void>> {
+/** Atomically claim the project; recover only a provably dead owner under a recovery mutex. */
+export async function acquireLock(stateDir: string): Promise<(() => Promise<void>) & { token: string }> {
   const path = join(stateDir, "controller.lock");
   const token = randomUUID();
-  try {
+  const claim = async () => {
     const handle = await open(path, "wx", 0o600);
     try { await handle.writeFile(JSON.stringify({ pid: process.pid, token })); }
     finally { await handle.close(); }
-    return async () => {
-      try {
-        const record = await readPrivateJson(path) as { token?: string };
-        if (record.token === token) await unlink(path);
-      } catch (error) { if (!isMissing(error)) throw error; }
-    };
-  } catch (error) {
+  };
+  try { await claim(); }
+  catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const record = await readPrivateJson(path) as { pid?: number };
-    if (!record || !Number.isSafeInteger(record.pid) || record.pid! <= 0) {
-      throw new Error("Invalid controller.lock; inspect it manually before removing it.");
-    }
-    try { process.kill(record.pid!, 0); }
-    catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ESRCH") {
-        throw new Error(`Stale controller.lock found. Confirm the previous controller and its panes have exited, then remove ${path} and retry.`);
-      }
-    }
-    throw new Error("This project already has a running lark-bot controller.");
+    if ((await inspectLock(stateDir)).state !== "stale") throw new Error("This project already has a running or unverified lark-bot controller.");
+    const mutex = join(stateDir, "controller.recovery");
+    try { await mkdir(mutex, { mode: 0o700 }); }
+    catch { throw new Error("Controller recovery is in progress or unverified; retry or inspect manually."); }
+    try {
+      const before = await lstat(path);
+      if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid?.() ||
+        (before.mode & 0o777) !== 0o600) throw new Error("Unsafe controller lock; inspect manually.");
+      const record = await readPrivateJson(path, false) as Lock;
+      if ((await inspectLock(stateDir)).state !== "stale") throw new Error("Controller owner changed during recovery.");
+      const after = await lstat(path);
+      if (before.ino !== after.ino || before.dev !== after.dev) throw new Error("Controller lock changed during recovery.");
+      // Only a dead process with a missing/refused endpoint may be reclaimed.
+      const endpointPath = join(stateDir, "push-endpoint.json");
+      try {
+        const entry = await lstat(endpointPath);
+        if (!entry.isFile() || entry.isSymbolicLink() || entry.uid !== process.getuid?.() ||
+          (entry.mode & 0o777) !== 0o600) throw new Error("Unsafe controller endpoint.");
+        const endpoint = await readPrivateJson(endpointPath, false) as Endpoint;
+        if (endpoint.ownerToken !== record.token) throw new Error("Unverified controller endpoint.");
+        await unlink(endpointPath);
+      } catch (e) { if (!isMissing(e)) throw e; }
+      await unlink(path);
+      await claim();
+    } finally { await rmdir(mutex); }
   }
+  const unlock = (async () => {
+    try {
+      const record = await readPrivateJson(path) as Lock;
+      if (record.token === token) await unlink(path);
+    } catch (error) { if (!isMissing(error)) throw error; }
+  }) as (() => Promise<void>) & { token: string };
+  unlock.token = token;
+  return unlock;
 }

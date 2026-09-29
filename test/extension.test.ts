@@ -2,18 +2,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import extension from "../src/index.ts";
+import { pushViaOwner } from "../src/push-ipc.ts";
 import { LarkTransport } from "../src/lark.ts";
 import { permissionInstructions } from "../src/registration.ts";
-import { acquireLock, prepareState, readPrivateJson, writePrivateJson } from "../src/storage.ts";
+import { acquireLock, inspectLock, prepareState, readPrivateJson, writePrivateJson } from "../src/storage.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 function harness(cwd: string) {
   const commands = new Map<string, any>(); const handlers = new Map<string, any>(); const messages: string[] = [];
   const tools = new Map<string, any>(); let activeTools: string[] = ["read", "bash"];
   extension({ registerCommand(name: string, value: unknown) { commands.set(name, value); },
-    registerTool(tool: any) { tools.set(tool.name, tool); },
+    registerTool(tool: any) { tools.set(tool.name, tool); activeTools.push(tool.name); },
     getThinkingLevel: () => "off",
     getActiveTools: () => activeTools,
     setActiveTools(names: string[]) { activeTools = names; },
@@ -31,7 +33,7 @@ test("loading extension is inert; /lark-bot defaults to status and never writes 
   try {
     const h = harness(cwd);
     assert.deepEqual([...h.commands.keys()], ["lark-bot"]);
-    assert.deepEqual([...h.tools.keys()], [], "loading registers no tool");
+    assert.deepEqual([...h.tools.keys()], ["lark_push"], "every local Pi has the outbound tool");
     assert.deepEqual([...h.handlers.keys()], ["session_before_switch", "session_before_fork", "session_shutdown", "session_start"]);
     // No listener means no interruption: /new must stay silent when the bot is off.
     let asked = 0;
@@ -40,6 +42,7 @@ test("loading extension is inert; /lark-bot defaults to status and never writes 
     assert.equal(await h.handlers.get("session_before_fork")({ position: "at" }, probe), undefined);
     assert.equal(asked, 0);
     assert.deepEqual(await readdir(cwd), []);
+    await assert.rejects(h.tools.get("lark_push").execute("call", { text: "hello" }, undefined, undefined, h.ctx), /not listening/);
     await h.commands.get("lark-bot").handler("", h.ctx);
     assert(h.messages.at(-1)?.includes("not connected"));
     assert(h.messages.at(-1)?.includes("stopped"));
@@ -48,69 +51,117 @@ test("loading extension is inert; /lark-bot defaults to status and never writes 
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 
-test("/new restores an enabled listener once in a fresh runtime; off and quit stay off", async (t) => {
+test("linked on persists across launches; two sessions elect one listener; off stays off", async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "lark-new-"));
   const env = { PATH: process.env.PATH, ZELLIJ: process.env.ZELLIJ, ZELLIJ_PANE_ID: process.env.ZELLIJ_PANE_ID };
   let starts = 0, stops = 0, confirmations = 0;
+  const sent: Array<{ chat: string; text: string }> = [];
   t.mock.method(LarkTransport.prototype, "start", async () => { starts++; });
   t.mock.method(LarkTransport.prototype, "stop", async () => { stops++; });
-  let h = harness(cwd);
-  const configure = () => { h.ctx.ui.confirm = async () => { confirmations++; return true; }; };
+  t.mock.method(LarkTransport.prototype, "send", async (chat: string, text: string) => {
+    sent.push({ chat, text }); return `m_${sent.length}`;
+  });
+  const sessions: ReturnType<typeof harness>[] = [];
+  const next = () => { const h = harness(cwd); h.ctx.ui.confirm = async () => { confirmations++; return true; }; sessions.push(h); return h; };
   try {
     await writeFile(join(cwd, "zellij"), '#!/bin/sh\necho "zellij 0.44.0"\n', { mode: 0o700 });
     process.env.PATH = `${cwd}:${env.PATH}`;
     process.env.ZELLIJ = "1"; process.env.ZELLIJ_PANE_ID = "0";
     const stateDir = await prepareState(cwd, ".pi");
+    const first = next();
+    await first.handlers.get("session_start")({ reason: "startup" }, first.ctx);
+    assert.equal(starts, 0, "unlinked projects stay off");
     await writePrivateJson(join(stateDir, "config.json"),
       { version: 1, brand: "feishu", appId: "cli_test", appSecret: "secret" });
-    configure();
-    await h.commands.get("lark-bot").handler("on", h.ctx);
-    assert.equal(starts, 1, h.messages.join("\n"));
-    assert(h.activeTools().includes("lark_push"));
-    for (let i = 0; i < 2; i++) {
-      await h.handlers.get("session_before_switch")({ reason: "new" }, h.ctx);
-      assert.equal(confirmations, 1, "/new needs no further authorization");
-      await h.handlers.get("session_shutdown")({ reason: "new" }, h.ctx);
-      assert(!h.activeTools().includes("lark_push"));
-      assert.equal(stops, i + 1);
-      h = harness(cwd); configure();
-      await h.handlers.get("session_start")({ reason: "new" }, h.ctx);
-      assert.equal(starts, i + 2, h.messages.join("\n"));
-      assert(h.activeTools().includes("lark_push"));
-      await h.handlers.get("session_start")({ reason: "new" }, h.ctx);
-      assert.equal(starts, i + 2, "handoff is consumed once");
-    }
-    await h.commands.get("lark-bot").handler("off", h.ctx);
-    await h.handlers.get("session_shutdown")({ reason: "new" }, h.ctx);
-    h = harness(cwd); configure();
-    await h.handlers.get("session_start")({ reason: "new" }, h.ctx);
-    assert.equal(starts, 3, "off must not be restored");
-    for (const reason of ["quit", "reload", "resume", "fork"]) {
-      await h.commands.get("lark-bot").handler("on", h.ctx);
-      const before: number = starts;
-      await h.handlers.get("session_shutdown")({ reason }, h.ctx);
-      h = harness(cwd); configure();
-      await h.handlers.get("session_start")({ reason: reason === "quit" ? "startup" : reason }, h.ctx);
-      assert.equal(starts, before, `${reason} must not restore listening`);
-    }
-    for (const guard of ["trust", "cwd", "mode", "credentials"]) {
-      await h.commands.get("lark-bot").handler("on", h.ctx);
-      const before: number = starts;
-      await h.handlers.get("session_shutdown")({ reason: "new" }, h.ctx);
-      h = harness(cwd); configure();
-      const ctx = { ...h.ctx };
-      if (guard === "trust") ctx.isProjectTrusted = () => false;
-      if (guard === "cwd") ctx.cwd = tmpdir();
-      if (guard === "mode") ctx.mode = "rpc";
-      if (guard === "credentials") await writePrivateJson(join(stateDir, "config.json"),
-        { version: 1, brand: "feishu", appId: "cli_changed", appSecret: "secret" });
-      await h.handlers.get("session_start")({ reason: "new" }, ctx);
-      assert.equal(starts, before, `${guard} must prevent automatic restoration`);
-      await h.handlers.get("session_start")({ reason: "new" }, h.ctx);
-      assert.equal(starts, before, "rejected handoff must not linger");
-    }
+    await writePrivateJson(join(stateDir, "push-target.json"),
+      { version: 1, appId: "cli_test", chatId: "oc_team", chatType: "group", setBy: "group:oc_team", setAt: "" });
+    const second = next();
+    await second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
+    assert.equal(starts, 0, "link alone stays off");
+    await first.commands.get("lark-bot").handler("on", first.ctx);
+    assert.equal(starts, 1, first.messages.join("\n"));
+    assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: true });
+    await second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
+    assert.equal(starts, 1, "the existing owner keeps the sole listener");
+    assert(second.activeTools().includes("lark_push"), "non-owner has a real push tool");
+    assert(first.activeTools().includes("lark_push"));
+    const push = (h: ReturnType<typeof harness>, text: string) =>
+      h.tools.get("lark_push").execute("call", { text }, undefined, undefined, h.ctx);
+    await push(second, "from non-owner");
+    assert.deepEqual(sent, [{ chat: "oc_team", text: "from non-owner" }]);
+    const endpoint = await readPrivateJson(join(stateDir, "push-endpoint.json")) as { socket: string; cwd: string; appId: string };
+    const forged = await new Promise<string>((resolve, reject) => {
+      const socket = createConnection(endpoint.socket); let data = "";
+      socket.on("error", reject);
+      socket.on("connect", () => socket.write(JSON.stringify({ token: "wrong", cwd: endpoint.cwd, appId: endpoint.appId, text: "forged" }) + "\n"));
+      socket.on("data", (chunk) => { data += chunk; if (data.includes("\n")) { socket.destroy(); resolve(data); } });
+    });
+    assert.match(forged, /Unauthorized push request/);
+    assert.equal((await pushViaOwner(stateDir, cwd, "cli_wrong", "wrong app")).ok, false);
+    assert.equal(sent.length, 1, "forged and mismatched requests never send");
+    for (let i = 1; i < 20; i++) await push(i % 2 ? first : second, `shared ${i}`);
+    await assert.rejects(push(second, "over limit"), /每分钟最多 20/);
+    assert.equal(sent.length, 20, "all local sessions share the controller's push limit");
+    await second.commands.get("lark-bot").handler("off", second.ctx);
+    assert(second.messages.at(-1)?.includes("Another pi holds the project lock"));
+    assert.equal(stops, 0, "a non-owner cannot stop the owner");
+    assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: true });
+    await first.handlers.get("session_shutdown")({ reason: "quit" }, first.ctx);
+    assert.equal(stops, 1);
+    await assert.rejects(readPrivateJson(join(stateDir, "push-endpoint.json")), /ENOENT/);
+    const third = next();
+    await third.handlers.get("session_start")({ reason: "startup" }, third.ctx);
+    assert.equal(starts, 2, "new Pi launch restores listening");
+    assert.equal(confirmations, 1, "automatic startup does not re-prompt");
+    await third.commands.get("lark-bot").handler("off", third.ctx);
+    await assert.rejects(push(second, "after off"), /not listening/);
+    await assert.rejects(readPrivateJson(join(stateDir, "push-endpoint.json")), /ENOENT/);
+    assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: false });
+    const fourth = next();
+    await fourth.handlers.get("session_start")({ reason: "startup" }, fourth.ctx);
+    assert.equal(starts, 2, "off disables future startup");
+    await fourth.commands.get("lark-bot").handler("on", fourth.ctx);
+    await fourth.handlers.get("session_shutdown")({ reason: "new" }, fourth.ctx);
+    const fifth = next();
+    await fifth.handlers.get("session_start")({ reason: "new" }, fifth.ctx);
+    assert.equal(starts, 4, "/new also resumes after shutdown");
+    await fifth.handlers.get("session_shutdown")({ reason: "quit" }, fifth.ctx);
+    await writePrivateJson(join(stateDir, "config.json"),
+      { version: 1, brand: "feishu", appId: "cli_changed", appSecret: "secret" });
+    const sixth = next();
+    await sixth.handlers.get("session_start")({ reason: "startup" }, sixth.ctx);
+    assert.equal(starts, 4, "another app cannot inherit prior on preference");
   } finally {
-    await h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx);
+    for (const h of sessions) await h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx);
+    for (const [key, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("simultaneous automatic starts publish just one listener and push endpoint", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "lark-simultaneous-"));
+  const env = { PATH: process.env.PATH, ZELLIJ: process.env.ZELLIJ, ZELLIJ_PANE_ID: process.env.ZELLIJ_PANE_ID };
+  const a = harness(cwd), b = harness(cwd);
+  let starts = 0;
+  t.mock.method(LarkTransport.prototype, "start", async () => { starts++; });
+  t.mock.method(LarkTransport.prototype, "stop", async () => {});
+  try {
+    await writeFile(join(cwd, "zellij"), '#!/bin/sh\necho "zellij 0.44.0"\n', { mode: 0o700 });
+    process.env.PATH = `${cwd}:${env.PATH}`;
+    process.env.ZELLIJ = "1"; process.env.ZELLIJ_PANE_ID = "0";
+    const dir = await prepareState(cwd, ".pi");
+    await writePrivateJson(join(dir, "config.json"), { version: 1, brand: "feishu", appId: "cli_test", appSecret: "secret" });
+    await writePrivateJson(join(dir, "enabled.json"), { appId: "cli_test", enabled: true });
+    await Promise.all([a, b].map((h) => h.handlers.get("session_start")({ reason: "startup" }, h.ctx)));
+    assert.equal(starts, 1);
+    const endpoint = await readPrivateJson(join(dir, "push-endpoint.json")) as { ownerToken: string };
+    const lock = await readPrivateJson(join(dir, "controller.lock")) as { token: string };
+    assert.equal(endpoint.ownerToken, lock.token);
+    assert.equal((await inspectLock(dir)).state, "running", "live owner answers the identity probe");
+  } finally {
+    await Promise.all([a, b].map((h) => h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx)));
     for (const [key, value] of Object.entries(env)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
@@ -159,7 +210,7 @@ test("link only shows a permission dialog when grants are missing or unknown", a
         assert(![...h.messages, ...dialogs].join("\n").includes("private-secret"));
         const stored = await readPrivateJson(join(cwd, ".pi/lark-bot/config.json")) as { appId: string };
         assert.equal(stored.appId, "cli_test", "failed checks must not discard saved credentials");
-        assert.equal(h.tools.size, 0, "link never starts the listener");
+        assert.equal(h.tools.size, 1, "link registers the tool but never starts the listener");
         assert(!h.commands.get("lark-bot").getArgumentCompletions("").includes("permissions"));
       } finally { await rm(cwd, { recursive: true, force: true }); }
     }
@@ -224,7 +275,7 @@ test("/lark-bot allow, deny and push edit project state without starting a liste
     await run("push");
     assert(h.messages.at(-1)?.includes("No push target configured"));
 
-    assert.deepEqual([...h.tools.keys()], [], "the push tool appears only while this pi listens");
-    assert.deepEqual(h.activeTools(), ["read", "bash"]);
+    assert.deepEqual([...h.tools.keys()], ["lark_push"]);
+    assert.deepEqual(h.activeTools(), ["read", "bash", "lark_push"]);
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });

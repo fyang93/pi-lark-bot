@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat, readFile, writeFile, symlink, mkdir } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat, readFile, writeFile, symlink, mkdir } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLock, inspectLock, loadConfig, prepareState, readPrivateJson, validateAllowlist, validateConfig, validatePushTarget, writePrivateJson } from "../src/storage.ts";
@@ -41,15 +42,47 @@ test("exclusive lock prevents duplicate project listeners and releases idempoten
     assert.deepEqual(await inspectLock(root), { state: "none" });
     const unlock = await acquireLock(root);
     assert.deepEqual(await inspectLock(root), { state: "running", pid: process.pid });
-    await assert.rejects(acquireLock(root), /already has a running/);
+    await assert.rejects(acquireLock(root), /running or unverified/);
     await unlock(); await unlock();
     assert.deepEqual(await inspectLock(root), { state: "none" });
     const unlock2 = await acquireLock(root); await unlock2();
     const lockPath = join(root, "controller.lock");
     await writePrivateJson(lockPath, { pid: 0 });
-    await assert.rejects(acquireLock(root), /Invalid controller.lock/);
+    await assert.rejects(acquireLock(root), /unverified/);
     assert.deepEqual(await readPrivateJson(lockPath), { pid: 0 });
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("dead owner is recovered once; unresponsive socket is never reclaimed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "lark-storage-owner-"));
+  const lockPath = join(root, "controller.lock");
+  const socketDir = join(root, "fake");
+  const socketPath = join(socketDir, "push.sock");
+  const peers = new Set<import("node:net").Socket>();
+  const server = createServer((socket) => {
+    peers.add(socket); socket.on("close", () => peers.delete(socket)); socket.on("error", () => {});
+  });
+  try {
+    await writePrivateJson(lockPath, { pid: 2147483647, token: "old" });
+    assert.equal((await inspectLock(root)).state, "stale");
+    const [a, b] = await Promise.allSettled([acquireLock(root), acquireLock(root)]);
+    const owners = [a, b].filter((value): value is PromiseFulfilledResult<Awaited<ReturnType<typeof acquireLock>>> => value.status === "fulfilled");
+    assert.equal(owners.length, 1, "two simultaneous recovery attempts cannot own the lock");
+    await owners[0]!.value();
+    await writePrivateJson(lockPath, { pid: 2147483647, token: "old" });
+    await mkdir(socketDir, { mode: 0o700 });
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    await chmod(socketPath, 0o600);
+    await writePrivateJson(join(root, "push-endpoint.json"),
+      { cwd: root, appId: "cli_test", token: "secret", ownerToken: "old", socket: socketPath });
+    assert.equal((await inspectLock(root)).state, "invalid", "unresponsive socket must fail closed");
+    await assert.rejects(acquireLock(root), /unverified/);
+    assert.deepEqual(await readPrivateJson(lockPath), { pid: 2147483647, token: "old" });
+  } finally {
+    for (const peer of peers) peer.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("config rejects malformed secrets and unsupported brands", () => {

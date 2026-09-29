@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BotController, ProgressMessage, senderCode, splitText } from "../src/controller.ts";
-import { PANE_IDLE_MS, type BotTransport, type IncomingMessage, type WorkerFactory } from "../src/types.ts";
+import { type BotTransport, type IncomingMessage, type WorkerFactory } from "../src/types.ts";
 
 const config = { version: 1 as const, brand: "feishu" as const, appId: "cli_test", appSecret: "secret" };
 const msg = (id: string, userId = "ou_a"): IncomingMessage => ({ id, userId, chatId: `chat_${userId}`, text: id });
@@ -48,6 +48,50 @@ test("controller deduplicates across restart, reuses per-user worker and sends s
     assert.equal(calls.length, 3);
     await bot2.stop();
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("messages are handed off without model completion; output and stop are chat-wide", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-chat-bridge-"));
+  const transport = new FakeTransport(); const deliveries: string[] = [];
+  let sink: ((event: import("../src/types.ts").WorkerEvent) => void) | undefined, interrupts = 0;
+  const worker = { async run(text: string, emit: typeof sink) { deliveries.push(text); sink = emit; },
+    async interrupt() { interrupts++; }, async close() {} };
+  const bot = new BotController({ config, stateDir: dir, transport,
+    workers: { async open() { return worker; }, async close() {} } });
+  try {
+    await bot.start(); await bot.receive(msg("first")); await bot.drain();
+    assert.equal(bot.status.queued, 0, "accepted messages are not model jobs");
+    await bot.receive(msg("second")); await bot.drain();
+    assert.deepEqual(deliveries, ["first", "second"], "neither input needs a done event");
+    assert.equal(transport.sends.length, 0, "handoff creates no placeholder reply tied to an input");
+    sink!({ type: "done", text: "combined answer" }); await bot.drain();
+    sink!({ type: "done", text: "background follow-up" }); await bot.drain();
+    assert.deepEqual(transport.updates, ["combined answer", "background follow-up"]);
+    assert(transport.sends.every((s) => s.reply === undefined));
+    await bot.receive({ ...msg("stop"), text: "/stop" }); await bot.drain();
+    assert.equal(interrupts, 1, "stop reaches Pi even when no handoff is pending");
+    assert.deepEqual(deliveries, ["first", "second"]);
+    await bot.stop(); sink!({ type: "done", text: "late" });
+    assert(!transport.updates.includes("late"));
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("slow outbound replies do not block input handoff", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-independent-io-"));
+  const transport = new FakeTransport(), started = deferred(), gate = deferred(), second = deferred();
+  const originalSend = transport.send.bind(transport);
+  transport.send = async (...args) => { started.resolve(); await gate.promise; return originalSend(...args); };
+  const worker = { async run(text: string, emit: (event: import("../src/types.ts").WorkerEvent) => void) {
+    if (text === "first") emit({ type: "done", text: "answer" }); else second.resolve();
+  }, async close() {} };
+  const bot = new BotController({ config, stateDir: dir, transport,
+    workers: { async open() { return worker; }, async close() {} } });
+  try {
+    await bot.start(); await bot.receive(msg("first")); await started.promise;
+    await bot.receive(msg("second")); await second.promise;
+    gate.resolve(); await bot.drain();
+    assert.equal(bot.status.queued, 0);
+  } finally { gate.resolve(); await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test("direct and group senders require approval and share the persisted user allowlist", async () => {
@@ -109,7 +153,7 @@ test("quoted files are prepared only after authorization and their cache paths r
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
-test("same-user FIFO, different users concurrent, event handler does not wait for model", async () => {
+test("handoffs preserve per-chat order without blocking other chats during startup", async () => {
   const dir = await mkdtemp(join(tmpdir(), "lark-controller-"));
   const gate = deferred(); const began = deferred();
   const order: string[] = [];
@@ -132,11 +176,11 @@ test("same-user FIFO, different users concurrent, event handler does not wait fo
     assert.equal(transport.sends.filter((x) => x.reply === "two").length, 0, "queued messages stay silent until execution");
     gate.resolve(); await bot.drain();
     assert.deepEqual(order, ["one", "other", "two"]);
-    assert.equal(transport.sends.filter((x) => x.reply === "two").length, 1, "execution creates only the normal reply bubble");
+    assert.equal(transport.sends.filter((x) => x.reply).length, 0, "assistant output belongs to the chat, not an input message");
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
-test("group members share one FIFO session, isolated from DMs and other groups", async () => {
+test("group members share ordered handoffs, isolated from DMs and other groups", async () => {
   const dir = await mkdtemp(join(tmpdir(), "lark-groups-"));
   const gate = deferred(), began = deferred(), otherDone = deferred();
   const calls: string[] = [];
@@ -220,36 +264,14 @@ test("/stop bypasses a full FIFO, checks authorization, isolates chats and never
     assert(transport.sends.some((s) => s.reply === "denied-stop" && s.text.includes("拒绝")));
     assert.equal(calls.length, 2);
     await bot.receive(group("stop", "/stop", "ou_b")); await stopped.promise;
-    assert(transport.sends.some((s) => s.reply === "stop" && s.text === "已请求停止。"));
+    assert(transport.sends.some((s) => s.reply === "stop" && s.text.includes("已请求 Pi 中断")));
     otherGate.resolve(); await bot.drain();
     assert.equal(calls.length, 21, "only the active group turn stops; queued messages still run");
     assert.equal(calls.filter((s) => s.endsWith("|ou_a: first")).length, 1);
-    assert(transport.updates.includes("⏹ 已停止。"));
+    assert.equal(bot.status.queued, 0, "handoff accounting is released");
     await bot.receive({ ...msg("idle-stop"), text: "/stop" }); await bot.drain();
-    assert(transport.sends.some((s) => s.reply === "idle-stop" && s.text === "当前没有任务。"));
+    assert(transport.sends.some((s) => s.reply === "idle-stop" && s.text === "当前没有会话。"));
     assert.deepEqual(errors, []);
-  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
-});
-
-test("idle reclamation rejects running work and resets as soon as a new message arrives", { timeout: 3000 }, async (t) => {
-  t.mock.timers.enable({ apis: ["Date"], now: 1_000 });
-  const dir = await mkdtemp(join(tmpdir(), "lark-idle-"));
-  const started = deferred(), gate = deferred();
-  const workers: WorkerFactory = { async open() { return { async run(_text, emit) {
-    started.resolve(); await gate.promise; emit({ type: "done", text: "ok" });
-  }, async close() {} }; }, async close() { gate.resolve(); } };
-  const bot = new BotController({ config, stateDir: dir, transport: new FakeTransport(), workers });
-  try {
-    await bot.start(); await bot.receive(msg("first")); await started.promise;
-    t.mock.timers.tick(PANE_IDLE_MS);
-    assert.equal(bot.canCloseIdle("ou_a"), false);
-    gate.resolve(); await bot.drain();
-    assert.equal(bot.canCloseIdle("ou_a"), true);
-    await bot.receive(msg("next"));
-    assert.equal(bot.canCloseIdle("ou_a"), false, "receipt protects even before asynchronous admission finishes");
-    await bot.drain(); t.mock.timers.tick(PANE_IDLE_MS);
-    assert.equal(bot.canCloseIdle("ou_a"), true);
-    assert.equal(bot.canCloseIdle("unknown"), false);
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -302,7 +324,7 @@ test("stop closes workers, skips queued work and is idempotent", async () => {
     await bot.receive(msg("three"));
     assert.equal(closes, 1); assert.equal(runs, 1); assert.equal(bot.status.active, false);
     assert(!transport.sends.some((x) => x.text === "stopped"));
-    assert(transport.updates.at(-1)?.includes("已停止"));
+    assert.equal(bot.status.queued, 0);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -547,7 +569,7 @@ test("a message addressed to the bot is always answered, even when it cannot be 
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("a cold Pi session that fails its first turn is retried once, not lost", async () => {
+test("model failures never cause automatic re-delivery, even in a cold session", async () => {
   const dir = await mkdtemp(join(tmpdir(), "lark-coldstart-"));
   try {
     const transport = new FakeTransport();
@@ -571,10 +593,10 @@ test("a cold Pi session that fails its first turn is retried once, not lost", as
 
     await bot.receive(msg("cold"));
     await bot.drain();
-    assert.deepEqual(runs, ["cold", "cold"], "the first turn is retried");
-    assert.equal(transport.updates.at(-1), "Answer cold", "the retry's answer replaces the failure");
+    assert.deepEqual(runs, ["cold"], "delivery cannot be retried based on model results");
+    assert.equal(transport.updates.at(-1), "处理失败：请稍后重试。");
 
-    // Once a turn has succeeded, a later failure is reported rather than repeated.
+    // The same rule applies to every later message.
     failNext = true;
     runs.length = 0;
     await bot.receive(msg("warm"));

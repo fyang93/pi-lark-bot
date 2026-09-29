@@ -1,9 +1,10 @@
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { realpath } from "node:fs/promises";
-import { acquireLock, inspectLock, loadAllowlist, loadConfig, loadPushTarget, prepareState, saveAllowlist, savePushTarget, writePrivateJson } from "./storage.ts";
+import { acquireLock, inspectLock, isMissing, loadAllowlist, loadConfig, loadPushTarget, prepareState, readPrivateJson, saveAllowlist, savePushTarget, writePrivateJson } from "./storage.ts";
 import type { BotController } from "./controller.ts";
 import { registerPushTools } from "./push-tools.ts";
+import { pushViaOwner, servePush } from "./push-ipc.ts";
 import { requireZellij } from "./zellij.ts";
 import { missingBotPermissions, permissionInstructions } from "./registration.ts";
 
@@ -11,19 +12,20 @@ const commands = ["link", "on", "off", "allow", "deny", "push", "help"];
 const help = [
   "/lark-bot — Show project configuration, listener, sessions and push target",
   "/lark-bot link — Register a bot or enter existing app credentials",
-  "/lark-bot on — Enable listening manually (requires Zellij 0.44+)",
-  "/lark-bot off — Stop listening and close panes, preserving history",
+  "/lark-bot on — Enable automatic listening for this project (requires Zellij 0.44+)",
+  "/lark-bot off — Disable automatic listening and close panes, preserving history",
   "/lark-bot allow [open_id|code] — Allowlist a sender; with no argument, pick from recent rejections",
   "/lark-bot deny <open_id> — Remove a sender from the allowlist",
   "/lark-bot push [off] — Show or clear the global push target",
 ].join("\n");
 
-const PUSH_TOOL = "lark_push";
-// Only a one-shot handoff within this process, never persisted to disk.
-// globalThis survives Pi replacing the extension module on /new.
-const handoff = globalThis as typeof globalThis & {
-  __piLarkBotNewSession?: { cwd: string; appId: string };
-};
+async function enabledFor(stateDir: string, appId: string): Promise<boolean> {
+  try {
+    const value = await readPrivateJson(join(stateDir, "enabled.json")) as { appId?: unknown; enabled?: unknown };
+    if (!value || typeof value.appId !== "string" || typeof value.enabled !== "boolean") throw new Error("Invalid enabled.json");
+    return value.appId === appId && value.enabled;
+  } catch (error) { if (isMissing(error)) return false; throw error; }
+}
 
 const OPEN_ID = /^o[a-z]_[A-Za-z0-9_-]{6,120}$/;
 
@@ -56,20 +58,22 @@ function ago(at: number): string {
 export default function larkBot(pi: ExtensionAPI): void {
   if (process.env.PI_LARK_BOT_WORKER === "1") return;
   let controller: BotController | undefined;
-  let release: (() => Promise<void>) | undefined;
+  let release: ((() => Promise<void>) & { token: string }) | undefined;
+  let closePush: (() => Promise<void>) | undefined;
   let started: { cwd: string; appId: string } | undefined;
   let operation = false;
   let shuttingDown = false;
   const setupAbort = new AbortController();
   async function stop(): Promise<void> {
-    // Never let tool bookkeeping block teardown: the lock and the panes matter more.
-    try { disablePushTool(); } catch { /* the session may already be tearing down */ }
     const old = controller; controller = undefined; started = undefined;
-    try { await old?.stop(); }
-    finally { const unlock = release; release = undefined; await unlock?.(); }
+    const close = closePush; closePush = undefined;
+    try { await close?.(); }
+    finally {
+      try { await old?.stop(); }
+      finally { const unlock = release; release = undefined; await unlock?.(); }
+    }
   }
-  // Other session replacements still stop listening; /new gets a one-shot
-  // restart in the fresh runtime after the old resources and lock are released.
+  // Session replacement stops this listener; enabled projects can start again in the fresh runtime.
   async function confirmReplacement(ctx: { ui: { confirm(title: string, body: string): Promise<boolean> } } | undefined) {
     if (shuttingDown || !controller?.status.active || !ctx) return undefined;
     const ok = await ctx.ui.confirm("Stop the Lark bot?",
@@ -79,44 +83,39 @@ export default function larkBot(pi: ExtensionAPI): void {
   pi.on("session_before_switch", (event, ctx) => event.reason === "new" ? undefined : confirmReplacement(ctx));
   pi.on("session_before_fork", (_event, ctx) => confirmReplacement(ctx));
   pi.on("session_shutdown", async (event, ctx) => {
-    const restart = event?.reason === "new" && controller?.status.active ? started : undefined;
-    delete handoff.__piLarkBotNewSession;
     shuttingDown = true; setupAbort.abort();
     ctx?.ui.setStatus("lark-bot", undefined);
     await stop();
-    if (restart) handoff.__piLarkBotNewSession = restart;
   });
-  pi.on("session_start", async (event, ctx) => {
-    const restart = handoff.__piLarkBotNewSession;
-    delete handoff.__piLarkBotNewSession;
-    if (!restart || event.reason !== "new" || ctx.mode !== "tui" || !ctx.isProjectTrusted()) return;
+  pi.on("session_start", async (_event, ctx) => {
+    if (ctx.mode !== "tui" || !ctx.isProjectTrusted() || shuttingDown) return;
     try {
-      if (await realpath(ctx.cwd) !== restart.cwd) return;
-      await run("on", ctx, restart.appId);
+      const cwd = await realpath(ctx.cwd);
+      const stateDir = join(cwd, CONFIG_DIR_NAME, "lark-bot");
+      // Never read credentials while another Pi already owns the inbound listener.
+      const lock = await inspectLock(stateDir);
+      if (lock.state !== "none" && lock.state !== "stale") return;
+      const config = await loadConfig(stateDir);
+      if (!config || !await enabledFor(stateDir, config.appId)) return;
+      await run("on", ctx, config.appId, true);
     } catch {
       ctx.ui.notify("Could not restore Lark bot. Run /lark-bot on to retry.", "error");
     }
   });
-  // The same tool as in a worker pane; this pi hosts the controller, so it needs
-  // no IPC hop. "set this chat" has no meaning here, so only lark_push is offered.
-  // It exists only while this pi listens: loading the extension stays inert, and
-  // stopping the listener takes the tool back out of the model's reach.
-  let pushToolRegistered = false;
-  function enablePushTool(): void {
-    if (!pushToolRegistered) {
-      registerPushTools(pi, {
-        push: async (text) => controller
-          ? controller.push(text)
-          : { ok: false, text: "Lark bot is not listening in this pi session. Run /lark-bot on first." },
-      });
-      pushToolRegistered = true;
-    }
-    pi.setActiveTools([...new Set([...pi.getActiveTools(), PUSH_TOOL])]);
-  }
-  function disablePushTool(): void {
-    // Registration cannot be undone, so deactivation is what removes it.
-    if (pushToolRegistered) pi.setActiveTools(pi.getActiveTools().filter((name) => name !== PUSH_TOOL));
-  }
+  // Every local Pi exposes the tool; non-owners send through the sole owner's
+  // outbound endpoint, so the controller remains the authority for target and rate.
+  registerPushTools(pi, { push: async (text, ctx) => {
+    if (!ctx.isProjectTrusted()) return { ok: false, text: "Trust this project before using Lark push." };
+    const cwd = await realpath(ctx.cwd);
+    if (controller && started?.cwd === cwd) return controller.push(text);
+    const stateDir = join(cwd, CONFIG_DIR_NAME, "lark-bot");
+    let preference: { appId?: unknown; enabled?: unknown };
+    try { preference = await readPrivateJson(join(stateDir, "enabled.json")) as typeof preference; }
+    catch (error) { if (isMissing(error)) return { ok: false, text: "Lark bot is not listening in this project." }; throw error; }
+    if (!preference || preference.enabled !== true || typeof preference.appId !== "string")
+      return { ok: false, text: "Lark bot is not listening in this project." };
+    return pushViaOwner(stateDir, cwd, preference.appId, text);
+  } });
   pi.registerCommand("lark-bot", {
     description: "Project-local Feishu/Lark bot: link, on, off",
     getArgumentCompletions(prefix) {
@@ -124,7 +123,7 @@ export default function larkBot(pi: ExtensionAPI): void {
     },
     handler: (args, ctx) => run(args, ctx),
   });
-  async function run(args: string, ctx: ExtensionContext, restoreAppId?: string): Promise<void> {
+  async function run(args: string, ctx: ExtensionContext, restoreAppId?: string, automatic = false): Promise<void> {
       if (ctx.mode !== "tui") { ctx.ui.notify("/lark-bot requires an interactive pi TUI.", "error"); return; }
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const [command] = parts;
@@ -143,13 +142,14 @@ export default function larkBot(pi: ExtensionAPI): void {
           const lock = await inspectLock(stateDir);
           const listener = status?.active ? "enabled in this pi"
             : lock.state === "running" ? `another pi holds the project lock (PID ${lock.pid})`
-            : lock.state === "none" ? "stopped (never starts automatically)"
-            : "stale or invalid project lock; verify old processes have exited before removal";
+            : lock.state === "none" ? "stopped"
+            : lock.state === "stale" ? "dead owner; next start will verify and recover the lock"
+            : "unverified project owner; inspect it manually before retrying";
           ctx.ui.notify([
             `Project: ${cwd}`,
             `Credentials: ${config ? `${config.brand} / ${config.appId}` : "not connected; run /lark-bot link"}`,
             `Listener: ${listener} · Connection: ${status?.connection ?? "stopped"}`,
-            `Allowlisted users: ${status?.allowlisted ?? 0} · Main sessions: ${status?.users ?? 0} · Running/queued: ${status?.queued ?? 0}`,
+            `Allowlisted users: ${status?.allowlisted ?? 0} · Chats: ${status?.users ?? 0} · Pending handoffs: ${status?.queued ?? 0}`,
             `Push target: ${target ? `${target.chatType === "group" ? "group" : "direct chat"} ${target.chatId}` : "none (pushing disabled)"}`,
             ...(status?.denied ? [`Recent rejections awaiting review: ${status.denied} (run /lark-bot allow)`] : []),
             ...(status?.sessions.map((session) => `${session.userId} → pane ${session.paneId ?? "starting"} · ${session.connected ? "connected" : "disconnected"}`) ?? []),
@@ -159,8 +159,17 @@ export default function larkBot(pi: ExtensionAPI): void {
         }
         if (command === "off") {
           if (!controller && (await inspectLock(stateDir)).state === "running") throw new Error("Another pi holds the project lock. Run /lark-bot off in that pi session.");
+          // A non-owner cannot turn off somebody else's live controller.
+          if (controller) await writePrivateJson(join(stateDir, "enabled.json"), { appId: started!.appId, enabled: false });
+          else {
+            const unlock = await acquireLock(stateDir);
+            try {
+              const config = await loadConfig(stateDir);
+              if (config) await writePrivateJson(join(stateDir, "enabled.json"), { appId: config.appId, enabled: false });
+            } finally { await unlock(); }
+          }
           await stop(); ctx.ui.setStatus("lark-bot", undefined);
-          ctx.ui.notify("Lark bot stopped. Session history preserved.", "info"); return;
+          ctx.ui.notify("Lark bot stopped. Automatic listening disabled; session history preserved.", "info"); return;
         }
         if (command === "allow" || command === "deny" || command === "push") {
           const config = await loadConfig(stateDir);
@@ -243,6 +252,8 @@ export default function larkBot(pi: ExtensionAPI): void {
           // Configuration may have changed during the confirmation dialog.
           config = await loadConfig(stateDir);
           if (!config || (restoreAppId !== undefined && config.appId !== restoreAppId)) throw new Error("Configuration changed. Check and retry.");
+          // A queued automatic start must not undo an off completed while it waited for the lock.
+          if (automatic && !await enabledFor(stateDir, config.appId)) { await stop(); return; }
           const [{ LarkTransport }, { ZellijWorkers }, { BotController }] = await Promise.all([
             import("./lark.ts"), import("./panes.ts"), import("./controller.ts"),
           ]);
@@ -263,7 +274,6 @@ export default function larkBot(pi: ExtensionAPI): void {
           const workers = new ZellijWorkers({ cwd, stateDir, appId: config.appId,
             model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
             thinkingLevel: pi.getThinkingLevel(),
-            canCloseIdle: (key) => served?.canCloseIdle(key) ?? false,
             onRequest: (key, request) => served
               ? served.handleWorkerRequest(key, request)
               : Promise.resolve({ ok: false, text: "Lark 控制端尚未就绪。" }) });
@@ -279,9 +289,9 @@ export default function larkBot(pi: ExtensionAPI): void {
             onNotice: (text) => { if (!shuttingDown) ctx.ui.notify(text, "info"); },
             onStatus: () => {
               if (shuttingDown) return;
-              const jobs = controller?.status.active ? controller.status.queued : undefined;
-              ctx.ui.setStatus("lark-bot", jobs === undefined ? undefined
-                : ctx.ui.theme.fg("accent", jobs > 0 ? `Lark: ${jobs} job${jobs === 1 ? "" : "s"}` : "Lark: on"));
+              const pending = controller?.status.active ? controller.status.queued : undefined;
+              ctx.ui.setStatus("lark-bot", pending === undefined ? undefined
+                : ctx.ui.theme.fg("accent", pending > 0 ? `Lark: ${pending} pending handoff${pending === 1 ? "" : "s"}` : "Lark: on"));
             },
           });
           transport.setCardActionHandler((messageId, chatId, operatorId, value) => instance.handleModelCardAction(messageId, chatId, operatorId, value));
@@ -289,8 +299,9 @@ export default function larkBot(pi: ExtensionAPI): void {
           controller = instance;
           await instance.start();
           if (shuttingDown) { await stop(); return; }
-          enablePushTool();
+          closePush = await servePush(stateDir, cwd, config.appId, release!.token, (text) => instance.push(text));
           started = { cwd, appId: config.appId };
+          if (!automatic) await writePrivateJson(join(stateDir, "enabled.json"), { appId: config.appId, enabled: true });
           ctx.ui.notify("Lark bot enabled: only allowlisted users can use direct messages or group @mentions. Run /lark-bot off to disable.", "info");
         } catch (error) { await stop(); throw error; }
       } catch (error) {

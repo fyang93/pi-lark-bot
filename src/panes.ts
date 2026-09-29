@@ -7,10 +7,85 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { setTimeout as sleep } from "node:timers/promises";
 import { privateDir, writePrivateJson } from "./storage.ts";
 import type { ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory, WorkerRequest, WorkerResponse } from "./types.ts";
 
-import { createSurface, closeSurface } from "./zellij.ts";
+import { closeSurface } from "./zellij.ts";
+import { measurePane, selectPlacement, type PaneGeometry } from "./zellij-layout.ts";
+
+/** Split selection and tab reconciliation adapted from HazAT/pi-interactive-subagents (MIT). */
+let creationQueue: Promise<unknown> = Promise.resolve();
+function createWorkerSurface(name: string, command: string[]): Promise<string> {
+  const result = creationQueue.then(() => createWorkerSurfaceUnlocked(name, command));
+  creationQueue = result.catch(() => {});
+  return result;
+}
+async function createWorkerSurfaceUnlocked(name: string, command: string[]): Promise<string> {
+  const parent = process.env.ZELLIJ_PANE_ID;
+  if (!process.env.ZELLIJ || !parent || !/^\d+$/.test(parent)) throw new Error("Start pi inside Zellij 0.44+ before running /lark-bot on.");
+  const options = { encoding: "utf8" as const, timeout: 10_000 };
+  let version: string;
+  try { version = execFileSync("zellij", ["--version"], options); }
+  catch { throw new Error("Zellij 0.44+ must be installed and available on PATH."); }
+  const match = version.match(/zellij (\d+)\.(\d+)\.(\d+)/);
+  if (!match || (Number(match[1]) === 0 && Number(match[2]) < 44)) throw new Error("Zellij 0.44+ is required for pane-targeted CLI actions.");
+  const noFocus = Number(match[1]) > 0 || Number(match[2]) >= 45;
+  let panes: PaneGeometry[];
+  try {
+    const found: unknown = JSON.parse(execFileSync("zellij", ["action", "list-panes", "--json", "--geometry", "--state", "--tab"],
+      { ...options, env: { ...process.env, ZELLIJ_PANE_ID: parent } }));
+    if (!Array.isArray(found) || !found.every((p) => p && Number.isSafeInteger(p.id) && p.id >= 0 && typeof p.is_plugin === "boolean")) throw new Error("Invalid pane list");
+    panes = found as PaneGeometry[];
+  } catch { throw new Error("Cannot inspect Zellij layout; worker creation was not attempted."); }
+  const owner = panes.find(p => !p.is_plugin && p.id === Number(parent));
+  if (!owner || !Number.isSafeInteger(owner.tab_id) || owner.tab_id! < 0 || owner.is_floating || owner.is_suppressed || owner.is_selectable === false ||
+      panes.some(p => p.tab_id === owner.tab_id && !p.is_plugin && !measurePane(p))) {
+    throw new Error("Cannot verify parent pane and tab geometry; worker creation was not attempted.");
+  }
+  const placement = selectPlacement(panes, Number(parent));
+  if (!placement && !noFocus) throw new Error("Zellij 0.45+ is required to create an unfocused worker tab when pane space runs out.");
+  const marker = `pi-lark-create-${randomBytes(16).toString("hex")}`;
+  let reply = "";
+  const tab = !placement;
+  try {
+    reply = execFileSync("zellij", tab
+      ? ["action", "new-tab", "--no-focus", "--name", marker, "--cwd", "/", "--layout-string", "layout { pane; }", "--", ...command]
+      : ["action", "new-pane", noFocus ? "--no-focus" : "--near-current-pane",
+        "--direction", placement.direction, "--name", marker, "--cwd", "/", "--", ...command],
+      { ...options, env: { ...process.env, ZELLIJ_PANE_ID: String(placement?.paneId ?? parent) } }).trim();
+  } catch { /* CLI failure can still mean creation succeeded; never retry the mutation. */ }
+  let pane = tab ? "" : /^terminal_\d+$/.test(reply) ? reply : "";
+  let tabId: number | undefined;
+  if (tab || !pane) {
+    const deadline = performance.now() + 2000;
+    while (performance.now() < deadline && !pane) {
+      try {
+        const found: unknown = JSON.parse(execFileSync("zellij", ["action", "list-panes", "--json", "--all"], options));
+        if (!Array.isArray(found)) throw new Error("Invalid pane list");
+        if (tab) {
+          const id = /^\d+$/.test(reply) && Number.isSafeInteger(Number(reply)) ? Number(reply) : undefined;
+          const matches = found.filter(p => p && !p.is_plugin && Number.isSafeInteger(p.id) && p.id >= 0 &&
+            Number.isSafeInteger(p.tab_id) && p.tab_id >= 0 && p.tab_name === marker && (id === undefined || p.tab_id === id));
+          if (matches.length === 1 && found.filter(p => p && !p.is_plugin && p.tab_id === matches[0].tab_id).length === 1) {
+            pane = `terminal_${matches[0].id}`; tabId = matches[0].tab_id;
+          }
+        } else {
+          const matches = found.filter(p => p && !p.is_plugin && p.title === marker && Number.isSafeInteger(p.id) && p.id >= 0);
+          if (matches.length === 1) pane = `terminal_${matches[0].id}`;
+        }
+      } catch { /* An unconfirmed creation is not safe to repeat. */ }
+      if (!pane && performance.now() < deadline) await sleep(Math.min(50, deadline - performance.now()));
+    }
+  }
+  if (!/^terminal_\d+$/.test(pane)) throw new Error(`Could not confirm Zellij ${tab ? "tab" : "pane"} creation (${marker}); not retried to avoid duplicate workers.`);
+  try {
+    if (tab) execFileSync("zellij", ["action", "rename-tab", "--tab-id", String(tabId), "--", name], options);
+    execFileSync("zellij", ["action", "rename-pane", "--pane-id", pane, "--", name], options);
+  } catch { /* An identified pane can still be owned/closed under its marker. */ }
+  return pane;
+}
+
 const MAX_FRAME = 8 * 1024 * 1024;
 export interface ZellijWorkersOptions {
   cwd: string;
@@ -24,8 +99,6 @@ export interface ZellijWorkersOptions {
   env?: NodeJS.ProcessEnv;
   /** Serve a worker-initiated request. The key is the worker's own conversation key. */
   onRequest?: (key: string, request: WorkerRequest) => Promise<WorkerResponse>;
-  /** Parent-side inactivity and queue check; the worker rechecks local activity. */
-  canCloseIdle?: (key: string) => boolean;
 }
 
 /** A worker may only ask for these; it never supplies a chat ID of its own. */
@@ -90,12 +163,8 @@ class PaneWorker implements ConversationWorker {
   private resources?: Promise<void>;
   private closing?: Promise<void>;
   private rejectReady?: (error: Error) => void;
-  private serial: Promise<void> = Promise.resolve();
-  retiring?: Promise<void>;
-  private finishRetirement?: () => void;
-  private active?: { id: string; onEvent: (event: WorkerEvent) => void; resolve: () => void; reject: (error: Error) => void };
-  /** Keep the callback after a turn settles: extensions may trigger a later continuation in this same Pi session. */
-  private readonly continuations = new Map<string, (event: WorkerEvent) => void>();
+  private onEvent?: (event: WorkerEvent) => void;
+  private readonly deliveries = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   constructor(private options: ZellijWorkersOptions, private userId: string) {
     this.sessionFile = resolve(options.stateDir ?? join(options.cwd, ".pi", "lark-bot"), "sessions", `${sessionKey(options.appId, userId)}.jsonl`);
   }
@@ -167,7 +236,7 @@ class PaneWorker implements ConversationWorker {
     // Pass the actual parent environment privately, preserving the new pane's
     // own Zellij identity in the launcher. Remote messages only use IPC.
     const launcher = fileURLToPath(new URL("./launch-worker.cjs", import.meta.url));
-    this.paneId = createSurface(`lark-${sessionKey(this.options.appId, this.userId).slice(0, 10)}`,
+    this.paneId = await createWorkerSurface(`lark-${sessionKey(this.options.appId, this.userId).slice(0, 10)}`,
       [process.execPath, launcher, launchFile]);
     this.checkOpen();
   }
@@ -206,59 +275,40 @@ class PaneWorker implements ConversationWorker {
     });
   }
 
-  run(text: string, onEvent: (event: WorkerEvent) => void, signal?: AbortSignal): Promise<void> {
-    const result = this.serial.then(async () => {
-      signal?.throwIfAborted();
-      if (!this.isConnected()) throw new Error("Pi worker is not connected");
-      const id = randomBytes(12).toString("hex");
-      const interrupt = () => this.socket?.write(`${JSON.stringify({ type: "abort", id })}\n`, (error) => {
-        if (error) this.failActive(new Error("Pi worker interrupt delivery failed"));
-      });
-      signal?.addEventListener("abort", interrupt, { once: true });
-      try {
-        await new Promise<void>((resolve, reject) => {
-          this.active = { id, onEvent, resolve, reject };
-          this.socket!.write(`${JSON.stringify({ type: "prompt", id, text })}\n`, (error) => { if (error) this.failActive(new Error("Pi worker prompt delivery failed")); });
+  async run(text: string, onEvent: (event: WorkerEvent) => void, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    this.onEvent = onEvent;
+    await this.deliver({ type: "prompt", text });
+  }
+  interrupt(): Promise<void> { return this.deliver({ type: "abort" }); }
+  private async deliver(payload: object): Promise<void> {
+    if (!this.isConnected()) throw new Error("Pi worker is not connected");
+    const id = randomBytes(12).toString("hex");
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.deliveries.set(id, { resolve, reject });
+        timer = setTimeout(() => reject(new Error("Pi worker handoff timed out; delivery is uncertain, not retried")), 10_000);
+        this.socket!.write(`${JSON.stringify({ ...payload, id })}\n`, (error) => {
+          if (error) reject(new Error("Pi worker handoff failed; delivery is uncertain, not retried"));
         });
-      } finally { signal?.removeEventListener("abort", interrupt); }
-    });
-    this.serial = result.catch(() => {});
-    return result;
+      });
+    } finally { clearTimeout(timer); this.deliveries.delete(id); }
   }
   private handle(message: any): void {
-    if (message.type === "idle") {
-      if (!this.closed && !this.active && !this.retiring && this.options.canCloseIdle?.(this.userId)) {
-        this.retiring = new Promise<void>((resolve) => { this.finishRetirement = resolve; })
-          .finally(() => { this.retiring = undefined; this.finishRetirement = undefined; });
-        this.socket!.write(`${JSON.stringify({ type: "retire" })}\n`);
-      }
-      return;
-    }
-    if (message.type === "retired") {
-      if (this.retiring) {
-        if (message.accepted === true) void this.close();
-        else this.finishRetirement?.();
-      }
-      return;
-    }
     if (message.type === "request") { void this.respond(message); return; }
-    if (typeof message.text !== "string" || !["progress", "text", "done"].includes(message.type)) return;
+    if (message.type === "accepted" || message.type === "rejected") {
+      const pending = this.deliveries.get(message.id);
+      if (message.type === "accepted") pending?.resolve();
+      else pending?.reject(new Error("Pi worker could not hand off the message; not retried"));
+      return;
+    }
+    // Output belongs to this authenticated conversation, never an input ID.
+    if (message.id !== undefined || typeof message.text !== "string" || !["progress", "text", "done"].includes(message.type)) return;
     const event: WorkerEvent = message.type === "done"
       ? { type: "done", text: message.text, error: message.error === true }
       : { type: message.type, text: message.text };
-    const active = this.active;
-    if (!active || message.id !== active.id) {
-      const continuation = typeof message.id === "string" ? this.continuations.get(message.id) : undefined;
-      if (continuation) try { continuation(event); } catch { /* a late continuation must not kill the worker */ }
-      return;
-    }
-    try { active.onEvent(event); }
-    catch { this.failActive(new Error("Pi worker event handler failed")); return; }
-    if (event.type === "done") {
-      this.active = undefined;
-      this.continuations.set(active.id, active.onEvent);
-      active.resolve();
-    }
+    try { this.onEvent?.(event); } catch { /* output failure cannot block input delivery */ }
   }
   /** Requests run outside the prompt lifecycle: a worker may push long after its turn ended. */
   private async respond(message: any): Promise<void> {
@@ -274,10 +324,17 @@ class PaneWorker implements ConversationWorker {
     }
   }
 
-  private failActive(error: Error): void { const active = this.active; this.active = undefined; active?.reject(error); }
+  private failActive(error: Error): void {
+    for (const pending of this.deliveries.values()) pending.reject(error);
+    this.deliveries.clear();
+    // A lost connection can occur long after handoff. Report it on the chat
+    // channel, rather than leaving the last progress card looking busy forever.
+    const sink = this.onEvent; this.onEvent = undefined;
+    try { sink?.({ type: "done", text: "❌ Pi 会话连接已断开，未自动重发消息。下次消息会重新打开会话。", error: true }); } catch {}
+  }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closed = true; this.ready = false; this.continuations.clear();
+    this.closed = true; this.ready = false; this.onEvent = undefined;
     this.rejectReady?.(new Error("Pi worker closed")); this.abort.abort();
     this.failActive(new Error("Pi worker closed"));
     for (const peer of this.peers) peer.destroy();
@@ -292,7 +349,7 @@ class PaneWorker implements ConversationWorker {
         catch { /* An already-closed pane needs no cleanup. IPC loss also stops pi. */ }
       }
       if (this.tempDir) await rm(this.tempDir, { recursive: true, force: true });
-    })().finally(() => this.finishRetirement?.());
+    })();
     return this.closing;
   }
 }
@@ -309,8 +366,6 @@ export class ZellijWorkers implements WorkerFactory {
   open(userId: string): Promise<ConversationWorker> {
     if (this.closed) return Promise.reject(new Error("ZellijWorkers is closed"));
     const old = this.entries.get(userId);
-    // New messages wait for the idle handshake, then reuse or reopen the pane.
-    if (old?.worker.retiring) return old.worker.retiring.then(() => this.open(userId));
     if (old && (old.worker.isConnected() || !old.started)) return old.promise;
     const worker = new PaneWorker({ ...this.options, model: this.models.get(userId) ?? this.options.model }, userId);
     const entry = { worker, promise: undefined as unknown as Promise<PaneWorker>, started: false };

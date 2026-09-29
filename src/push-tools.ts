@@ -1,5 +1,5 @@
 import { Type } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { WorkerResponse } from "./types.ts";
 
 /**
@@ -8,7 +8,7 @@ import type { WorkerResponse } from "./types.ts";
  * The tools themselves are identical either way.
  */
 export interface PushToolHandlers {
-  push(text: string): Promise<WorkerResponse>;
+  push(text: string, ctx: ExtensionContext): Promise<WorkerResponse>;
   /** Omitted for a session that belongs to no chat, where "set this chat" has no meaning. */
   target?(action: "set" | "clear" | "status"): Promise<WorkerResponse>;
 }
@@ -36,7 +36,7 @@ export function registerPushTools(pi: ExtensionAPI, handlers: PushToolHandlers):
     parameters: Type.Object({
       text: Type.String({ description: "Plain text to post. Write it so it makes sense to readers who cannot see this conversation." }),
     }),
-    execute: async (_toolCallId, params) => result(await handlers.push(params.text)),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => result(await handlers.push(params.text, ctx)),
   });
 
   if (!handlers.target) return;

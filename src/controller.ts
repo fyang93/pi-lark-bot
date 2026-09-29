@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { isMissing, loadAllowlist, loadPushTarget, readPrivateJson, saveAllowlist, savePushTarget, writePrivateJson } from "./storage.ts";
-import { PANE_IDLE_MS, conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type ModelSpec, type PushTarget, type WorkerFactory, type WorkerEvent, type WorkerRequest, type WorkerResponse } from "./types.ts";
+import { conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type ModelSpec, type PushTarget, type ConversationWorker, type WorkerFactory, type WorkerEvent, type WorkerRequest, type WorkerResponse } from "./types.ts";
 import { modelPickerCard, modelSelectedCard, parseModelCardAction } from "./model-card.ts";
 
 /** Conservative UTF-8 payload bound, including room for card JSON overhead. */
@@ -50,10 +50,9 @@ export class ProgressMessage {
       }
     });
   }
+  cancel(): void { this.ended = true; clearTimeout(this.timer); this.timer = undefined; }
   async finish(text: string): Promise<void> {
-    this.ended = true;
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = undefined;
+    this.cancel();
     this.latest = text;
     await this.pending;
     this.enqueue();
@@ -61,7 +60,48 @@ export class ProgressMessage {
   }
 }
 
-interface UserQueue { tail: Promise<void>; count: number }
+/** Output serialization is independent of input delivery. Token snapshots are coalesced. */
+class ChatOutput {
+  private tail: Promise<void> = Promise.resolve();
+  private card?: Promise<ProgressMessage | undefined>;
+  private progress?: ProgressMessage;
+  private text = "";
+  private status = "⏳ 正在处理中…";
+  private closed = false;
+  constructor(private transport: BotTransport, private chatId: string, private interval: number | undefined,
+    private onError: (error: unknown) => void) {}
+  receive(event: WorkerEvent): void {
+    if (this.closed) return;
+    if (event.type === "text") this.text = event.text;
+    if (event.type === "progress") this.status = event.text;
+    if (!this.card) {
+      const card = this.tail.then(async () => {
+        if (this.closed) return undefined;
+        const id = await this.transport.send(this.chatId, "⏳ 正在处理中…");
+        const progress = new ProgressMessage(this.transport, id, this.interval, this.onError);
+        if (this.closed) { progress.cancel(); return undefined; }
+        if (this.card === card) { this.progress = progress; progress.set(`${this.status}\n\n${this.text}`); }
+        return progress;
+      });
+      this.card = card;
+      this.tail = card.then(() => {}, this.onError);
+    }
+    if (event.type === "done") {
+      const card = this.card;
+      const text = event.text || this.text || (event.error ? "Pi 回合执行失败。" : "（没有文本回复）");
+      this.card = undefined; this.progress = undefined; this.text = ""; this.status = "⏳ 正在处理中…";
+      this.tail = card.then(async (progress) => {
+        if (!progress) return;
+        if (this.closed) { progress.cancel(); return; }
+        await progress.finish(text);
+      }).catch(this.onError);
+    } else this.progress?.set(`${this.status}\n\n${this.text}`);
+  }
+  drain(): Promise<void> { return this.tail; }
+  close(): void { this.closed = true; this.progress?.cancel(); }
+}
+
+interface HandoffQueue { tail: Promise<void>; count: number }
 export interface ControllerOptions {
   config: BotConfig;
   stateDir: string;
@@ -122,9 +162,8 @@ export class BotController {
   private readonly models = new Map<string, ModelSpec>();
   private readonly modelCards = new Map<string, { chatId: string; key: string; ownerId?: string }>();
   private stopping?: Promise<void>;
-  private users = new Map<string, UserQueue>();
+  private users = new Map<string, HandoffQueue>();
   private readonly running = new Map<string, AbortController>();
-  private readonly lastMessages = new Map<string, number>();
   private seen = new Set<string>();
   private admission: Promise<void> = Promise.resolve();
   private authorizationTail: Promise<void> = Promise.resolve();
@@ -133,8 +172,7 @@ export class BotController {
   private allowlist = new Set<string>();
   /** Conversation key to its chat, so "set the push target here" needs no ID from the model. */
   private readonly chats = new Map<string, { chatId: string; chatType: "p2p" | "group" }>();
-  /** Conversations whose Pi session has completed a turn, so a failure there is real. */
-  private readonly warmed = new Set<string>();
+  private readonly channels = new Map<string, { worker: ConversationWorker; output: ChatOutput }>();
   private pushTarget?: PushTarget;
   private pushTimes: number[] = [];
   private denied: DeniedSender[] = [];
@@ -144,7 +182,7 @@ export class BotController {
     allowlisted: this.allowlist.size, sessions: this.options.workers.list?.() ?? [],
     pushTarget: this.pushTarget ? { chatId: this.pushTarget.chatId, chatType: this.pushTarget.chatType } : undefined,
     denied: this.denied.length,
-    queued: [...this.users.values()].reduce((n, u) => n + u.count, 0) }; }
+    queued: [...this.users.values()].reduce((n, u) => n + u.count, 0) }; } // pending handoffs, not model jobs
 
   async start(): Promise<void> {
     if (this.active) return;
@@ -169,12 +207,11 @@ export class BotController {
     this.options.onStatus?.();
   }
 
-  /** Return promptly to acknowledge WebSocket delivery; jobs run outside the event handler. */
+  /** Return promptly to acknowledge WebSocket delivery; authorize and hand off asynchronously. */
   receive(message: IncomingMessage): Promise<void> {
     if (!this.active) return Promise.resolve();
     if (message.chatType !== undefined && message.chatType !== "p2p" && message.chatType !== "group") return Promise.resolve();
     if (message.chatType === "group" && !message.mentionedBot) return Promise.resolve();
-    this.lastMessages.set(conversationKey(message), Date.now());
     const admission = this.admission.then(async () => {
       if (!this.active || this.seen.has(message.id)) return;
       this.seen.add(message.id);
@@ -229,12 +266,6 @@ export class BotController {
     return Promise.resolve();
   }
 
-  /** The worker separately checks local Pi activity before accepting retirement. */
-  canCloseIdle(key: string): boolean {
-    return this.active && !this.users.get(key)?.count && !this.running.has(key)
-      && Date.now() - (this.lastMessages.get(key) ?? Date.now()) >= PANE_IDLE_MS;
-  }
-
   private async isAllowed(message: IncomingMessage): Promise<boolean> {
     // The allowlist follows the human sender across direct and group chats.
     if (this.allowlist.has(message.userId)) return true;
@@ -267,13 +298,20 @@ export class BotController {
     const { transport, workers } = this.options;
     if (value.name === "stop") {
       if (value.arg) { await transport.send(message.chatId, "用法：/stop", message.id); return; }
-      const current = this.running.get(key);
+      const current = this.running.get(key), worker = this.channels.get(key)?.worker;
       current?.abort();
-      await transport.send(message.chatId, current ? "已请求停止。" : "当前没有任务。", message.id);
+      try { await worker?.interrupt?.(); }
+      catch (error) {
+        this.onError(error);
+        await transport.send(message.chatId, "无法确认 Pi 是否已停止，请检查对应分屏。", message.id);
+        return;
+      }
+      await transport.send(message.chatId, current || worker ? "已请求 Pi 中断当前操作；已交给 Pi 的排队消息由 Pi 管理。" : "当前没有会话。", message.id);
       return;
     }
     if (value.name === "new") {
       if (!workers.reset) throw new Error("This worker does not support session reset");
+      this.channels.get(key)?.output.close(); this.channels.delete(key);
       await workers.reset(key);
       this.models.delete(key);
       await transport.send(message.chatId, "已开启新的 Pi 会话。", message.id);
@@ -300,6 +338,7 @@ export class BotController {
     if (!workers.setModel) throw new Error("This worker does not support model switching");
     // `key` is derived solely from the incoming DM user or group chat, so a
     // command cannot reset or reconfigure another user's private session.
+    this.channels.get(key)?.output.close(); this.channels.delete(key);
     await workers.setModel(key, model);
     this.models.set(key, model);
     await transport.send(message.chatId, `已切换当前会话模型：${model.provider}/${model.id}\n下一条消息将使用该模型继续当前历史。`, message.id);
@@ -318,6 +357,7 @@ export class BotController {
     const slash = action.key.indexOf("/");
     const selected = slash > 0 && this.options.availableModels?.find((model) => model.provider === action.key.slice(0, slash) && model.id === action.key.slice(slash + 1));
     if (!selected || !this.options.workers.setModel) return;
+    this.channels.get(card.key)?.output.close(); this.channels.delete(card.key);
     await this.options.workers.setModel(card.key, selected);
     this.models.set(card.key, selected);
     await this.options.transport.updateCard?.(messageId, modelSelectedCard(selected));
@@ -442,8 +482,7 @@ export class BotController {
     const key = conversationKey(message), abort = new AbortController();
     this.running.set(key, abort);
     const { signal } = abort;
-    let progress: ProgressMessage | undefined, responseId: string | undefined;
-    let answer = "", continuation = "", initialDone = false, status = "⏳ 正在处理中…", final: Extract<WorkerEvent, { type: "done" }> | undefined;
+
     try {
       if (transport.prepareMessage && message.parentMessageId) message = await transport.prepareMessage(message);
       signal.throwIfAborted();
@@ -451,10 +490,13 @@ export class BotController {
       const worker = await workers.open(key);
       signal.throwIfAborted();
       if (!this.active) return;
-      responseId = await transport.send(message.chatId, status, message.id);
-      progress = new ProgressMessage(transport, responseId, this.options.streamInterval, this.onError);
-      signal.throwIfAborted();
-      if (!this.active) { await progress.finish("⏹ 已停止。"); return; }
+      let channel = this.channels.get(key);
+      if (!channel || channel.worker !== worker) {
+        channel?.output.close();
+        channel = { worker, output: new ChatOutput(transport, message.chatId, this.options.streamInterval, this.onError) };
+        this.channels.set(key, channel);
+      }
+      const output = channel.output;
       const attachmentText = message.attachments?.length ? [
         "Referenced attachments for this request:",
         ...message.attachments.map((file) => file.status === "ready"
@@ -467,69 +509,30 @@ export class BotController {
         : "";
       const request = [message.text, attachmentText, preparationWarning].filter(Boolean).join("\n\n");
       const prompt = message.chatType === "group" ? `${message.userId}: ${request}` : request;
-      const onEvent = (event: WorkerEvent) => {
-        if (signal.aborted) return;
-        if (initialDone) {
-          if (event.type === "text") continuation = event.text;
-          if (event.type === "done") {
-            const text = event.text || continuation || (event.error ? "会话后续任务执行失败。" : "（没有文本回复）");
-            continuation = "";
-            // A background task often leaves the original card at a waiting
-            // status. Finalize that status before posting its later result.
-            if (responseId && /等待/.test(status)) void transport.update(responseId, "✅ 后续任务已完成").catch(this.onError);
-            void transport.send(message.chatId, text, message.id).catch(this.onError);
-          }
-          return;
-        }
-        if (event.type === "done") { final = event; initialDone = true; return; }
-        if (event.type === "text") answer = event.text;
-        else status = event.text;
-        progress?.set(`${status}\n\n${answer}`);
-      };
-      await worker.run(prompt, onEvent, signal);
-      // A Pi session that has never completed a turn can fail while it is still
-      // coming up, before the request has had any effect. Losing the message to
-      // that is worse than running it twice, which cannot have happened yet.
-      if (this.active && !signal.aborted && final?.error && !this.warmed.has(key)) {
-        progress.set("⏳ 会话启动失败，正在重试…");
-        answer = ""; status = "⏳ 正在重试…"; final = undefined; initialDone = false;
-        await worker.run(prompt, onEvent, signal);
-      }
-      if (final && !final.error) this.warmed.add(key);
-      const cancelled = async () => {
-        if (this.active && !signal.aborted) return false;
-        await progress!.finish("⏹ 已停止。");
-        return true;
-      };
-      if (await cancelled()) return;
-      const result = final as Extract<WorkerEvent, { type: "done" }> | undefined;
-      if (!result) throw new Error("Worker ended without a final result.");
-      // The progress card is the reply. Replacing its content instead of sending
-      // another message preserves one continuous, streaming conversation bubble.
-      await progress.finish(result.text || (result.error ? "执行失败，请检查会话 pane。" : "（没有文本回复）"));
-      await cancelled();
+      await worker.run(prompt, (event) => {
+        if (this.active) output.receive(event);
+      }, signal);
+      // Handoff is complete. Pi owns any model work and follow-up queue from here.
     } catch (error) {
       if (!signal.aborted) this.onError(error);
-      // Keep errors in the existing progress card too, rather than creating a
-      // second bubble after a streamed response.
-      const text = signal.aborted ? "⏹ 已停止。" : this.active
-        ? "❌ 执行或回复失败，请检查 Pi 会话。"
-        : "⏹ 机器人已停止。";
-      if (progress) await progress.finish(text);
-      else if (this.active && !signal.aborted) await transport.send(message.chatId, text, message.id);
+      if (this.active && !signal.aborted) await transport.send(message.chatId,
+        "❌ 消息投递失败或状态不确定，请检查 Pi 会话。为避免重复执行，未自动重试。", message.id);
     } finally { this.running.delete(key); }
   }
 
-  /** Used by tests and shutdown; includes asynchronous admission and all queued jobs. */
+  /** Wait for admitted handoffs and currently scheduled output writes, never model completion. */
   async drain(): Promise<void> {
     await this.admission;
     await Promise.all([...this.users.values()].map((user) => user.tail));
+    await Promise.all([...this.channels.values()].map(({ output }) => output.drain()));
   }
 
   stop(): Promise<void> {
     if (this.stopping) return this.stopping;
     this.active = false;
     this.authorizationAbort.abort();
+    for (const abort of this.running.values()) abort.abort();
+    for (const { output } of this.channels.values()) output.close();
     this.stopping = (async () => {
       // Stop inbound WS first. REST remains usable for final interruption notifications.
       await this.options.transport.stop().catch(this.onError);
