@@ -69,7 +69,15 @@ export async function nameAgent(pane: string, name: string, attempts = 10): Prom
   }
 }
 
-export function closeSurface(pane: string): void {
+/**
+ * Close the pane, found through its agent name when given: a pane moved to another
+ * workspace gets a new id, the name follows the agent. Falls back to `pane`.
+ */
+export function closeSurface(pane: string, agent?: string): void {
+  if (agent) {
+    try { pane = JSON.parse(execFileSync(bin(), ["agent", "get", agent], { ...options, timeout: 5000 })).result.agent.pane_id ?? pane; }
+    catch { /* not (or no longer) a named agent: use the pane it was opened in */ }
+  }
   try { execFileSync(bin(), ["pane", "close", pane], { ...options, stdio: "ignore", timeout: 5000 }); }
   catch { /* an already-closed pane needs no cleanup */ }
 }

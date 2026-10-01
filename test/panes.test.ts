@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmod, copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -169,4 +169,20 @@ test("startup deadline cancels the pending handshake and permits a clean retry",
     await assert.rejects(factory.open("ou_a"), /Timed out|closed/);
     assert.deepEqual(factory.list(), []);
   } finally { await factory.close(); await f.cleanup(); }
+});
+
+test("closing finds a moved worker pane through its agent name", { timeout: 10000 }, async () => {
+  const f = await fixture(); const workers = new HerdrWorkers(f.options);
+  try {
+    await workers.open("ou_a");
+    const { paneId } = workers.list()[0]!;
+    const read = async (id: string) => JSON.parse(await readFile(join(f.root, `pane-${id.replace("w1:p", "")}.json`), "utf8"));
+    for (let i = 0; i < 50 && !(await read(paneId!)).agent; i++) await new Promise((done) => setTimeout(done, 20));
+    const { agent } = await read(paneId!);
+    // The user moves the pane to another workspace: herdr gives it a new id; the agent name follows.
+    await rename(join(f.root, `pane-${paneId!.replace("w1:p", "")}.json`), join(f.root, "pane-50.json"));
+    await writeFile(join(f.root, "moved.json"), JSON.stringify({ [agent]: "w1:p50" }));
+    await workers.close();
+    assert.deepEqual((await readdir(f.root)).filter((file) => /^pane-\d+\.json$/.test(file)), [], "the moved pane is closed");
+  } finally { await workers.close(); await f.cleanup(); }
 });

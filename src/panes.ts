@@ -274,7 +274,7 @@ class PaneWorker implements ConversationWorker {
       await this.resources?.catch(() => {});
       for (const peer of this.peers) peer.destroy();
       if (this.server) await new Promise<void>((done) => { this.server!.close(() => done()); });
-      if (this.paneId) closeSurface(this.paneId); // IPC loss also stops pi
+      if (this.paneId) closeSurface(this.paneId, this.name); // IPC loss also stops pi
 
       if (this.tempDir) await rm(this.tempDir, { recursive: true, force: true });
     })();

@@ -83,6 +83,11 @@ if (process.argv[2] === "--child") {
     child.unref();
     const saved = JSON.parse(fs.readFileSync(file(args[0]), "utf8"));
     fs.writeFileSync(file(args[0]), JSON.stringify({ ...saved, pid: child.pid }));
+  } else if (group === "agent" && action === "get") {
+    // A pane moved to another workspace: the agent keeps its name, the pane gets a new id.
+    const moved = path.join(root, "moved.json");
+    if (!fs.existsSync(moved)) fail("agent_not_found");
+    ok({ agent: { name: args[0], pane_id: JSON.parse(fs.readFileSync(moved, "utf8"))[args[0]] } });
   } else if (group === "pane" && action === "close") {
     try { process.kill(JSON.parse(fs.readFileSync(file(args[0]), "utf8")).pid, "SIGTERM"); } catch {}
     try { fs.unlinkSync(file(args[0])); } catch {}
