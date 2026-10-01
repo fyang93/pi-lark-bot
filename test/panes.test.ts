@@ -85,11 +85,12 @@ test("handoff does not wait for output; the next message and interrupt reach the
   } finally { await factory.close(); await f.cleanup(); }
 });
 
-test("workers split the largest usable pane unfocused, else open a background tab", { timeout: 10000 }, async () => {
+test("workers split the controller's own pane unfocused, else open a background tab", { timeout: 10000 }, async () => {
   for (const [layout, zoomed, expected] of [
     [[["w1:p0", 120, 40]], false, { action: "split", target: "w1:p0", direction: "right" }],
-    [[["w1:p0", 120, 40], ["w1:p7", 100, 60]], false, { action: "split", target: "w1:p7", direction: "down" }],
+    [[["w1:p0", 120, 40], ["w1:p7", 100, 60]], false, { action: "split", target: "w1:p0", direction: "right" }],  // never another pane
     [[["w1:p0", 90, 18]], false, { action: "tab" }],
+    [[["w1:p0", 90, 18], ["w1:p7", 200, 50]], false, { action: "tab" }],  // too small: a tab, not the bigger neighbour
     [[["w1:p0", 160, 50]], true, { action: "tab" }],
   ] as const) {
     const f = await fixture({ TEST_LAYOUT: JSON.stringify(layout), TEST_ZOOMED: zoomed ? "1" : "0" });

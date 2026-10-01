@@ -1,6 +1,6 @@
 // herdr panes for worker sessions. Pane ids look like `w1:p2`.
-// Workers open as unfocused splits of the largest pane in the controller's tab,
-// or in a background tab when no split leaves both halves usable.
+// Workers open as unfocused splits of the controller's own pane, or in a
+// background tab when splitting it would leave either half too small.
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -44,14 +44,13 @@ export async function createSurface(name: string, command: string[]): Promise<st
   let layout: any;
   try { ({ layout } = await herdr(["pane", "layout", "--pane", process.env.HERDR_PANE_ID!])); }
   catch { throw new Error("Cannot inspect herdr layout; worker creation was not attempted."); }
-  // Never unzoom or rearrange the user's layout.
-  let best: { pane: string; direction: "right" | "down"; area: number } | undefined;
-  for (const { pane_id, rect } of layout.zoomed ? [] : layout.panes) {
-    const direction = splitDirection(rect.width, rect.height);
-    if (direction && (!best || rect.width * rect.height > best.area)) best = { pane: pane_id, direction, area: rect.width * rect.height };
-  }
-  const pane: string = best
-    ? (await herdr(["pane", "split", best.pane, "--direction", best.direction, "--no-focus", "--cwd", "/"])).pane.pane_id
+  // Split only the controller's own pane, never another pane the user may be working in;
+  // a background tab when it is too small or zoomed. Never unzoom or rearrange the layout.
+  const parent = process.env.HERDR_PANE_ID!;
+  const own = layout.zoomed ? undefined : layout.panes.find((pane: any) => pane.pane_id === parent);
+  const direction = own && splitDirection(own.rect.width, own.rect.height);
+  const pane: string = direction
+    ? (await herdr(["pane", "split", parent, "--direction", direction, "--no-focus", "--cwd", "/"])).pane.pane_id
     : (await herdr(["tab", "create", "--no-focus", "--label", name, "--cwd", "/"])).root_pane.pane_id;
   await herdr(["pane", "rename", pane, name]).catch(() => {});
   try { await herdr(["pane", "run", pane, command.map(quote).join(" ")]); }
