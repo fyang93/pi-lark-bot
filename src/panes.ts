@@ -150,6 +150,7 @@ class PaneWorker implements ConversationWorker {
       if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_LARK_BOT_") || ["PI_SESSION_ID", "PI_SESSION_FILE"].includes(key)) delete childEnv[key];
     }
     Object.assign(childEnv, { PI_LARK_BOT_WORKER: "1", PI_LARK_BOT_SOCKET: socketPath, PI_LARK_BOT_RUN_ID: runId, PI_LARK_BOT_TOKEN: token });
+    if (this.userId.startsWith("group:")) childEnv.PI_LARK_BOT_GROUP_CHAT_ID = this.userId.slice("group:".length);
     const extension = this.options.workerExtensionPath ?? fileURLToPath(new URL("./worker-extension.ts", import.meta.url));
     const args = ["--session", this.sessionFile, "-e", extension];
     if (this.options.model) args.push("--model", `${this.options.model.provider}/${this.options.model.id}`);

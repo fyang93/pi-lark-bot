@@ -17,6 +17,7 @@ function textFrom(message: any): string {
 export default function larkWorkerExtension(pi: ExtensionAPI): void {
   const socketPath = process.env.PI_LARK_BOT_SOCKET;
   const runId = process.env.PI_LARK_BOT_RUN_ID;
+  const groupChatId = process.env.PI_LARK_BOT_GROUP_CHAT_ID;
   const token = process.env.PI_LARK_BOT_TOKEN;
   let socket: Socket | undefined, ctx: ExtensionContext | undefined, buffer = "";
   let stopping = false, connectedChat = false, outputOpen = false, text = "";
@@ -107,6 +108,9 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     push: (value) => request({ action: "push", text: value }),
     target: (action) => request({ action: action === "set" ? "set-target" : action === "clear" ? "clear-target" : "target-status" }),
   });
+  pi.on("before_agent_start", (event) => groupChatId
+    ? { systemPrompt: `${event.systemPrompt}\n\nThis is group chat \`${groupChatId}\`.` }
+    : undefined);
   pi.on("session_start", (_event, eventCtx) => {
     ctx = eventCtx;
     if (!socketPath || !runId || !token) {

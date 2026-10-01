@@ -7,7 +7,7 @@ import { join } from "node:path";
 import workerExtension from "../src/worker-extension.ts";
 
 async function harness(t: TestContext, options: { fail?: boolean } = {}) {
-  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER"];
+  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_GROUP_CHAT_ID"];
   const old = keys.map((key) => process.env[key]);
   const root = await mkdtemp(join(tmpdir(), "pi-lark-worker-test-"));
   let peer: Socket | undefined;
