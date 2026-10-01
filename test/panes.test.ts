@@ -176,7 +176,13 @@ test("closing finds a moved worker pane through its agent name", { timeout: 1000
   try {
     await workers.open("ou_a");
     const { paneId } = workers.list()[0]!;
-    const read = async (id: string) => JSON.parse(await readFile(join(f.root, `pane-${id.replace("w1:p", "")}.json`), "utf8"));
+    const read = async (id: string) => {
+      for (let i = 0; i < 50; i++) {
+        try { return JSON.parse(await readFile(join(f.root, `pane-${id.replace("w1:p", "")}.json`), "utf8")); }
+        catch (error) { if (!(error instanceof SyntaxError)) throw error; await new Promise((done) => setTimeout(done, 20)); }
+      }
+      throw new Error("pane state was not written");
+    };
     for (let i = 0; i < 50 && !(await read(paneId!)).agent; i++) await new Promise((done) => setTimeout(done, 20));
     const { agent } = await read(paneId!);
     await new Promise((done) => setTimeout(done, 100));  // the rename's reply reaches the worker
