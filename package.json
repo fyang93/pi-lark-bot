@@ -1,14 +1,14 @@
 {
   "name": "pi-lark-bot",
-  "version": "0.3.1",
-  "description": "Opt-in Feishu/Lark bot with independent per-user and per-group pi sessions in Zellij",
+  "version": "0.4.0",
+  "description": "Opt-in Feishu/Lark bot with independent per-user and per-group pi sessions in herdr",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "pi-package",
     "lark",
     "feishu",
-    "zellij"
+    "herdr"
   ],
   "files": [
     "src",
@@ -22,9 +22,7 @@
   },
   "scripts": {
     "test": "tsx --test --test-timeout=30000 test/*.test.ts",
-    "typecheck": "tsc --noEmit",
-    "test:integration": "node test/run-integration.mjs",
-    "test:integration:worker": "tsx --test --test-timeout=100000 test/integration.test.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.74.0",

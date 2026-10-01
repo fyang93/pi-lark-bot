@@ -7,87 +7,13 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { setTimeout as sleep } from "node:timers/promises";
 import { privateDir, writePrivateJson } from "./storage.ts";
 import type { ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory, WorkerRequest, WorkerResponse } from "./types.ts";
 
-import { closeSurface } from "./zellij.ts";
-import { measurePane, selectPlacement, type PaneGeometry } from "./zellij-layout.ts";
-
-/** Split selection and tab reconciliation adapted from HazAT/pi-interactive-subagents (MIT). */
-let creationQueue: Promise<unknown> = Promise.resolve();
-function createWorkerSurface(name: string, command: string[]): Promise<string> {
-  const result = creationQueue.then(() => createWorkerSurfaceUnlocked(name, command));
-  creationQueue = result.catch(() => {});
-  return result;
-}
-async function createWorkerSurfaceUnlocked(name: string, command: string[]): Promise<string> {
-  const parent = process.env.ZELLIJ_PANE_ID;
-  if (!process.env.ZELLIJ || !parent || !/^\d+$/.test(parent)) throw new Error("Start pi inside Zellij 0.44+ before running /lark-bot on.");
-  const options = { encoding: "utf8" as const, timeout: 10_000 };
-  let version: string;
-  try { version = execFileSync("zellij", ["--version"], options); }
-  catch { throw new Error("Zellij 0.44+ must be installed and available on PATH."); }
-  const match = version.match(/zellij (\d+)\.(\d+)\.(\d+)/);
-  if (!match || (Number(match[1]) === 0 && Number(match[2]) < 44)) throw new Error("Zellij 0.44+ is required for pane-targeted CLI actions.");
-  const noFocus = Number(match[1]) > 0 || Number(match[2]) >= 45;
-  let panes: PaneGeometry[];
-  try {
-    const found: unknown = JSON.parse(execFileSync("zellij", ["action", "list-panes", "--json", "--geometry", "--state", "--tab"],
-      { ...options, env: { ...process.env, ZELLIJ_PANE_ID: parent } }));
-    if (!Array.isArray(found) || !found.every((p) => p && Number.isSafeInteger(p.id) && p.id >= 0 && typeof p.is_plugin === "boolean")) throw new Error("Invalid pane list");
-    panes = found as PaneGeometry[];
-  } catch { throw new Error("Cannot inspect Zellij layout; worker creation was not attempted."); }
-  const owner = panes.find(p => !p.is_plugin && p.id === Number(parent));
-  if (!owner || !Number.isSafeInteger(owner.tab_id) || owner.tab_id! < 0 || owner.is_floating || owner.is_suppressed || owner.is_selectable === false ||
-      panes.some(p => p.tab_id === owner.tab_id && !p.is_plugin && !measurePane(p))) {
-    throw new Error("Cannot verify parent pane and tab geometry; worker creation was not attempted.");
-  }
-  const placement = selectPlacement(panes, Number(parent));
-  if (!placement && !noFocus) throw new Error("Zellij 0.45+ is required to create an unfocused worker tab when pane space runs out.");
-  const marker = `pi-lark-create-${randomBytes(16).toString("hex")}`;
-  let reply = "";
-  const tab = !placement;
-  try {
-    reply = execFileSync("zellij", tab
-      ? ["action", "new-tab", "--no-focus", "--name", marker, "--cwd", "/", "--layout-string", "layout { pane; }", "--", ...command]
-      : ["action", "new-pane", noFocus ? "--no-focus" : "--near-current-pane",
-        "--direction", placement.direction, "--name", marker, "--cwd", "/", "--", ...command],
-      { ...options, env: { ...process.env, ZELLIJ_PANE_ID: String(placement?.paneId ?? parent) } }).trim();
-  } catch { /* CLI failure can still mean creation succeeded; never retry the mutation. */ }
-  let pane = tab ? "" : /^terminal_\d+$/.test(reply) ? reply : "";
-  let tabId: number | undefined;
-  if (tab || !pane) {
-    const deadline = performance.now() + 2000;
-    while (performance.now() < deadline && !pane) {
-      try {
-        const found: unknown = JSON.parse(execFileSync("zellij", ["action", "list-panes", "--json", "--all"], options));
-        if (!Array.isArray(found)) throw new Error("Invalid pane list");
-        if (tab) {
-          const id = /^\d+$/.test(reply) && Number.isSafeInteger(Number(reply)) ? Number(reply) : undefined;
-          const matches = found.filter(p => p && !p.is_plugin && Number.isSafeInteger(p.id) && p.id >= 0 &&
-            Number.isSafeInteger(p.tab_id) && p.tab_id >= 0 && p.tab_name === marker && (id === undefined || p.tab_id === id));
-          if (matches.length === 1 && found.filter(p => p && !p.is_plugin && p.tab_id === matches[0].tab_id).length === 1) {
-            pane = `terminal_${matches[0].id}`; tabId = matches[0].tab_id;
-          }
-        } else {
-          const matches = found.filter(p => p && !p.is_plugin && p.title === marker && Number.isSafeInteger(p.id) && p.id >= 0);
-          if (matches.length === 1) pane = `terminal_${matches[0].id}`;
-        }
-      } catch { /* An unconfirmed creation is not safe to repeat. */ }
-      if (!pane && performance.now() < deadline) await sleep(Math.min(50, deadline - performance.now()));
-    }
-  }
-  if (!/^terminal_\d+$/.test(pane)) throw new Error(`Could not confirm Zellij ${tab ? "tab" : "pane"} creation (${marker}); not retried to avoid duplicate workers.`);
-  try {
-    if (tab) execFileSync("zellij", ["action", "rename-tab", "--tab-id", String(tabId), "--", name], options);
-    execFileSync("zellij", ["action", "rename-pane", "--pane-id", pane, "--", name], options);
-  } catch { /* An identified pane can still be owned/closed under its marker. */ }
-  return pane;
-}
+import { closeSurface, createSurface, nameAgent } from "./herdr.ts";
 
 const MAX_FRAME = 8 * 1024 * 1024;
-export interface ZellijWorkersOptions {
+export interface HerdrWorkersOptions {
   cwd: string;
   stateDir?: string;
   appId: string;
@@ -165,9 +91,11 @@ class PaneWorker implements ConversationWorker {
   private rejectReady?: (error: Error) => void;
   private onEvent?: (event: WorkerEvent) => void;
   private readonly deliveries = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
-  constructor(private options: ZellijWorkersOptions, private userId: string) {
+  constructor(private options: HerdrWorkersOptions, private userId: string) {
     this.sessionFile = resolve(options.stateDir ?? join(options.cwd, ".pi", "lark-bot"), "sessions", `${sessionKey(options.appId, userId)}.jsonl`);
   }
+  /** Pane and herdr agent name; reveals no user identifier. */
+  get name(): string { return `lark-${sessionKey(this.options.appId, this.userId).slice(0, 10)}`; }
   snapshot(): PaneSnapshot { return { userId: this.userId, paneId: this.paneId, sessionFile: this.sessionFile, connected: this.isConnected() }; }
   isConnected(): boolean { return !this.closed && this.ready && !!this.socket && !this.socket.destroyed; }
 
@@ -177,7 +105,7 @@ class PaneWorker implements ConversationWorker {
     const runId = randomBytes(16).toString("hex"), token = randomBytes(32).toString("hex");
     let resolveReady!: () => void;
     const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; this.rejectReady = reject; });
-    // Start the deadline before any filesystem, Zellij, or pi startup operation.
+    // Start the deadline before any filesystem, herdr, or pi startup operation.
     const timer = setTimeout(() => {
       this.rejectReady?.(new Error("Timed out waiting for pi worker startup"));
       void this.close();
@@ -234,10 +162,9 @@ class PaneWorker implements ConversationWorker {
     await writePrivateJson(launchFile, { cli: piCliPath(), args, cwd: this.options.cwd, env: childEnv });
     this.checkOpen();
     // Pass the actual parent environment privately, preserving the new pane's
-    // own Zellij identity in the launcher. Remote messages only use IPC.
+    // own herdr identity in the launcher. Remote messages only use IPC.
     const launcher = fileURLToPath(new URL("./launch-worker.cjs", import.meta.url));
-    this.paneId = await createWorkerSurface(`lark-${sessionKey(this.options.appId, this.userId).slice(0, 10)}`,
-      [process.execPath, launcher, launchFile]);
+    this.paneId = await createSurface(this.name, [process.execPath, launcher, launchFile]);
     this.checkOpen();
   }
 
@@ -269,7 +196,10 @@ class PaneWorker implements ConversationWorker {
           });
           continue;
         }
-        if (message.type === "ready") { this.ready = true; resolveReady(); }
+        if (message.type === "ready") {
+          this.ready = true; resolveReady();
+          if (this.paneId) void nameAgent(this.paneId, this.name);
+        }
         else this.handle(message);
       }
     });
@@ -344,37 +274,35 @@ class PaneWorker implements ConversationWorker {
       await this.resources?.catch(() => {});
       for (const peer of this.peers) peer.destroy();
       if (this.server) await new Promise<void>((done) => { this.server!.close(() => done()); });
-      if (this.paneId) {
-        try { closeSurface(this.paneId); }
-        catch { /* An already-closed pane needs no cleanup. IPC loss also stops pi. */ }
-      }
+      if (this.paneId) closeSurface(this.paneId); // IPC loss also stops pi
+
       if (this.tempDir) await rm(this.tempDir, { recursive: true, force: true });
     })();
     return this.closing;
   }
 }
 
-export class ZellijWorkers implements WorkerFactory {
+export class HerdrWorkers implements WorkerFactory {
   private entries = new Map<string, { worker: PaneWorker; promise: Promise<PaneWorker>; started: boolean }>();
   private readonly models = new Map<string, ModelSpec>();
   private closed = false;
   private closing?: Promise<void>;
-  constructor(private options: ZellijWorkersOptions) {
-    if (!options.cwd || !options.appId) throw new Error("ZellijWorkers requires cwd and appId");
+  constructor(private options: HerdrWorkersOptions) {
+    if (!options.cwd || !options.appId) throw new Error("HerdrWorkers requires cwd and appId");
   }
   list(): PaneSnapshot[] { return [...this.entries.values()].filter((entry) => !entry.started || entry.worker.isConnected()).map((entry) => entry.worker.snapshot()); }
   open(userId: string): Promise<ConversationWorker> {
-    if (this.closed) return Promise.reject(new Error("ZellijWorkers is closed"));
+    if (this.closed) return Promise.reject(new Error("HerdrWorkers is closed"));
     const old = this.entries.get(userId);
     if (old && (old.worker.isConnected() || !old.started)) return old.promise;
     const worker = new PaneWorker({ ...this.options, model: this.models.get(userId) ?? this.options.model }, userId);
     const entry = { worker, promise: undefined as unknown as Promise<PaneWorker>, started: false };
     entry.promise = Promise.resolve().then(async () => {
       await old?.worker.close();
-      if (this.closed) throw new Error("ZellijWorkers is closed");
+      if (this.closed) throw new Error("HerdrWorkers is closed");
       await worker.start();
       entry.started = true;
-      if (this.closed) { await worker.close(); throw new Error("ZellijWorkers is closed"); }
+      if (this.closed) { await worker.close(); throw new Error("HerdrWorkers is closed"); }
       return worker;
     }).catch(async (error) => {
       await worker.close();
@@ -396,7 +324,7 @@ export class ZellijWorkers implements WorkerFactory {
     this.models.delete(userId);
   }
   async setModel(userId: string, model: ModelSpec): Promise<void> {
-    if (this.closed) throw new Error("ZellijWorkers is closed");
+    if (this.closed) throw new Error("HerdrWorkers is closed");
     this.models.set(userId, model);
     const entry = this.entries.get(userId);
     if (entry) {

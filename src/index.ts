@@ -6,14 +6,14 @@ import { acquireLock, inspectLock, isMissing, loadAllowlist, loadConfig, loadPus
 import type { BotController } from "./controller.ts";
 import { registerPushTools } from "./push-tools.ts";
 import { pushViaOwner, servePush, type Endpoint } from "./push-ipc.ts";
-import { requireZellij } from "./zellij.ts";
+import { requireHerdr } from "./herdr.ts";
 import { missingBotPermissions, permissionInstructions } from "./registration.ts";
 
 const commands = ["link", "on", "off", "allow", "deny", "push", "help"];
 const help = [
   "/lark-bot — Show project configuration, listener, sessions and push target",
   "/lark-bot link — Register a bot or enter existing app credentials",
-  "/lark-bot on — Enable automatic listening for this project (requires Zellij 0.44+)",
+  "/lark-bot on — Enable automatic listening for this project (requires herdr)",
   "/lark-bot off — Disable automatic listening and close panes, preserving history",
   "/lark-bot allow [open_id|code] — Allowlist a sender; with no argument, pick from recent rejections",
   "/lark-bot deny <open_id> — Remove a sender from the allowlist",
@@ -302,7 +302,7 @@ export default function larkBot(pi: ExtensionAPI): void {
         }
         let config = await loadConfig(stateDir);
         if (!config) throw new Error("Run /lark-bot link first.");
-        requireZellij();
+        requireHerdr();
         if (restoreAppId !== undefined && config.appId !== restoreAppId) throw new Error("Bot configuration changed. Run /lark-bot on to enable it again.");
         if (restoreAppId === undefined && !await ctx.ui.confirm("Enable remote code execution?", "New users require local approval (10-second timeout; default choice is Confirm), whether they contact the bot directly or @mention it in a group. Sessions share project files, and group replies are visible to group members.", { signal: setupAbort.signal })) return;
         if (shuttingDown) return;
@@ -313,7 +313,7 @@ export default function larkBot(pi: ExtensionAPI): void {
           if (!config || (restoreAppId !== undefined && config.appId !== restoreAppId)) throw new Error("Configuration changed. Check and retry.");
           // A queued automatic start must not undo an off completed while it waited for the lock.
           if (automatic && !await enabledFor(stateDir, config.appId)) { await stop(); return; }
-          const [{ LarkTransport }, { ZellijWorkers }, { BotController }] = await Promise.all([
+          const [{ LarkTransport }, { HerdrWorkers }, { BotController }] = await Promise.all([
             import("./lark.ts"), import("./panes.ts"), import("./controller.ts"),
           ]);
           if (shuttingDown) { await stop(); return; }
@@ -322,7 +322,7 @@ export default function larkBot(pi: ExtensionAPI): void {
             if (Date.now() - lastErrorAt < 5000 || shuttingDown) return;
             lastErrorAt = Date.now();
             // Never dump SDK errors, subprocess objects, payloads or credentials.
-            const detail = error instanceof Error && /^(Lark (API|connection)|Pi worker|Timed out waiting for pi worker|Zellij did not|Unable to locate the pi CLI)/.test(error.message)
+            const detail = error instanceof Error && /^(Lark (API|connection)|Pi worker|Timed out waiting for pi worker|herdr |Cannot inspect herdr|Unable to locate the pi CLI)/.test(error.message)
               ? ` (${error.message.slice(0, 240)})` : "";
             ctx.ui.notify(`Lark bot operation failed${detail}. Check connectivity, app permissions and the session pane. Generated history is preserved locally.`, "error");
           };
@@ -331,7 +331,7 @@ export default function larkBot(pi: ExtensionAPI): void {
           // Worker panes hold no credentials: their push and push-target requests
           // are served here, and the chat is resolved from the worker's own key.
           let served: BotController | undefined;
-          const workers = new ZellijWorkers({ cwd, stateDir, appId: config.appId,
+          const workers = new HerdrWorkers({ cwd, stateDir, appId: config.appId,
             model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
             thinkingLevel: pi.getThinkingLevel(),
             onRequest: (key, request) => served

@@ -60,7 +60,7 @@ async function waitFor(check: () => boolean) {
 
 test("linked on persists across launches; two sessions elect one listener; off stays off", async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "lark-new-"));
-  const env = { PATH: process.env.PATH, ZELLIJ: process.env.ZELLIJ, ZELLIJ_PANE_ID: process.env.ZELLIJ_PANE_ID };
+  const env = { PATH: process.env.PATH, HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_BIN_PATH: process.env.HERDR_BIN_PATH };
   let starts = 0, stops = 0, confirmations = 0;
   const sent: Array<{ chat: string; text: string }> = [];
   t.mock.method(LarkTransport.prototype, "start", async () => { starts++; });
@@ -71,9 +71,9 @@ test("linked on persists across launches; two sessions elect one listener; off s
   const sessions: ReturnType<typeof harness>[] = [];
   const next = () => { const h = harness(cwd); h.ctx.ui.confirm = async () => { confirmations++; return true; }; sessions.push(h); return h; };
   try {
-    await writeFile(join(cwd, "zellij"), '#!/bin/sh\necho "zellij 0.44.0"\n', { mode: 0o700 });
+    await writeFile(join(cwd, "herdr"), '#!/bin/sh\necho "herdr 0.9.1"\n', { mode: 0o700 });
     process.env.PATH = `${cwd}:${env.PATH}`;
-    process.env.ZELLIJ = "1"; process.env.ZELLIJ_PANE_ID = "0";
+    process.env.HERDR_ENV = "1"; process.env.HERDR_PANE_ID = "w1:p0"; delete process.env.HERDR_BIN_PATH;
     const stateDir = await prepareState(cwd, ".pi");
     const first = next();
     await first.handlers.get("session_start")({ reason: "startup" }, first.ctx);
@@ -170,15 +170,15 @@ test("linked on persists across launches; two sessions elect one listener; off s
 
 test("simultaneous automatic starts publish just one listener and push endpoint", async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "lark-simultaneous-"));
-  const env = { PATH: process.env.PATH, ZELLIJ: process.env.ZELLIJ, ZELLIJ_PANE_ID: process.env.ZELLIJ_PANE_ID };
+  const env = { PATH: process.env.PATH, HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_BIN_PATH: process.env.HERDR_BIN_PATH };
   const a = harness(cwd), b = harness(cwd);
   let starts = 0;
   t.mock.method(LarkTransport.prototype, "start", async () => { starts++; });
   t.mock.method(LarkTransport.prototype, "stop", async () => {});
   try {
-    await writeFile(join(cwd, "zellij"), '#!/bin/sh\necho "zellij 0.44.0"\n', { mode: 0o700 });
+    await writeFile(join(cwd, "herdr"), '#!/bin/sh\necho "herdr 0.9.1"\n', { mode: 0o700 });
     process.env.PATH = `${cwd}:${env.PATH}`;
-    process.env.ZELLIJ = "1"; process.env.ZELLIJ_PANE_ID = "0";
+    process.env.HERDR_ENV = "1"; process.env.HERDR_PANE_ID = "w1:p0"; delete process.env.HERDR_BIN_PATH;
     const dir = await prepareState(cwd, ".pi");
     await writePrivateJson(join(dir, "config.json"), { version: 1, brand: "feishu", appId: "cli_test", appSecret: "secret" });
     await writePrivateJson(join(dir, "enabled.json"), { appId: "cli_test", enabled: true });
