@@ -108,7 +108,7 @@ test("captures a reply parent and caches its file resource for the authorized co
   fake.api.get = async (payload: any) => {
     fake.calls.get.push(payload);
     return { code: 0, data: { items: [{ message_id: "om_file", chat_id: "oc_1", msg_type: "file",
-      body: { content: JSON.stringify({ file_key: "file-key", file_name: "../report.csv" }) } }] } };
+      body: { content: JSON.stringify({ file_key: "file-key", file_name: "../report.csv", text: "quoted text" }) } }] } };
   };
   fake.messageResource.get = async (payload: any) => {
     fake.calls.resource.push(payload);
@@ -122,6 +122,7 @@ test("captures a reply parent and caches its file resource for the authorized co
     await fake.emit({ ...textEvent, message: { ...textEvent.message, parent_id: "om_file" } });
     assert.equal(received[0].parentMessageId, "om_file");
     const prepared = await transport.prepareMessage(received[0]);
+    assert.equal(prepared.quotedText, "quoted text");
     const attachment = prepared.attachments?.[0];
     assert.equal(attachment?.name, "report.csv");
     assert(attachment?.status === "ready");

@@ -119,7 +119,7 @@ export class LarkTransport implements BotTransport {
 
   /** Resolve directly quoted resources after authorization; one failed resource never drops the text request. */
   async prepareMessage(message: IncomingMessage): Promise<IncomingMessage> {
-    if (!message.parentMessageId || !this.attachmentCache) return message;
+    if (!message.parentMessageId) return message;
     let item: any;
     try {
       const response = await this.request(() => this.client.im.v1.message.get({ path: { message_id: message.parentMessageId } }));
@@ -128,10 +128,13 @@ export class LarkTransport implements BotTransport {
       return { ...message, preparationWarning: "referenced_message_unavailable" };
     }
     if (!item || item.chat_id !== message.chatId || typeof item.body?.content !== "string") return message;
-    let content: unknown;
+    let content: any;
     try { content = JSON.parse(item.body.content); } catch { return message; }
+    const quotedText = typeof content?.text === "string" ? content.text : undefined;
+    const base = quotedText === undefined ? message : { ...message, quotedText };
+    if (!this.attachmentCache) return base;
     const candidates = referencedResources(item.msg_type, content);
-    if (!candidates.length) return message;
+    if (!candidates.length) return base;
     const attachments: NonNullable<IncomingMessage["attachments"]> = [];
     for (const candidate of candidates) {
       try {
@@ -151,7 +154,7 @@ export class LarkTransport implements BotTransport {
           sourceMessageId: message.parentMessageId, error: "download_failed" });
       }
     }
-    return { ...message, attachments };
+    return { ...base, attachments };
   }
 
   async sendCard(chatId: string, value: object, replyTo?: string): Promise<string> {

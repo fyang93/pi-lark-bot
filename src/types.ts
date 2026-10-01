@@ -18,6 +18,8 @@ export interface IncomingMessage {
   mentionedBot?: boolean;
   /** The directly quoted/replied-to message, if any. */
   parentMessageId?: string;
+  /** Text of the directly quoted/replied-to message, resolved after authorization. */
+  quotedText?: string;
   attachments?: IncomingAttachment[];
   preparationWarning?: "referenced_message_unavailable";
   /**
