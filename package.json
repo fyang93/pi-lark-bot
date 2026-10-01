@@ -21,7 +21,7 @@
     ]
   },
   "scripts": {
-    "test": "tsx --test --test-timeout=30000 test/*.test.ts",
+    "test": "tsx --test --test-concurrency=1 --test-timeout=30000 test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

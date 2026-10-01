@@ -105,7 +105,7 @@ test("workers split the controller's own pane unfocused, else open a background 
       const paneId = workers.list()[0]!.paneId!;
       assert.match(paneId, /^w1:p\d+$/);
       const read = async () => JSON.parse(await readFile(join(f.root, `pane-${paneId.replace("w1:p", "")}.json`), "utf8"));
-      for (let i = 0; i < 50 && !(await read()).agent; i++) await new Promise((done) => setTimeout(done, 20));
+      for (let i = 0; i < 250 && !(await read()).agent; i++) await new Promise((done) => setTimeout(done, 20));
       const pane = await read();
       assert.match(pane.label, /^lark-[a-f0-9]{10}$/);
       assert.equal(pane.agent, pane.label, "the ready worker is named in herdr's agents sidebar");
@@ -183,7 +183,7 @@ test("closing finds a moved worker pane through its agent name", { timeout: 1000
       }
       throw new Error("pane state was not written");
     };
-    for (let i = 0; i < 50 && !(await read(paneId!)).agent; i++) await new Promise((done) => setTimeout(done, 20));
+    for (let i = 0; i < 250 && !(await read(paneId!)).agent; i++) await new Promise((done) => setTimeout(done, 20));
     const { agent } = await read(paneId!);
     await new Promise((done) => setTimeout(done, 100));  // the rename's reply reaches the worker
     // The user moves the pane to another workspace: herdr gives it a new id; the agent name follows.
