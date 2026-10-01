@@ -6,8 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import workerExtension from "../src/worker-extension.ts";
 
-async function harness(t: TestContext, options: { fail?: boolean; directUserId?: string; groupChatId?: string } = {}) {
-  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_DIRECT_USER_ID", "PI_LARK_BOT_GROUP_CHAT", "PI_LARK_BOT_GROUP_CHAT_ID"];
+async function harness(t: TestContext, options: { fail?: boolean } = {}) {
+  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER"];
   const old = keys.map((key) => process.env[key]);
   const root = await mkdtemp(join(tmpdir(), "pi-lark-worker-test-"));
   let peer: Socket | undefined;
@@ -36,8 +36,6 @@ async function harness(t: TestContext, options: { fail?: boolean; directUserId?:
   await new Promise<void>((resolve) => server.listen(path, resolve));
   keys.forEach((key) => delete process.env[key]);
   Object.assign(process.env, { PI_LARK_BOT_SOCKET: path, PI_LARK_BOT_RUN_ID: "run", PI_LARK_BOT_TOKEN: "token" });
-  if (options.directUserId) process.env.PI_LARK_BOT_DIRECT_USER_ID = options.directUserId;
-  if (options.groupChatId) process.env.PI_LARK_BOT_GROUP_CHAT_ID = options.groupChatId;
   const prompts: { text: string; options: any }[] = [];
   let aborts = 0, shutdowns = 0;
   const context = { isIdle: () => false, hasPendingMessages: () => true,
@@ -128,10 +126,9 @@ test("long idle periods do not close the bridge", { timeout: 3000 }, async (t) =
   assert.equal(h.shutdowns, 0); assert.equal(h.aborts, 0);
 });
 
-test("every model turn receives its direct or group identity", async (t) => {
-  const h = await harness(t, { groupChatId: "oc_team" });
-  const result = h.emit("before_agent_start", { systemPrompt: "base" });
-  assert.match(result.systemPrompt, /oc_team/); assert.match(result.systemPrompt, /user_id: message/);
+test("model turns do not receive chat identity system prompts", async (t) => {
+  const h = await harness(t);
+  assert.equal(h.emit("before_agent_start", { systemPrompt: "base" }), undefined);
 });
 
 test("push tools use controller IPC and do not carry chat credentials", { timeout: 3000 }, async (t) => {
