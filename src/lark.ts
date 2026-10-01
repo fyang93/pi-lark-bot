@@ -130,8 +130,8 @@ export class LarkTransport implements BotTransport {
     if (!item || item.chat_id !== message.chatId || typeof item.body?.content !== "string") return message;
     let content: any;
     try { content = JSON.parse(item.body.content); } catch { return message; }
-    const quotedText = typeof content?.text === "string" ? content.text : undefined;
-    const base = quotedText === undefined ? message : { ...message, quotedText };
+    const quotedText = quotedMessageText(content);
+    const base = quotedText ? { ...message, quotedText } : message;
     if (!this.attachmentCache) return base;
     const candidates = referencedResources(item.msg_type, content);
     if (!candidates.length) return base;
@@ -380,6 +380,20 @@ function referencedResources(messageType: unknown, value: unknown): ReferencedRe
     default:
       return [];
   }
+}
+
+function quotedMessageText(value: unknown): string | undefined {
+  const text = (node: any): string[] => {
+    if (Array.isArray(node)) return node.flatMap(text);
+    if (!node || typeof node !== "object") return [];
+    if (typeof node.text === "string") return [node.text];
+    if (typeof node.content === "string") return [node.content];
+    return Object.entries(node)
+      .filter(([key]) => key === "elements" || key === "body" || key === "header")
+      .flatMap(([, child]) => text(child));
+  };
+  const result = text(value).join("\n").trim();
+  return result || undefined;
 }
 
 function card(text: string): object {
