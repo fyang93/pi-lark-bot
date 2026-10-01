@@ -59,19 +59,25 @@ export async function createSurface(name: string, command: string[]): Promise<st
 }
 
 /**
- * Show the pane's pi in herdr's agents sidebar under `name` ([a-z][a-z0-9_-]{0,31}).
- * Best effort: herdr may detect the agent a moment after the worker is ready.
+ * Show the pane's pi in herdr's agents sidebar under `name` ([a-z][a-z0-9_-]{0,31}); true once
+ * it holds the name. herdr may detect the agent a moment after the worker is ready, so this
+ * retries; a name held by another agent is not retried.
  */
-export async function nameAgent(pane: string, name: string, attempts = 10): Promise<void> {
+export async function nameAgent(pane: string, name: string, attempts = 10): Promise<boolean> {
   for (let i = 0; i < attempts; i++) {
-    try { await herdr(["agent", "rename", pane, name]); return; }
-    catch { await new Promise((done) => setTimeout(done, 1000).unref()); }
+    try { await herdr(["agent", "rename", pane, name]); return true; }
+    catch (error) {
+      if (String((error as Error).message).includes("agent_name_taken")) return false;
+      await new Promise((done) => setTimeout(done, 1000).unref());
+    }
   }
+  return false;
 }
 
 /**
  * Close the pane, found through its agent name when given: a pane moved to another
- * workspace gets a new id, the name follows the agent. Falls back to `pane`.
+ * workspace gets a new id, the name follows the agent. Falls back to `pane`. Pass a
+ * name only once this pane's agent holds it, or another agent's pane could be closed.
  */
 export function closeSurface(pane: string, agent?: string): void {
   if (agent) {

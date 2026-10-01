@@ -179,10 +179,27 @@ test("closing finds a moved worker pane through its agent name", { timeout: 1000
     const read = async (id: string) => JSON.parse(await readFile(join(f.root, `pane-${id.replace("w1:p", "")}.json`), "utf8"));
     for (let i = 0; i < 50 && !(await read(paneId!)).agent; i++) await new Promise((done) => setTimeout(done, 20));
     const { agent } = await read(paneId!);
+    await new Promise((done) => setTimeout(done, 100));  // the rename's reply reaches the worker
     // The user moves the pane to another workspace: herdr gives it a new id; the agent name follows.
     await rename(join(f.root, `pane-${paneId!.replace("w1:p", "")}.json`), join(f.root, "pane-50.json"));
     await writeFile(join(f.root, "moved.json"), JSON.stringify({ [agent]: "w1:p50" }));
     await workers.close();
     assert.deepEqual((await readdir(f.root)).filter((file) => /^pane-\d+\.json$/.test(file)), [], "the moved pane is closed");
+  } finally { await workers.close(); await f.cleanup(); }
+});
+
+test("a worker that could not take its name is closed by its own pane id, never by name", { timeout: 10000 }, async () => {
+  const f = await fixture({ TEST_NAME_TAKEN: "1" }); const workers = new HerdrWorkers(f.options);
+  try {
+    await workers.open("ou_a");
+    const { paneId } = workers.list()[0]!;
+    // Another live agent already holds the worker's name, in pane w1:p77.
+    await writeFile(join(f.root, "pane-77.json"), "{}");
+    const name = `lark-${__panesTest__.sessionKey("cli_test", "ou_a").slice(0, 10)}`;
+    await writeFile(join(f.root, "moved.json"), JSON.stringify({ [name]: "w1:p77" }));
+    await new Promise((done) => setTimeout(done, 100));  // let the rename attempt settle
+    await workers.close();
+    const left = (await readdir(f.root)).filter((file) => /^pane-\d+\.json$/.test(file));
+    assert.deepEqual(left, ["pane-77.json"], `closed ${paneId} only; the other agent's pane stays`);
   } finally { await workers.close(); await f.cleanup(); }
 });

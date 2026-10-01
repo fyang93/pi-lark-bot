@@ -68,6 +68,7 @@ if (process.argv[2] === "--child") {
     ok({ root_pane: { pane_id: newPane() }, tab: {} });
   } else if ((group === "pane" || group === "agent") && action === "rename") {
     if (!fs.existsSync(file(args[0]))) fail("pane_not_found");
+    if (group === "agent" && process.env.TEST_NAME_TAKEN === "1") fail("agent_name_taken");
     const saved = JSON.parse(fs.readFileSync(file(args[0]), "utf8"));
     fs.writeFileSync(file(args[0]), JSON.stringify({ ...saved, [group === "pane" ? "label" : "agent"]: args[1] }));
     ok({});

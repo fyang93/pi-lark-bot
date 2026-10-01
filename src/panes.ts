@@ -85,6 +85,8 @@ class PaneWorker implements ConversationWorker {
   private readonly abort = new AbortController();
   private closed = false;
   private ready = false;
+  /** This worker's agent holds `name`, so closing may look its pane up by name. */
+  private named = false;
   private startTask?: Promise<void>;
   private resources?: Promise<void>;
   private closing?: Promise<void>;
@@ -198,7 +200,7 @@ class PaneWorker implements ConversationWorker {
         }
         if (message.type === "ready") {
           this.ready = true; resolveReady();
-          if (this.paneId) void nameAgent(this.paneId, this.name);
+          if (this.paneId) void nameAgent(this.paneId, this.name).then((held) => { this.named = held; });
         }
         else this.handle(message);
       }
@@ -274,7 +276,7 @@ class PaneWorker implements ConversationWorker {
       await this.resources?.catch(() => {});
       for (const peer of this.peers) peer.destroy();
       if (this.server) await new Promise<void>((done) => { this.server!.close(() => done()); });
-      if (this.paneId) closeSurface(this.paneId, this.name); // IPC loss also stops pi
+      if (this.paneId) closeSurface(this.paneId, this.named ? this.name : undefined); // IPC loss also stops pi
 
       if (this.tempDir) await rm(this.tempDir, { recursive: true, force: true });
     })();
