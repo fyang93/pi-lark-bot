@@ -397,5 +397,5 @@ function quotedMessageText(value: unknown): string | undefined {
 }
 
 function card(text: string): object {
-  return { config: { wide_screen_mode: true }, elements: [{ tag: "markdown", content: text }] };
+  return { schema: "2.0", config: { width_mode: "fill" }, body: { elements: [{ tag: "markdown", content: text }] } };
 }

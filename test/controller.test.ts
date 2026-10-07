@@ -153,6 +153,41 @@ test("quoted files are prepared only after authorization and their cache paths r
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
+test("mention-only replies resolve quotes after authorization before rejecting empty text", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-empty-quote-"));
+  const transport = new FakeTransport();
+  const prepared: string[] = [], prompts: string[] = [];
+  (transport as BotTransport).prepareMessage = async (message) => {
+    prepared.push(message.id);
+    if (message.id === "quote") return { ...message, quotedText: "请解释这段代码" };
+    if (message.id === "file") return { ...message, attachments: [{ status: "ready", type: "file",
+      path: "/private/cache/report.csv", name: "report.csv", size: 12, sourceMessageId: "parent" }] };
+    if (message.id === "unavailable") return { ...message, preparationWarning: "referenced_message_unavailable" };
+    return message;
+  };
+  const bot = new BotController({ config, stateDir: dir, transport,
+    authorizeUser: async (userId) => userId !== "ou_denied",
+    workers: { async open() { return { async run(text) { prompts.push(text); }, async close() {} }; }, async close() {} } });
+  try {
+    await bot.start();
+    for (const id of ["quote", "file", "empty", "unavailable", "no-parent", "denied"]) {
+      await bot.receive({ ...msg(id, id === "denied" ? "ou_denied" : "ou_a"),
+        text: "(empty)", unsupported: "empty_text", chatType: "group", mentionedBot: true,
+        ...(id === "no-parent" ? {} : { parentMessageId: "parent" }) });
+    }
+    await bot.drain();
+    assert.deepEqual(prepared, ["quote", "file", "empty", "unavailable"]);
+    assert.equal(prompts.length, 2);
+    assert.equal(prompts[0], "Quote:\n请解释这段代码");
+    assert.match(prompts[1]!, /\/private\/cache\/report\.csv/);
+    assert(prompts.every((text) => !text.includes("(empty)")));
+    assert(transport.sends.some((send) => send.reply === "empty" && send.text.includes("@ 之后没有内容")));
+    assert(transport.sends.some((send) => send.reply === "unavailable" && send.text.includes("引用消息无法读取")));
+    assert(transport.sends.some((send) => send.reply === "no-parent" && send.text.includes("@ 之后没有内容")));
+    assert(transport.sends.some((send) => send.reply === "denied" && send.text.includes("本机拒绝启动")));
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
 test("handoffs preserve per-chat order without blocking other chats during startup", async () => {
   const dir = await mkdtemp(join(tmpdir(), "lark-controller-"));
   const gate = deferred(); const began = deferred();

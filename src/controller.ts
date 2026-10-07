@@ -241,7 +241,7 @@ export class BotController {
         }
         if (!this.active) return;
         this.chats.set(key, { chatId: message.chatId, chatType: message.chatType === "group" ? "group" : "p2p" });
-        if (message.unsupported) {
+        if (message.unsupported && !(message.unsupported === "empty_text" && message.parentMessageId)) {
           await this.options.transport.send(message.chatId, unsupportedNote(message), message.id);
           return;
         }
@@ -487,6 +487,15 @@ export class BotController {
       if (transport.prepareMessage && message.parentMessageId) message = await transport.prepareMessage(message);
       signal.throwIfAborted();
       if (!this.active) return;
+      if (message.unsupported === "empty_text") {
+        if (!message.quotedText?.trim() && !message.attachments?.length) {
+          await transport.send(message.chatId, message.preparationWarning
+            ? "引用消息无法读取，请重新发送引用内容，或在 @ 后面写明要我做的事。"
+            : unsupportedNote(message), message.id);
+          return;
+        }
+        message = { ...message, text: "", unsupported: undefined };
+      }
       const worker = await workers.open(key);
       signal.throwIfAborted();
       if (!this.active) return;
