@@ -122,7 +122,11 @@ export class LarkTransport implements BotTransport {
     if (!message.parentMessageId) return message;
     let item: any;
     try {
-      const response = await this.request(() => this.client.im.v1.message.get({ path: { message_id: message.parentMessageId } }));
+      // Without this parameter, Lark may return an upgrade placeholder for 2.0 cards.
+      // https://open.feishu.cn/document/server-docs/im-v1/message/get
+      const response = await this.request(() => this.client.im.v1.message.get({
+        path: { message_id: message.parentMessageId }, params: { card_msg_content_type: "user_card_content" },
+      }));
       item = response?.data?.items?.find((candidate: any) => candidate?.message_id === message.parentMessageId);
     } catch {
       return { ...message, preparationWarning: "referenced_message_unavailable" };
@@ -385,9 +389,6 @@ function referencedResources(messageType: unknown, value: unknown): ReferencedRe
 function quotedMessageText(value: unknown): string | undefined {
   const text = (node: any): string[] => {
     if (Array.isArray(node)) return node.flatMap(text);
-    if (typeof node === "string") {
-      try { return text(JSON.parse(node)); } catch { return []; }
-    }
     if (!node || typeof node !== "object") return [];
     if (typeof node.text === "string") return [node.text];
     if (typeof node.content === "string") return [node.content];

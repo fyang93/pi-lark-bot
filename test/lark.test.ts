@@ -202,11 +202,19 @@ test("Markdown tables use JSON 2.0 cards for sends, replies and updates, and rem
   for (const payload of [fake.calls.create[0], fake.calls.reply[0], fake.calls.patch[0]]) {
     assert.deepEqual(JSON.parse(payload.data.content), expected);
   }
-  fake.api.get = async () => ({ code: 0, data: { items: [{ message_id: "out-1", chat_id: "oc_1",
-    body: { content: fake.calls.create[0].data.content } }] } });
+  // The real API's default response is not the JSON used to send the card.
+  fake.api.get = async (payload: any) => {
+    fake.calls.get.push(payload);
+    return { code: 0, data: { items: [{ message_id: "out-1", chat_id: "oc_1", msg_type: "interactive",
+      body: { content: payload.params?.card_msg_content_type === "user_card_content"
+        ? fake.calls.patch[0].data.content
+        : JSON.stringify({ elements: [{ tag: "text", text: "请升级至最新版本客户端，以查看内容" }] }) } }] } };
+  };
   const prepared = await transport.prepareMessage({ id: "reply", userId: "ou_1", chatId: "oc_1",
     text: "解释表格", parentMessageId: "out-1" });
   assert.equal(prepared.quotedText, text);
+  assert.deepEqual(fake.calls.get[0], { path: { message_id: "out-1" },
+    params: { card_msg_content_type: "user_card_content" } });
 });
 
 test("uses idempotent create/reply/patch cards and bounded HTTP/retries", async () => {
