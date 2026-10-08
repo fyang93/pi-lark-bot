@@ -104,9 +104,15 @@ test("workers split the controller's own pane unfocused, else open a background 
       if ("target" in expected) { assert.equal(create.target, expected.target); assert.equal(create.direction, expected.direction); }
       const paneId = workers.list()[0]!.paneId!;
       assert.match(paneId, /^w1:p\d+$/);
-      const read = async () => JSON.parse(await readFile(join(f.root, `pane-${paneId.replace("w1:p", "")}.json`), "utf8"));
-      for (let i = 0; i < 250 && !(await read()).agent; i++) await new Promise((done) => setTimeout(done, 20));
-      const pane = await read();
+      const read = async () => {
+        try { return JSON.parse(await readFile(join(f.root, `pane-${paneId.replace("w1:p", "")}.json`), "utf8")); }
+        catch { return {}; } // The fixture rewrites this file non-atomically while naming the pane.
+      };
+      let pane: any = {};
+      for (let i = 0; i < 250 && !pane.agent; i++) {
+        pane = await read();
+        if (!pane.agent) await new Promise((done) => setTimeout(done, 20));
+      }
       assert.match(pane.label, /^lark-[a-f0-9]{10}$/);
       assert.equal(pane.agent, pane.label, "the ready worker is named in herdr's agents sidebar");
       await worker.run("worker", () => {});
