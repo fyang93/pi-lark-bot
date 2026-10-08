@@ -385,6 +385,9 @@ function referencedResources(messageType: unknown, value: unknown): ReferencedRe
 function quotedMessageText(value: unknown): string | undefined {
   const text = (node: any): string[] => {
     if (Array.isArray(node)) return node.flatMap(text);
+    if (typeof node === "string") {
+      try { return text(JSON.parse(node)); } catch { return []; }
+    }
     if (!node || typeof node !== "object") return [];
     if (typeof node.text === "string") return [node.text];
     if (typeof node.content === "string") return [node.content];
