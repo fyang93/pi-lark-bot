@@ -1,4 +1,4 @@
-// Executed inside a new Zellij pane. No shell interpolation or remote text in argv.
+// Executed inside a new herdr pane. No shell interpolation or remote text in argv.
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 let child;
@@ -10,10 +10,9 @@ try {
   finally { fs.closeSync(handle); }
   fs.unlinkSync(path); // one-use private environment handoff, never retain model API keys
   const env = { ...config.env };
-  for (const key of ["ZELLIJ", "ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME"]) {
-    if (process.env[key] !== undefined) env[key] = process.env[key];
-    else delete env[key];
-  }
+  // The pane's own herdr identity, not the controller's, so herdr attributes the worker to this pane.
+  for (const key of Object.keys(env)) if (key.startsWith("HERDR_")) delete env[key];
+  for (const [key, value] of Object.entries(process.env)) if (key.startsWith("HERDR_")) env[key] = value;
   child = spawn(process.execPath, [config.cli, ...config.args], { cwd: config.cwd, env, stdio: "inherit" });
   let force;
   for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"]) {

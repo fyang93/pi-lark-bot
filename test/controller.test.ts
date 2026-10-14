@@ -113,7 +113,7 @@ test("direct and group senders require approval and share the persisted user all
     await bot.drain();
     assert.equal(prompts, 3, "concurrent messages from one new user share one prompt, while a group sender is also checked");
     assert(calls.includes("ou_allowed|first") && calls.includes("ou_allowed|second"));
-    assert(calls.includes("group:oc_room|ou_group: hello"));
+    assert(calls.includes("group:oc_room|hello"));
     assert(!calls.some((x) => x.includes("denied")));
     assert(transport.sends.some((x) => x.chat === "chat_ou_denied" && x.text.includes("本机拒绝启动")));
     assert.equal(bot.status.allowlisted, 2);
@@ -186,8 +186,8 @@ test("group members share ordered handoffs, isolated from DMs and other groups",
   const calls: string[] = [];
   const workers: WorkerFactory = { async open(key) { return { async run(text, emit) {
     calls.push(`${key}|${text}`);
-    if (text === "ou_a: first") { began.resolve(); await gate.promise; }
-    if (text === "ou_a: other") otherDone.resolve();
+    if (text === "first") { began.resolve(); await gate.promise; }
+    if (text === "other") otherDone.resolve();
     emit({ type: "done", text });
   }, async close() {} }; }, async close() { gate.resolve(); } };
   const bot = new BotController({ config, stateDir: dir, transport: new FakeTransport(), workers });
@@ -198,9 +198,9 @@ test("group members share ordered handoffs, isolated from DMs and other groups",
     await bot.receive(msg("dm")); await bot.receive(group("other", "ou_a", "oc_y"));
     await bot.receive({ ...group("ignored"), mentionedBot: false });
     await otherDone.promise;
-    assert.deepEqual(calls, ["group:oc_x|ou_a: first", "ou_a|dm", "group:oc_y|ou_a: other"]);
+    assert.deepEqual(calls, ["group:oc_x|first", "ou_a|dm", "group:oc_y|other"]);
     gate.resolve(); await bot.drain();
-    assert.equal(calls.at(-1), "group:oc_x|ou_b: second");
+    assert.equal(calls.at(-1), "group:oc_x|second");
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -236,7 +236,7 @@ test("/stop bypasses a full FIFO, checks authorization, isolates chats and never
   const transport = new FakeTransport();
   const workers: WorkerFactory = { async open(key) { return { async run(text, emit, signal) {
     calls.push(`${key}|${text}`);
-    if (text === "ou_a: first") {
+    if (text === "first") {
       started.resolve();
       await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
       emit({ type: "done", text: "aborted", error: true });
@@ -267,7 +267,7 @@ test("/stop bypasses a full FIFO, checks authorization, isolates chats and never
     assert(transport.sends.some((s) => s.reply === "stop" && s.text.includes("已请求 Pi 中断")));
     otherGate.resolve(); await bot.drain();
     assert.equal(calls.length, 21, "only the active group turn stops; queued messages still run");
-    assert.equal(calls.filter((s) => s.endsWith("|ou_a: first")).length, 1);
+    assert.equal(calls.filter((s) => s.endsWith("|first")).length, 1);
     assert.equal(bot.status.queued, 0, "handoff accounting is released");
     await bot.receive({ ...msg("idle-stop"), text: "/stop" }); await bot.drain();
     assert(transport.sends.some((s) => s.reply === "idle-stop" && s.text === "当前没有会话。"));

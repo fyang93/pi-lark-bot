@@ -108,7 +108,7 @@ test("captures a reply parent and caches its file resource for the authorized co
   fake.api.get = async (payload: any) => {
     fake.calls.get.push(payload);
     return { code: 0, data: { items: [{ message_id: "om_file", chat_id: "oc_1", msg_type: "file",
-      body: { content: JSON.stringify({ file_key: "file-key", file_name: "../report.csv" }) } }] } };
+      body: { content: JSON.stringify({ file_key: "file-key", file_name: "../report.csv", text: "quoted text" }) } }] } };
   };
   fake.messageResource.get = async (payload: any) => {
     fake.calls.resource.push(payload);
@@ -122,6 +122,7 @@ test("captures a reply parent and caches its file resource for the authorized co
     await fake.emit({ ...textEvent, message: { ...textEvent.message, parent_id: "om_file" } });
     assert.equal(received[0].parentMessageId, "om_file");
     const prepared = await transport.prepareMessage(received[0]);
+    assert.equal(prepared.quotedText, "quoted text");
     const attachment = prepared.attachments?.[0];
     assert.equal(attachment?.name, "report.csv");
     assert(attachment?.status === "ready");
@@ -130,6 +131,18 @@ test("captures a reply parent and caches its file resource for the authorized co
     await transport.prepareMessage(received[0]);
     assert.equal(fake.calls.resource.length, 1, "the second reference reuses the persistent cache");
   } finally { await transport.stop(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("extracts quoted text from an interactive card reply", async () => {
+  const fake = fakeSdk();
+  const report = "美股持仓复核完成｜账户权益约$84.55k。邮轮主题集中度约18.2%。";
+  fake.api.get = async () => ({ code: 0, data: { items: [{ message_id: "om_card", chat_id: "oc_1", msg_type: "interactive",
+    body: { content: JSON.stringify({ config: {}, elements: [{ tag: "markdown", content: report }] }) } }] } });
+  const transport = new LarkTransport(config, undefined, fake.sdk);
+  try {
+    const prepared = await transport.prepareMessage({ id: "reply", userId: "ou_1", chatId: "oc_1", text: "邮轮是什么？", parentMessageId: "om_card" });
+    assert.equal(prepared.quotedText, report);
+  } finally { await transport.stop(); }
 });
 
 test("a quoted attachment download failure is isolated from the text request", async () => {

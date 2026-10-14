@@ -2,7 +2,7 @@
 
 在飞书 / Lark 私聊机器人，或在群里 @机器人，让 [pi](https://pi.dev) 在本机项目中完成任务。
 
-每个私聊用户、每个群聊都有独立的 pi 会话和 Zellij 分屏，保留自己的历史与模型选择。你也可以直接在本机查看进度、继续对话或处理确认操作。
+每个私聊用户、每个群聊都有独立的 pi 会话和 herdr 分屏，保留自己的历史与模型选择；分屏在 herdr 的 agents 栏显示为 `lark-…`。你也可以直接在本机查看进度、继续对话或处理确认操作。
 
 > [!WARNING]
 > 机器人可以在本机执行代码。首次使用的用户需要本机确认：默认选中 Confirm，10 秒未确认则拒绝。群内每位用户也需单独授权。所有会话共享项目文件，并非安全沙箱，请限制应用可用范围。
@@ -11,7 +11,7 @@
 
 - Node.js 22+
 - pi 0.85.1+，已配置模型
-- Zellij 0.44+
+- [herdr](https://herdr.dev) 0.9+
 - 飞书或 Lark 开放平台应用（连接时可扫码创建）
 
 ## 安装与连接
@@ -22,7 +22,7 @@
 pi install -l git:github.com/fyang93/pi-lark-bot
 ```
 
-在 Zellij 中启动 pi；如果 pi 已在运行，先执行 `/reload`。然后输入：
+在 herdr 中启动 pi；如果 pi 已在运行，先执行 `/reload`。然后输入：
 
 ```text
 /lark-bot link
@@ -121,11 +121,10 @@ pi install -l git:github.com/fyang93/pi-lark-bot
 npm install
 npm run typecheck
 npm test
-npm run test:integration
 npm pack --dry-run
 ```
 
-集成测试使用独立 Zellij 会话和本地模拟模型，不消耗付费模型额度；需要 Zellij 0.44+ 和 util-linux 的 `script`。真实平台审批和显示效果需用自己的应用验收。
+测试用模拟的 herdr 和 worker 进程，不连接真实终端或模型。真实平台审批和显示效果需用自己的应用验收。
 
 ## 许可证
 
