@@ -52,13 +52,17 @@ export type WorkerRequest =
   | { action: "target-status" };
 export interface WorkerResponse { ok: boolean; text: string }
 
+/** Chat output only. `done` ends a reply bubble, not an input delivery or background task. */
 export type WorkerEvent =
   | { type: "progress"; text: string }
   | { type: "text"; text: string }
   | { type: "done"; text: string; error?: boolean };
 
 export interface ConversationWorker {
+  /** Resolves on Pi handoff, not completion. The sink receives chat-wide output until replaced/closed. */
   run(text: string, onEvent: (event: WorkerEvent) => void, signal?: AbortSignal): Promise<void>;
+  /** Abort the current Pi operation without opening a new pane. */
+  interrupt?(): Promise<void>;
   close(): Promise<void>;
 }
 

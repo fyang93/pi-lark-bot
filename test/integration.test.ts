@@ -38,7 +38,7 @@ async function listenMock(fixture: string) {
           await new Promise<void>((resolve) => response.once("close", resolve));
           return;
         }
-        await delay(200); // cross worker/controller throttle windows
+        await delay(prompt === "slow prompt" ? 1500 : 200); // leave time to hand off a follow-up while busy
         chunk({ content: prompt }, "stop");
       }
       response.end("data: [DONE]\n\n");
@@ -50,7 +50,10 @@ async function listenMock(fixture: string) {
 }
 async function run(worker: Awaited<ReturnType<ZellijWorkers["open"]>>, prompt: string) {
   const events: WorkerEvent[] = [];
-  await timeout(worker.run(prompt, (event) => events.push(event)), 15000, "remote prompt");
+  let done!: () => void;
+  const completed = new Promise<void>((resolve) => { done = resolve; });
+  await timeout(worker.run(prompt, (event) => { events.push(event); if (event.type === "done") done(); }), 15000, "handoff");
+  await timeout(completed, 15000, "remote output");
   return events;
 }
 async function panes(): Promise<{ id: number; is_plugin: boolean; is_focused: boolean; tab_id: number }[]> {
@@ -101,7 +104,7 @@ test("real Zellij/pi: tools, streaming, native panes, isolation, crash recovery 
     assert.notStrictEqual(two, one); await assertPlacement();
     if (process.env.PI_LARK_BOT_SIBLING_TEST === "1") {
       const sibling = await import(pathToFileURL(resolve("../pi-interactive-subagents/pi-extension/subagents/zellij.ts")).href);
-      const extra: string = sibling.createSurface("layout-fixture"); owned.add(extra);
+      const extra: string = await sibling.createSurface("layout-fixture"); owned.add(extra);
       try { await assertPlacement(); } finally { sibling.closeSurface(extra); }
       await assertPlacement();
     }
@@ -110,12 +113,32 @@ test("real Zellij/pi: tools, streaming, native panes, isolation, crash recovery 
     await run(one, "second prompt");
     assert(mock.requests.at(-1)!.includes("first prompt"));
     assert(!mock.requests.at(-1)!.includes("separate user"));
-    const abort = new AbortController(), interrupted: WorkerEvent[] = [];
+    // Real Pi must accept another input while the first model response is still streaming.
+    const replies: string[] = [];
+    let streaming!: () => void, bothDone!: () => void;
+    const inFlight = new Promise<void>((resolve) => { streaming = resolve; });
+    const completed = new Promise<void>((resolve) => { bothDone = resolve; });
+    const chatSink = (event: WorkerEvent) => {
+      if (event.type === "text" && event.text === "mock:") streaming();
+      if (event.type === "done") { replies.push(event.text); if (replies.length === 2) bothDone(); }
+    };
+    await one.run("slow prompt", chatSink); await timeout(inFlight, 5000, "slow stream");
+    await timeout(one.run("queued follow-up", chatSink), 1000, "busy handoff");
+    assert.equal(replies.length, 0, "follow-up handoff precedes model completion");
+    await timeout(completed, 15000, "native follow-up execution");
+    assert.deepEqual(replies, ["mock:slow prompt", "mock:queued follow-up"]);
+
+    const interrupted: WorkerEvent[] = [];
+    let stop!: () => void;
+    const stopped = new Promise<void>((resolve) => { stop = resolve; });
+    let interrupting: Promise<void> | undefined;
     await timeout(one.run("interrupt me", (event) => {
       interrupted.push(event);
-      if (event.type === "text" && event.text === "mock:") abort.abort();
-    }, abort.signal), 15000, "interrupt active Pi turn");
-    assert.equal(abort.signal.aborted, true);
+      if (event.type === "text" && event.text === "mock:") interrupting ??= one.interrupt!();
+      if (event.type === "done") stop();
+    }), 15000, "handoff before interrupt");
+    await timeout(stopped, 15000, "interrupt active Pi turn");
+    await interrupting;
     assert.match(interrupted.at(-1)!.text, /已停止/);
     assert.equal((interrupted.at(-1) as { error?: boolean }).error, false);
     assert.strictEqual(await workers.open("user-one"), one);
@@ -136,21 +159,27 @@ test("real Zellij/pi: tools, streaming, native panes, isolation, crash recovery 
     assert(request.includes("first prompt") && request.includes("second prompt") && request.includes("after crash"));
     await restored.close(); restored = undefined;
     const outbound: string[] = [], edits: string[] = [];
+    const waitForReply = async (text: string) => {
+      await timeout((async () => { while (!edits.includes(text)) await delay(20); })(), 25000, `reply ${text}`);
+    };
     const transport: BotTransport = { async start() {}, async stop() {},
       async send(_chat, text) { outbound.push(text); return `card-${outbound.length}`; }, async update(_id, text) { edits.push(text); } };
     const botWorkers = new ZellijWorkers(common);
     bridge = new BotController({ config: { version: 1, brand: "feishu", appId: "integration-app", appSecret: "fixture" },
       stateDir: common.stateDir, workers: botWorkers, transport, streamInterval: 20 });
     await bridge.start(); await bridge.receive({ id: "message-1", userId: "ou_owner", chatId: "chat", text: "first prompt" });
-    await timeout(bridge.drain(), 25000, "bot reply"); record(botWorkers);
+    await timeout(bridge.drain(), 25000, "bot handoff");
+    await waitForReply("mock:first prompt"); record(botWorkers);
     assert(edits.includes("mock:first prompt"));
     assert(edits.some((text) => text.includes("read") || text.includes("mock:")));
     await bridge.receive({ id: "group-1", userId: "ou_owner", chatId: "oc_room", chatType: "group", mentionedBot: true, text: "group first" });
-    await timeout(bridge.drain(), 25000, "first group reply"); record(botWorkers);
+    await timeout(bridge.drain(), 25000, "first group handoff");
+    await waitForReply("mock:ou_owner: group first"); record(botWorkers);
     const groupPane = botWorkers.list().find((pane) => pane.userId === "group:oc_room")!;
     assert(groupPane && groupPane.paneId !== botWorkers.list().find((pane) => pane.userId === "ou_owner")?.paneId);
     await bridge.receive({ id: "group-2", userId: "ou_other", chatId: "oc_room", chatType: "group", mentionedBot: true, text: "group second" });
-    await timeout(bridge.drain(), 25000, "second group reply");
+    await timeout(bridge.drain(), 25000, "second group handoff");
+    await waitForReply("mock:ou_other: group second");
     assert.equal(botWorkers.list().find((pane) => pane.userId === "group:oc_room")?.paneId, groupPane.paneId);
     assert(mock.requests.at(-1)!.includes("ou_owner: group first"));
     assert(!mock.requests.at(-1)!.includes('"first prompt"'));
