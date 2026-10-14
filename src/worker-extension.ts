@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { registerPushTools } from "./push-tools.ts";
 import type { WorkerEvent, WorkerRequest, WorkerResponse } from "./types.ts";
 
-type Prompt = { id: string; text: string };
+type Prompt = { id: string; text: string; cancelled?: boolean };
 const MAX_FRAME_BYTES = 512 * 1024;
 const MAX_PROMPT_BYTES = 64_000;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -24,7 +24,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   const isGroupChat = process.env.PI_LARK_BOT_GROUP_CHAT === "1" || !!groupChatId;
   let socket: Socket | undefined, ctx: ExtensionContext | undefined, buffer = "";
   let pending: Prompt | undefined, dispatching: Prompt | undefined;
-  let active: { id: string; prompt: string; text: string; failed: boolean; started: boolean } | undefined;
+  let active: { id: string; prompt: string; text: string; failed: boolean; started: boolean; cancelled?: boolean } | undefined;
   let lastRemoteId: string | undefined, localTurnPending = false;
   // pi-interactive-subagents returns from its tool immediately, then delivers
   // the completed result as a fresh, steered parent turn. Keep the remote turn
@@ -112,6 +112,26 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
       socket?.end(); shutdown();
     }
   };
+  const settled = (): void => {
+    if (stopping || !ctx?.isIdle()) return;
+    if (active?.started) {
+      if (!active.cancelled) {
+        if (spawnedSubagentThisTurn) {
+          spawnedSubagentThisTurn = false; awaitingSubagent = true;
+          emit({ type: "progress", text: "正在等待子代理完成…" });
+          return;
+        }
+        if (awaitingSubagent) return;
+      }
+      const completed = active; flushText(true); active = undefined;
+      lastRemoteId = completed.cancelled ? undefined : completed.id;
+      awaitingSubagent = false; spawnedSubagentThisTurn = false;
+      send({ type: "done", id: completed.id,
+        text: completed.cancelled ? "⏹ 已停止当前消息。" : completed.text || (completed.failed ? "Pi 回合执行失败或已中止。" : ""),
+        error: !completed.cancelled && completed.failed || undefined });
+    }
+    dispatch();
+  };
   const receive = (chunk: string): void => {
     if (stopping) return;
     buffer += chunk;
@@ -121,6 +141,21 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
       const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
       let message: any;
       try { message = JSON.parse(line); } catch { socket?.destroy(); return; }
+      if (message?.type === "abort" && typeof message.id === "string") {
+        if (active && active.id === message.id) {
+          active.cancelled = true;
+          if (active.started && ctx?.isIdle()) settled();
+          else ctx?.abort();
+        } else if (pending && pending.id === message.id) {
+          pending.cancelled = true;
+          if (!dispatching) {
+            clearTimeout(retryTimer); retryTimer = undefined;
+            pending = undefined; setWaiting(false);
+            send({ type: "done", id: message.id, text: "⏹ 已停止当前消息。" });
+          }
+        }
+        continue;
+      }
       if (message && message.type === "response" && typeof message.id === "string") {
         const resolve = requests.get(message.id);
         if (resolve) {
@@ -165,6 +200,11 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     if (event.source !== "extension" || !dispatching || event.text !== dispatching.text) return;
     const prompt = dispatching;
     dispatching = undefined; pending = undefined;
+    if (prompt.cancelled) {
+      clearTimeout(handoffTimer); handoffTimer = undefined;
+      send({ type: "done", id: prompt.id, text: "⏹ 已停止当前消息。" });
+      return { action: "handled" as const };
+    }
     active = { id: prompt.id, prompt: prompt.text, text: "", failed: false, started: false };
   });
   pi.on("before_agent_start", (event) => {
@@ -197,6 +237,8 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     emit({ type: "progress", text: "正在处理中…" });
     return identity;
   });
+  // A stop can arrive after input was accepted but before the agent actually starts.
+  pi.on("agent_start", (_event, eventCtx) => { if (active?.cancelled) eventCtx.abort(); });
   pi.on("message_start", (event) => {
     if (active?.started && event.message.role === "assistant") {
       active.text = ""; emit({ type: "text", text: "" });
@@ -224,20 +266,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     // every Pi runtime. The completed turn still contains its tool result.
     if (messages.some((message) => message?.role === "toolResult" && message?.toolName === "subagent")) spawnedSubagentThisTurn = true;
   });
-  pi.on("agent_settled", () => {
-    if (stopping || !ctx?.isIdle()) return;
-    if (active?.started) {
-      if (spawnedSubagentThisTurn) {
-        spawnedSubagentThisTurn = false; awaitingSubagent = true;
-        emit({ type: "progress", text: "正在等待子代理完成…" });
-        return;
-      }
-      if (awaitingSubagent) return;
-      const completed = active; flushText(true); active = undefined; lastRemoteId = completed.id;
-      send({ type: "done", id: completed.id, text: completed.text || (completed.failed ? "Pi 回合执行失败或已中止。" : ""), error: completed.failed || undefined });
-    }
-    dispatch();
-  });
+  pi.on("agent_settled", settled);
   pi.on("ui_prompt_start", () => {
     promptOpen = true;
     if (active?.started) emit({ type: "progress", text: "正在等待本地确认…" });

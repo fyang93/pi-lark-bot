@@ -84,6 +84,7 @@ pi install -l git:github.com/fyang93/pi-lark-bot@v0.2.0
 
 | 命令 | 说明 |
 | --- | --- |
+| `/stop` | 立即中断当前消息（类似 Pi 的 Esc），保留历史和分屏；排队消息继续执行 |
 | `/new` | 重置当前私聊或群聊的会话 |
 | `/model` | 查看、选择模型 |
 | `/model provider/model` | 指定模型，保留当前历史 |

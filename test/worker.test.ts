@@ -44,10 +44,12 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
   const handlers = new Map<string, Function>();
   let idle = options.idle ?? true;
   const prompts: string[] = [];
-  let shutdownResolve!: () => void, submittedResolve!: () => void;
+  let shutdownResolve!: () => void, submittedResolve!: () => void, abortResolve!: () => void;
+  let aborts = 0;
+  const aborted = new Promise<void>((resolve) => { abortResolve = resolve; });
   const shutdown = new Promise<void>((resolve) => { shutdownResolve = resolve; });
   const submitted = new Promise<void>((resolve) => { submittedResolve = resolve; });
-  const context = { isIdle: () => idle, async abort() {}, shutdown: shutdownResolve, ui: { notify() {}, setStatus() {}, theme: { fg: (_color: string, text: string) => text } } };
+  const context = { isIdle: () => idle, async abort() { aborts++; abortResolve(); }, shutdown: shutdownResolve, ui: { notify() {}, setStatus() {}, theme: { fg: (_color: string, text: string) => text } } };
   const emit = (name: string, event: unknown = {}) => handlers.get(name)?.(event, context);
   const tools = new Map<string, any>();
   workerExtension({ on(name: string, handler: Function) { handlers.set(name, handler); },
@@ -62,7 +64,9 @@ async function harness(t: TestContext, options: { idle?: boolean; accept?: boole
   const until = async (type: string) => { for (;;) { const value = await next(); if (value.type === type) return value; } };
   assert.deepEqual(await next(), { type: "hello", runId: "run", token: "token" });
   assert.deepEqual(await next(), { type: "ready" });
-  return { messages, prompts, tools, next, until, emit, submitted, shutdown,
+  return { messages, prompts, tools, next, until, emit, submitted, shutdown, aborted,
+    get aborts() { return aborts; },
+    interrupt(id = "p1") { peer!.write(`${JSON.stringify({ type: "abort", id })}\n`); },
     reply(id: string, response: { ok: boolean; text: string }) { peer!.write(`${JSON.stringify({ type: "response", id, ...response })}\n`); },
     idle(value: boolean) { idle = value; },
     prompt(text = "hello") { peer!.write(`${JSON.stringify({ type: "prompt", id: "p1", text })}\n`); },
@@ -163,6 +167,37 @@ test("an intercepted handoff times out and shuts down rather than hanging or acc
   assert.equal((await h.until("done")).error, true);
   await h.shutdown;
   assert.deepEqual(h.prompts, ["hello"]);
+});
+
+test("interrupt calls Pi abort only for the matching request and keeps the worker reusable", { timeout: 3000 }, async (t) => {
+  const h = await harness(t); h.prompt(); await h.until("progress"); h.idle(false);
+  h.interrupt("wrong-id"); h.interrupt(); await h.aborted;
+  assert.equal(h.aborts, 1);
+  h.idle(true); h.finish("partial", true);
+  const done = await h.until("done");
+  assert.match(done.text, /已停止/); assert.equal(done.error, undefined);
+  h.prompt("next"); await h.until("progress"); h.finish("next answer");
+  assert.equal((await h.until("done")).text, "next answer");
+  assert.deepEqual(h.prompts, ["hello", "next"]);
+});
+
+test("interrupt cancels a pending remote prompt without aborting local work", { timeout: 3000 }, async (t) => {
+  const h = await harness(t, { idle: false }); h.prompt(); await h.until("progress");
+  h.interrupt(); assert.match((await h.until("done")).text, /已停止/);
+  h.idle(true); h.emit("agent_settled");
+  assert.deepEqual(h.prompts, []); assert.equal(h.aborts, 0);
+  h.prompt("next"); await h.until("progress"); h.finish("ok"); await h.until("done");
+});
+
+test("interrupt ends the idle subagent wait without forwarding a later continuation", { timeout: 3000 }, async (t) => {
+  const h = await harness(t); h.prompt(); await h.until("progress");
+  h.emit("tool_execution_start", { toolName: "subagent" }); await h.until("progress");
+  h.emit("agent_settled"); await h.until("progress");
+  h.interrupt(); assert.match((await h.until("done")).text, /已停止/);
+  h.emit("before_agent_start", { prompt: "late result" }); h.finish("late result");
+  h.prompt("next"); await h.until("progress"); h.finish("ok");
+  assert.equal((await h.until("done")).text, "ok");
+  assert(!h.messages.some((message) => message.text === "late result"));
 });
 
 test("push tools ask the controller instead of holding credentials", { timeout: 3000 }, async (t) => {
