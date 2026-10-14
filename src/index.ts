@@ -104,13 +104,26 @@ export default function larkBot(pi: ExtensionAPI): void {
         typeof endpoint.token === "string" && typeof endpoint.ownerToken === "string" &&
         await enabledFor(stateDir, endpoint.appId) && await verifiedOwner(stateDir, endpoint)) {
         const config = await loadConfig(stateDir);
-        if (config?.appId === endpoint.appId) status = `🐤 ${config.brand === "lark" ? "Lark" : "Feishu"}: push`;
+        if (config?.appId === endpoint.appId) status = `🐤 ${config.brand === "lark" ? "Lark" : "Feishu"}`;
       }
       if (shuttingDown || controller || status === peerStatus) return;
       peerStatus = status;
       ctx.ui.setStatus("lark-bot", status ? ctx.ui.theme.fg("accent", status) : undefined);
     } finally { checkingPeer = false; }
   }
+  let restoring = false;
+  async function restore(ctx: ExtensionContext, cwd: string, stateDir: string): Promise<void> {
+    if (restoring || operation || shuttingDown || (controller?.status.active && started?.cwd === cwd)) return;
+    restoring = true;
+    try {
+      // Never read credentials while another Pi already owns the inbound listener.
+      const lock = await inspectLock(stateDir);
+      const config = lock.state === "none" || lock.state === "stale" ? await loadConfig(stateDir) : undefined;
+      if (config && await enabledFor(stateDir, config.appId)) await run("on", ctx, config.appId, true);
+      else await refreshPeer(ctx, cwd, stateDir);
+    } finally { restoring = false; }
+  }
+  let lastAutomaticError: string | undefined;
   const setupAbort = new AbortController();
   async function stop(): Promise<void> {
     const old = controller; controller = undefined; started = undefined;
@@ -145,18 +158,12 @@ export default function larkBot(pi: ExtensionAPI): void {
         if (peerStatus) ctx.ui.setStatus("lark-bot", undefined);
         statusCwd = cwd;
         peerStatus = undefined;
-        // Non-owners may already be open when another Pi toggles listening.
-        statusTimer = setInterval(() => { void refreshPeer(ctx, cwd, stateDir).catch(() => {}); }, 1500);
+        // Non-owners may already be open when another Pi toggles listening, and
+        // take over when the owner exits so listening lasts while any Pi runs.
+        statusTimer = setInterval(() => { void restore(ctx, cwd, stateDir).catch(() => {}); }, 1500);
         statusTimer.unref();
       }
-      if (controller?.status.active && started?.cwd === cwd) return;
-      // Never read credentials while another Pi already owns the inbound listener.
-      const lock = await inspectLock(stateDir);
-      if (lock.state === "running") { await refreshPeer(ctx, cwd, stateDir); return; }
-      if (lock.state !== "none" && lock.state !== "stale") return;
-      const config = await loadConfig(stateDir);
-      if (!config || !await enabledFor(stateDir, config.appId)) return;
-      await run("on", ctx, config.appId, true);
+      await restore(ctx, cwd, stateDir);
     } catch {
       ctx.ui.notify("Could not restore Lark bot. Run /lark-bot on to retry.", "error");
     }
@@ -190,7 +197,7 @@ export default function larkBot(pi: ExtensionAPI): void {
       if (command === "help") { ctx.ui.notify(help, "info"); return; }
       if (command && !commands.includes(command)) { ctx.ui.notify(help, "warning"); return; }
       if (!ctx.isProjectTrusted()) { ctx.ui.notify("Trust this project first.", "error"); return; }
-      if (operation || shuttingDown) { ctx.ui.notify("Another operation is still in progress. Try again later.", "warning"); return; }
+      if (operation || shuttingDown) { if (!automatic) ctx.ui.notify("Another operation is still in progress. Try again later.", "warning"); return; }
       operation = true;
       try {
         const cwd = await realpath(ctx.cwd);
@@ -349,9 +356,7 @@ export default function larkBot(pi: ExtensionAPI): void {
             onNotice: (text) => { if (!shuttingDown) ctx.ui.notify(text, "info"); },
             onStatus: () => {
               if (shuttingDown) return;
-              const pending = controller?.status.active ? controller.status.queued : undefined;
-              ctx.ui.setStatus("lark-bot", pending === undefined ? undefined
-                : ctx.ui.theme.fg("accent", `🐤 ${brand}: on${pending > 0 ? ` · ${pending} pending handoff${pending === 1 ? "" : "s"}` : ""}`));
+              ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", `🐤 ${brand}`));
             },
           });
           transport.setCardActionHandler((messageId, chatId, operatorId, value) => instance.handleModelCardAction(messageId, chatId, operatorId, value));
@@ -363,10 +368,16 @@ export default function larkBot(pi: ExtensionAPI): void {
           closePush = await servePush(stateDir, cwd, config.appId, release!.token, (text) => instance.push(text));
           started = { cwd, appId: config.appId };
           if (!automatic) await writePrivateJson(join(stateDir, "enabled.json"), { appId: config.appId, enabled: true });
+          lastAutomaticError = undefined;
           ctx.ui.notify("Lark bot enabled: only allowlisted users can use direct messages or group @mentions. Run /lark-bot off to disable.", "info");
         } catch (error) { await stop(); throw error; }
       } catch (error) {
-        ctx.ui.notify(error instanceof Error ? error.message : "Lark bot operation failed", "error");
+        const text = error instanceof Error ? error.message : "Lark bot operation failed";
+        // Automatic takeovers retry every poll: another Pi winning the lock is
+        // expected, and a persistent failure is reported once.
+        if (automatic && (/already has a running|recovery is in progress/.test(text) || text === lastAutomaticError)) return;
+        if (automatic) lastAutomaticError = text;
+        ctx.ui.notify(text, "error");
       } finally { operation = false; }
   }
 }

@@ -254,10 +254,9 @@ class PaneWorker implements ConversationWorker {
   private failActive(error: Error): void {
     for (const pending of this.deliveries.values()) pending.reject(error);
     this.deliveries.clear();
-    // A lost connection can occur long after handoff. Report it on the chat
-    // channel, rather than leaving the last progress card looking busy forever.
-    const sink = this.onEvent; this.onEvent = undefined;
-    try { sink?.({ type: "done", text: "❌ Pi 会话连接已断开，未自动重发消息。下次消息会重新打开会话。", error: true }); } catch {}
+    // A lost connection can occur long after handoff. Clear the event handler;
+    // the next user message will reopen the session automatically.
+    this.onEvent = undefined;
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;

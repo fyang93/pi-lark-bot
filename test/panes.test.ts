@@ -104,9 +104,15 @@ test("workers split the controller's own pane unfocused, else open a background 
       if ("target" in expected) { assert.equal(create.target, expected.target); assert.equal(create.direction, expected.direction); }
       const paneId = workers.list()[0]!.paneId!;
       assert.match(paneId, /^w1:p\d+$/);
-      const read = async () => JSON.parse(await readFile(join(f.root, `pane-${paneId.replace("w1:p", "")}.json`), "utf8"));
-      for (let i = 0; i < 250 && !(await read()).agent; i++) await new Promise((done) => setTimeout(done, 20));
-      const pane = await read();
+      const read = async () => {
+        try { return JSON.parse(await readFile(join(f.root, `pane-${paneId.replace("w1:p", "")}.json`), "utf8")); }
+        catch { return {}; } // The fixture rewrites this file non-atomically while naming the pane.
+      };
+      let pane: any = {};
+      for (let i = 0; i < 250 && !pane.agent; i++) {
+        pane = await read();
+        if (!pane.agent) await new Promise((done) => setTimeout(done, 20));
+      }
       assert.match(pane.label, /^lark-[a-f0-9]{10}$/);
       assert.equal(pane.agent, pane.label, "the ready worker is named in herdr's agents sidebar");
       await worker.run("worker", () => {});
@@ -185,7 +191,10 @@ test("closing finds a moved worker pane through its agent name", { timeout: 1000
     };
     for (let i = 0; i < 250 && !(await read(paneId!)).agent; i++) await new Promise((done) => setTimeout(done, 20));
     const { agent } = await read(paneId!);
-    await new Promise((done) => setTimeout(done, 100));  // the rename's reply reaches the worker
+    // The worker closes by name only once the rename's reply has reached it.
+    const worker = (workers as any).entries.get("ou_a").worker;
+    for (let i = 0; i < 250 && !worker.named; i++) await new Promise((done) => setTimeout(done, 20));
+    assert.equal(worker.named, true, "the worker holds its agent name");
     // The user moves the pane to another workspace: herdr gives it a new id; the agent name follows.
     await rename(join(f.root, `pane-${paneId!.replace("w1:p", "")}.json`), join(f.root, "pane-50.json"));
     await writeFile(join(f.root, "moved.json"), JSON.stringify({ [agent]: "w1:p50" }));

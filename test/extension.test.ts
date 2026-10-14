@@ -55,7 +55,11 @@ test("loading extension is inert; /lark-bot defaults to status and never writes 
 
 async function waitFor(check: () => boolean) {
   for (let i = 0; i < 40 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 100));
-  assert(check(), "peer status did not update");
+  assert(check(), "condition did not update");
+}
+async function waitForAsync(check: () => Promise<boolean>) {
+  for (let i = 0; i < 40; i++) { if (await check()) return; await new Promise((resolve) => setTimeout(resolve, 100)); }
+  assert(await check(), "condition did not update");
 }
 
 test("linked on persists across launches; two sessions elect one listener; off stays off", async (t) => {
@@ -89,14 +93,14 @@ test("linked on persists across launches; two sessions elect one listener; off s
     assert.equal(second.statuses.length, 0, "link alone has no Lark status");
     await first.commands.get("lark-bot").handler("on", first.ctx);
     assert.equal(starts, 1, first.messages.join("\n"));
-    assert.equal(first.statuses.at(-1), "🐤 Feishu: on");
+    assert.equal(first.statuses.at(-1), "🐤 Feishu");
     assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: true });
-    await waitFor(() => second.statuses.at(-1) === "🐤 Feishu: push");
+    await waitFor(() => second.statuses.at(-1) === "🐤 Feishu");
     await second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
     assert.equal(starts, 1, "the existing owner keeps the sole listener");
-    assert.equal(second.statuses.at(-1), "🐤 Feishu: push");
+    assert.equal(second.statuses.at(-1), "🐤 Feishu");
     await first.handlers.get("session_start")({ reason: "resume" }, first.ctx);
-    assert.equal(first.statuses.at(-1), "🐤 Feishu: on", "owner remains on");
+    assert.equal(first.statuses.at(-1), "🐤 Feishu", "owner remains listed");
     const untrusted = next(); untrusted.ctx.isProjectTrusted = () => false;
     await untrusted.handlers.get("session_start")({ reason: "startup" }, untrusted.ctx);
     assert.equal(untrusted.statuses.length, 0, "untrusted session has no Lark status");
@@ -133,7 +137,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
     });
     try {
       await third.handlers.get("session_start")({ reason: "startup" }, third.ctx);
-      assert.equal(third.statuses.at(-1), "🐤 Feishu: on · 2 pending handoffs");
+      assert.equal(third.statuses.at(-1), "🐤 Feishu");
     } finally { Object.defineProperty(BotController.prototype, "status", status); }
     assert.equal(starts, 2, "new Pi launch restores listening");
     assert.equal(confirmations, 1, "automatic startup does not re-prompt");
@@ -148,7 +152,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
     assert.equal(starts, 2, "off disables future startup");
     assert.equal(fourth.statuses.length, 0, "off project has no status on new session");
     await fourth.commands.get("lark-bot").handler("on", fourth.ctx);
-    await waitFor(() => second.statuses.at(-1) === "🐤 Feishu: push");
+    await waitFor(() => second.statuses.at(-1) === "🐤 Feishu");
     await fourth.handlers.get("session_shutdown")({ reason: "new" }, fourth.ctx);
     const fifth = next();
     await fifth.handlers.get("session_start")({ reason: "new" }, fifth.ctx);
@@ -190,6 +194,47 @@ test("simultaneous automatic starts publish just one listener and push endpoint"
     assert.equal((await inspectLock(dir)).state, "running", "live owner answers the identity probe");
   } finally {
     await Promise.all([a, b].map((h) => h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx)));
+    for (const [key, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("running Pis take over listening when the owner exits", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "lark-takeover-"));
+  const env = { PATH: process.env.PATH, HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_BIN_PATH: process.env.HERDR_BIN_PATH };
+  const owner = harness(cwd), b = harness(cwd), c = harness(cwd);
+  let starts = 0;
+  const sent: string[] = [];
+  t.mock.method(LarkTransport.prototype, "start", async () => { starts++; });
+  t.mock.method(LarkTransport.prototype, "stop", async () => {});
+  t.mock.method(LarkTransport.prototype, "send", async (_chat: string, text: string) => { sent.push(text); return `m_${sent.length}`; });
+  try {
+    await writeFile(join(cwd, "herdr"), '#!/bin/sh\necho "herdr 0.9.1"\n', { mode: 0o700 });
+    process.env.PATH = `${cwd}:${env.PATH}`;
+    process.env.HERDR_ENV = "1"; process.env.HERDR_PANE_ID = "w1:p0"; delete process.env.HERDR_BIN_PATH;
+    const dir = await prepareState(cwd, ".pi");
+    await writePrivateJson(join(dir, "config.json"), { version: 1, brand: "feishu", appId: "cli_test", appSecret: "secret" });
+    await writePrivateJson(join(dir, "enabled.json"), { appId: "cli_test", enabled: true });
+    await writePrivateJson(join(dir, "push-target.json"),
+      { version: 1, appId: "cli_test", chatId: "oc_team", chatType: "group", setBy: "group:oc_team", setAt: "" });
+    for (const h of [owner, b, c]) await h.handlers.get("session_start")({ reason: "startup" }, h.ctx);
+    assert.equal(starts, 1);
+    await owner.handlers.get("session_shutdown")({ reason: "quit" }, owner.ctx);
+    await waitFor(() => starts === 2);
+    assert.equal(starts, 2, "exactly one running Pi takes over");
+    await waitForAsync(async () => (await inspectLock(dir)).state === "running" &&
+      !!await readPrivateJson(join(dir, "push-endpoint.json")).catch(() => undefined));
+    await b.tools.get("lark_push").execute("call", { text: "after takeover" }, undefined, undefined, b.ctx);
+    assert.deepEqual(sent, ["after takeover"]);
+    assert(![b, c].some((h) => h.messages.some((m) => /already has a running|recovery/.test(m))), "losing the race is silent");
+    for (const h of [b, c]) await h.commands.get("lark-bot").handler("off", h.ctx);
+    await waitFor(() => [b, c].every((h) => h.statuses.at(-1) === undefined));
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    assert.equal(starts, 2, "off is not undone by a takeover");
+  } finally {
+    await Promise.all([owner, b, c].map((h) => h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx)));
     for (const [key, value] of Object.entries(env)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
