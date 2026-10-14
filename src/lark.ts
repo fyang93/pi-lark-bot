@@ -122,7 +122,11 @@ export class LarkTransport implements BotTransport {
     if (!message.parentMessageId) return message;
     let item: any;
     try {
-      const response = await this.request(() => this.client.im.v1.message.get({ path: { message_id: message.parentMessageId } }));
+      // Without this parameter, Lark may return an upgrade placeholder for 2.0 cards.
+      // https://open.feishu.cn/document/server-docs/im-v1/message/get
+      const response = await this.request(() => this.client.im.v1.message.get({
+        path: { message_id: message.parentMessageId }, params: { card_msg_content_type: "user_card_content" },
+      }));
       item = response?.data?.items?.find((candidate: any) => candidate?.message_id === message.parentMessageId);
     } catch {
       return { ...message, preparationWarning: "referenced_message_unavailable" };
@@ -397,5 +401,5 @@ function quotedMessageText(value: unknown): string | undefined {
 }
 
 function card(text: string): object {
-  return { config: { wide_screen_mode: true }, elements: [{ tag: "markdown", content: text }] };
+  return { schema: "2.0", config: { width_mode: "fill" }, body: { elements: [{ tag: "markdown", content: text }] } };
 }

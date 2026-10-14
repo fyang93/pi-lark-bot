@@ -190,6 +190,33 @@ test("times out an initial handshake and force-closes", async (t) => {
   assert.deepEqual(fake.calls.close, [{ force: true }]);
 });
 
+test("Markdown tables use JSON 2.0 cards for sends, replies and updates, and remain quotable", async () => {
+  const fake = fakeSdk();
+  const transport = new LarkTransport(config, undefined, fake.sdk);
+  const text = "| 项目 | 状态 |\n| --- | --- |\n| 表格 | 支持 |";
+  const expected = { schema: "2.0", config: { width_mode: "fill" },
+    body: { elements: [{ tag: "markdown", content: text }] } };
+  await transport.send("oc_1", text);
+  await transport.send("oc_1", text, "om_1");
+  await transport.update("out-1", text);
+  for (const payload of [fake.calls.create[0], fake.calls.reply[0], fake.calls.patch[0]]) {
+    assert.deepEqual(JSON.parse(payload.data.content), expected);
+  }
+  // The real API's default response is not the JSON used to send the card.
+  fake.api.get = async (payload: any) => {
+    fake.calls.get.push(payload);
+    return { code: 0, data: { items: [{ message_id: "out-1", chat_id: "oc_1", msg_type: "interactive",
+      body: { content: payload.params?.card_msg_content_type === "user_card_content"
+        ? fake.calls.patch[0].data.content
+        : JSON.stringify({ elements: [{ tag: "text", text: "请升级至最新版本客户端，以查看内容" }] }) } }] } };
+  };
+  const prepared = await transport.prepareMessage({ id: "reply", userId: "ou_1", chatId: "oc_1",
+    text: "解释表格", parentMessageId: "out-1" });
+  assert.equal(prepared.quotedText, text);
+  assert.deepEqual(fake.calls.get[0], { path: { message_id: "out-1" },
+    params: { card_msg_content_type: "user_card_content" } });
+});
+
 test("uses idempotent create/reply/patch cards and bounded HTTP/retries", async () => {
   const fake = fakeSdk();
   const transport = new LarkTransport(config, undefined, fake.sdk);
@@ -201,7 +228,7 @@ test("uses idempotent create/reply/patch cards and bounded HTTP/retries", async 
   assert.equal(create.data.receive_id, "oc_1");
   assert.equal(create.data.msg_type, "interactive");
   assert.match(create.data.uuid, /^[0-9a-f-]{36}$/);
-  assert.equal(JSON.parse(create.data.content).elements[0].content, "progress");
+  assert.equal(JSON.parse(create.data.content).body.elements[0].content, "progress");
   assert.equal(fake.calls.reply[0].path.message_id, "om_1");
   assert.notEqual(fake.calls.reply[0].data.uuid, create.data.uuid);
   assert.equal(fake.calls.patch[0].path.message_id, "out-1");
