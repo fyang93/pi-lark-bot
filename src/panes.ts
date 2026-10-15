@@ -8,7 +8,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { privateDir, writePrivateJson } from "./storage.ts";
-import type { ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory, WorkerRequest, WorkerResponse } from "./types.ts";
+import type { BotConfig, ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory, WorkerRequest, WorkerResponse } from "./types.ts";
 
 import { closeSurface, createSurface, nameAgent } from "./herdr.ts";
 
@@ -17,6 +17,7 @@ export interface HerdrWorkersOptions {
   cwd: string;
   stateDir?: string;
   appId: string;
+  brand?: BotConfig["brand"];
   model?: { provider: string; id: string };
   thinkingLevel?: string;
   startupTimeoutMs?: number;
@@ -149,7 +150,7 @@ class PaneWorker implements ConversationWorker {
     for (const key of Object.keys(childEnv)) {
       if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_LARK_BOT_") || ["PI_SESSION_ID", "PI_SESSION_FILE"].includes(key)) delete childEnv[key];
     }
-    Object.assign(childEnv, { PI_LARK_BOT_WORKER: "1", PI_LARK_BOT_SOCKET: socketPath, PI_LARK_BOT_RUN_ID: runId, PI_LARK_BOT_TOKEN: token });
+    Object.assign(childEnv, { PI_LARK_BOT_WORKER: "1", PI_LARK_BOT_BRAND: this.options.brand ?? "lark", PI_LARK_BOT_SOCKET: socketPath, PI_LARK_BOT_RUN_ID: runId, PI_LARK_BOT_TOKEN: token });
     if (this.userId.startsWith("group:")) childEnv.PI_LARK_BOT_GROUP_CHAT_ID = this.userId.slice("group:".length);
     const extension = this.options.workerExtensionPath ?? fileURLToPath(new URL("./worker-extension.ts", import.meta.url));
     const args = ["--session", this.sessionFile, "-e", extension];

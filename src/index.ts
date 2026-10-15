@@ -338,7 +338,7 @@ export default function larkBot(pi: ExtensionAPI): void {
           // Worker panes hold no credentials: their push and push-target requests
           // are served here, and the chat is resolved from the worker's own key.
           let served: BotController | undefined;
-          const workers = new HerdrWorkers({ cwd, stateDir, appId: config.appId,
+          const workers = new HerdrWorkers({ cwd, stateDir, appId: config.appId, brand: config.brand,
             model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
             thinkingLevel: pi.getThinkingLevel(),
             onRequest: (key, request) => served

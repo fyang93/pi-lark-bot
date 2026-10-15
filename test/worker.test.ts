@@ -6,8 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import workerExtension from "../src/worker-extension.ts";
 
-async function harness(t: TestContext, options: { fail?: boolean } = {}) {
-  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_GROUP_CHAT_ID"];
+async function harness(t: TestContext, options: { fail?: boolean; brand?: string } = {}) {
+  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_GROUP_CHAT_ID", "PI_LARK_BOT_BRAND"];
   const old = keys.map((key) => process.env[key]);
   const root = await mkdtemp(join(tmpdir(), "pi-lark-worker-test-"));
   let peer: Socket | undefined;
@@ -36,6 +36,7 @@ async function harness(t: TestContext, options: { fail?: boolean } = {}) {
   await new Promise<void>((resolve) => server.listen(path, resolve));
   keys.forEach((key) => delete process.env[key]);
   Object.assign(process.env, { PI_LARK_BOT_SOCKET: path, PI_LARK_BOT_RUN_ID: "run", PI_LARK_BOT_TOKEN: "token" });
+  if (options.brand) process.env.PI_LARK_BOT_BRAND = options.brand;
   const prompts: { message: any; options: any }[] = [];
   const statuses = new Map<string, string | undefined>();
   let aborts = 0, shutdowns = 0;
@@ -131,12 +132,14 @@ test("local steering closes remote progress without forwarding local output or t
   assert(!JSON.stringify(h.messages).match(/private|secret/));
 });
 
-test("worker status uses the chick icon and is cleared on shutdown", async (t) => {
-  const h = await harness(t);
-  assert.equal(h.statuses.get("lark-bot"), "🐣 Lark");
-  h.emit("session_shutdown");
-  assert.equal(h.statuses.get("lark-bot"), undefined);
-});
+for (const brand of [undefined, "feishu", "lark"]) {
+  test(`worker status shows ${brand ?? "default"} brand and is cleared on shutdown`, async (t) => {
+    const h = await harness(t, { brand });
+    assert.equal(h.statuses.get("lark-bot"), brand === "feishu" ? "🐣 Feishu" : "🐣 Lark");
+    h.emit("session_shutdown");
+    assert.equal(h.statuses.get("lark-bot"), undefined);
+  });
+}
 
 test("abort is chat-scoped and acknowledged separately from assistant output", { timeout: 3000 }, async (t) => {
   const h = await harness(t); h.send({ type: "prompt", id: "p", text: "hi" }); await h.until("accepted"); h.start();

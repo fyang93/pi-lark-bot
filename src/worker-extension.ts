@@ -112,7 +112,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     : undefined);
   pi.on("session_start", (_event, eventCtx) => {
     ctx = eventCtx;
-    ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", "🐣 Lark"));
+    ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", `🐣 ${process.env.PI_LARK_BOT_BRAND === "feishu" ? "Feishu" : "Lark"}`));
     if (!socketPath || !runId || !token) {
       ctx.ui.notify("Lark worker IPC is not configured", "error"); ctx.shutdown(); return;
     }
