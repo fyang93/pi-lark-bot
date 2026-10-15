@@ -113,6 +113,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     : undefined);
   pi.on("session_start", (_event, eventCtx) => {
     ctx = eventCtx;
+    ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", "🐣 Feishu"));
     if (!socketPath || !runId || !token) {
       ctx.ui.notify("Lark worker IPC is not configured", "error"); ctx.shutdown(); return;
     }
@@ -146,5 +147,5 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     return { cancel: true as const };
   };
   pi.on("session_before_switch", blockSwitch); pi.on("session_before_fork", blockSwitch);
-  pi.on("session_shutdown", () => { cleanup(); socket?.end(); });
+  pi.on("session_shutdown", () => { ctx?.ui.setStatus("lark-bot", undefined); cleanup(); socket?.end(); });
 }
