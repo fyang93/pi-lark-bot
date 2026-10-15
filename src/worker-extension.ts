@@ -20,7 +20,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   const groupChatId = process.env.PI_LARK_BOT_GROUP_CHAT_ID;
   const token = process.env.PI_LARK_BOT_TOKEN;
   let socket: Socket | undefined, ctx: ExtensionContext | undefined, buffer = "";
-  let stopping = false, connectedChat = false, outputOpen = false, text = "";
+  let stopping = false, forwardReply = false, outputOpen = false, text = "";
   let textTimer: NodeJS.Timeout | undefined, queuedText: string | undefined;
   const requests = new Map<string, (response: WorkerResponse) => void>();
   const send = (message: object): void => {
@@ -57,7 +57,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     send({ type: "text", text: queuedText }); queuedText = undefined;
   };
   const emit = (event: WorkerEvent): void => {
-    if (!connectedChat || stopping) return;
+    if (!forwardReply || stopping) return;
     outputOpen = event.type !== "done";
     if (event.type === "text") {
       queuedText = event.text;
@@ -94,9 +94,8 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
       if (message.type !== "prompt" || typeof message.text !== "string" || !message.text.trim() || Buffer.byteLength(message.text) > MAX_PROMPT_BYTES) {
         socket?.destroy(); return;
       }
-      connectedChat = true;
       try {
-        pi.sendUserMessage(message.text, { deliverAs: "followUp", expandPromptTemplates: false });
+        pi.sendMessage({ customType: "lark_input", content: message.text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
         // Only confirms handoff to Pi, never model completion. Do not retry an
         // uncertain delivery: Pi may have already queued or executed it.
         send({ type: "accepted", id: message.id });
@@ -113,7 +112,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     : undefined);
   pi.on("session_start", (_event, eventCtx) => {
     ctx = eventCtx;
-    ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", "🐣 Feishu"));
+    ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", "🐣 Lark"));
     if (!socketPath || !runId || !token) {
       ctx.ui.notify("Lark worker IPC is not configured", "error"); ctx.shutdown(); return;
     }
@@ -122,8 +121,13 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     socket.on("data", receive);
     socket.on("error", () => socket?.destroy()); socket.on("close", shutdown);
   });
-  pi.on("input", (event) => { if (event.source === "interactive") connectedChat = false; });
   pi.on("message_start", (event) => {
+    // Pi emits inputs here when consumed, not when queued.
+    if (event.message.role === "user") {
+      forwardReply = false;
+      outputOpen = false;
+      clearTimeout(textTimer); textTimer = undefined; queuedText = undefined;
+    } else if (event.message.role === "custom" && event.message.customType === "lark_input") forwardReply = true;
     if (event.message.role === "assistant") { text = ""; emit({ type: "text", text }); }
   });
   pi.on("message_update", (event) => {

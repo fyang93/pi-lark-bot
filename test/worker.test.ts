@@ -36,16 +36,18 @@ async function harness(t: TestContext, options: { fail?: boolean } = {}) {
   await new Promise<void>((resolve) => server.listen(path, resolve));
   keys.forEach((key) => delete process.env[key]);
   Object.assign(process.env, { PI_LARK_BOT_SOCKET: path, PI_LARK_BOT_RUN_ID: "run", PI_LARK_BOT_TOKEN: "token" });
-  const prompts: { text: string; options: any }[] = [];
+  const prompts: { message: any; options: any }[] = [];
+  const statuses = new Map<string, string | undefined>();
   let aborts = 0, shutdowns = 0;
   const context = { isIdle: () => false, hasPendingMessages: () => true,
-    abort() { aborts++; }, shutdown() { shutdowns++; }, ui: { notify() {}, setStatus() {}, theme: { fg: (_color: string, text: string) => text } } };
+    abort() { aborts++; }, shutdown() { shutdowns++; },
+    ui: { notify() {}, setStatus(key: string, text?: string) { statuses.set(key, text); }, theme: { fg: (_color: string, text: string) => text } } };
   const emit = (name: string, event: unknown = {}) => handlers.get(name)?.(event, context);
   const tools = new Map<string, any>();
   workerExtension({ on(name: string, handler: Function) { handlers.set(name, handler); },
     registerTool(tool: any) { tools.set(tool.name, tool); },
-    sendUserMessage(text: string, opts: any) {
-      prompts.push({ text, options: opts });
+    sendMessage(message: any, opts: any) {
+      prompts.push({ message, options: opts });
       if (options.fail) throw new Error("private error");
     },
   } as never);
@@ -54,7 +56,8 @@ async function harness(t: TestContext, options: { fail?: boolean } = {}) {
   const until = async (type: string) => { for (;;) { const value = await next(); if (value.type === type) return value; } };
   assert.deepEqual(await next(), { type: "hello", runId: "run", token: "token" });
   assert.deepEqual(await next(), { type: "ready" });
-  return { messages, prompts, tools, next, until, emit,
+  return { messages, prompts, tools, statuses, next, until, emit,
+    start(index = prompts.length - 1) { emit("message_start", { message: { role: "custom", ...prompts[index]!.message } }); },
     get aborts() { return aborts; }, get shutdowns() { return shutdowns; },
     send(message: object) { peer!.write(`${JSON.stringify(message)}\n`); },
     disconnect() { peer!.destroy(); },
@@ -72,39 +75,71 @@ test("busy Pi accepts successive follow-ups without waiting for any answer, even
     h.send({ type: "prompt", id, text: id });
     assert.deepEqual(await h.until("accepted"), { type: "accepted", id });
   }
-  assert.deepEqual(h.prompts, ["first", "second", "/not-a-command"].map((text) => ({ text,
-    options: { deliverAs: "followUp", expandPromptTemplates: false } })));
+  assert.deepEqual(h.prompts, ["first", "second", "/not-a-command"].map((text) => ({
+    message: { customType: "lark_input", content: text, display: true },
+    options: { triggerTurn: true, deliverAs: "followUp" } })));
   assert.equal(h.messages.some((m) => m.type === "done"), false);
 });
 
 test("output is chat-wide: subagent results inside a turn or later both finish without special lifecycle guesses", { timeout: 3000 }, async (t) => {
   const h = await harness(t);
-  h.send({ type: "prompt", id: "first", text: "question" }); await h.until("accepted");
+  h.send({ type: "prompt", id: "first", text: "question" }); await h.until("accepted"); h.start();
   h.emit("tool_execution_start", { toolName: "subagent" }); await h.until("progress");
   h.emit("message_end", { message: { role: "custom", customType: "subagent_result", content: "private payload" } });
   h.finish("final answer");
   assert.deepEqual(await h.until("done"), { type: "done", text: "final answer", error: false });
   h.emit("before_agent_start", { prompt: "background continuation" }); h.finish("later answer");
   assert.equal((await h.until("done")).text, "later answer");
-  h.send({ type: "prompt", id: "next", text: "next question" }); await h.until("accepted");
+  h.send({ type: "prompt", id: "next", text: "next question" }); await h.until("accepted"); h.start();
   h.finish("next answer"); assert.equal((await h.until("done")).text, "next answer");
   assert(!h.messages.some((m) => m.text?.includes("private payload")));
 });
 
-test("local TUI replies are not forwarded, while Lark replies are", { timeout: 3000 }, async (t) => {
+test("a queued Lark input cannot forward the active local reply", { timeout: 3000 }, async (t) => {
   const h = await harness(t);
-  h.send({ type: "prompt", id: "first", text: "hi" }); await h.until("accepted");
-  h.emit("input", { source: "interactive", text: "local message" });
-  h.finish("local assistant reply");
-  assert.equal(h.messages.some((m) => m.type === "done"), false);
+  h.emit("message_start", { message: { role: "user", content: "local question" } });
+  h.send({ type: "prompt", id: "remote", text: "from Lark" }); await h.until("accepted");
+  h.finish("private local reply");
+  h.start(); h.finish("Lark reply");
+  assert.equal((await h.until("done")).text, "Lark reply");
+  assert(!JSON.stringify(h.messages).includes("private local reply"));
+});
 
-  h.send({ type: "prompt", id: "second", text: "from Lark" }); await h.until("accepted");
+test("a queued local input cannot suppress the active Lark reply", { timeout: 3000 }, async (t) => {
+  const h = await harness(t);
+  h.send({ type: "prompt", id: "remote", text: "from Lark" }); await h.until("accepted"); h.start();
+  h.emit("input", { source: "interactive", text: "queued local question", streamingBehavior: "followUp" });
   h.finish("Lark reply");
   assert.equal((await h.until("done")).text, "Lark reply");
+  h.emit("message_start", { message: { role: "user", content: "queued local question" } });
+  h.finish("private local reply");
+  h.send({ type: "abort", id: "barrier" }); await h.until("accepted");
+  assert(!JSON.stringify(h.messages).includes("private local reply"));
+  assert.equal(h.messages.filter((m) => m.type === "done").length, 1);
+});
+
+test("local steering closes remote progress without forwarding local output or tool bodies", { timeout: 3000 }, async (t) => {
+  const h = await harness(t);
+  h.send({ type: "prompt", id: "remote", text: "from Lark" }); await h.until("accepted"); h.start();
+  h.emit("tool_execution_start", { toolName: "read" }); await h.until("progress");
+  h.emit("message_start", { message: { role: "user", content: "local steering" } });
+  assert.equal(h.messages.some((m) => m.type === "done"), false);
+  h.emit("message_end", { message: { role: "toolResult", content: "secret tool body" } });
+  h.emit("message_update", { message: { role: "assistant", content: [{ type: "thinking", thinking: "secret thought" }] } });
+  h.finish("private local reply");
+  h.send({ type: "abort", id: "barrier" }); await h.until("accepted");
+  assert(!JSON.stringify(h.messages).match(/private|secret/));
+});
+
+test("worker status uses the chick icon and is cleared on shutdown", async (t) => {
+  const h = await harness(t);
+  assert.equal(h.statuses.get("lark-bot"), "🐣 Lark");
+  h.emit("session_shutdown");
+  assert.equal(h.statuses.get("lark-bot"), undefined);
 });
 
 test("abort is chat-scoped and acknowledged separately from assistant output", { timeout: 3000 }, async (t) => {
-  const h = await harness(t); h.send({ type: "prompt", id: "p", text: "hi" }); await h.until("accepted");
+  const h = await harness(t); h.send({ type: "prompt", id: "p", text: "hi" }); await h.until("accepted"); h.start();
   h.send({ type: "abort", id: "stop" });
   assert.deepEqual(await h.until("accepted"), { type: "accepted", id: "stop" });
   assert.equal(h.aborts, 1);
@@ -121,7 +156,7 @@ test("handoff failures are rejected once without exposing errors or auto-retryin
 
 test("long idle periods do not close the bridge", { timeout: 3000 }, async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 1_000 });
-  const h = await harness(t); h.send({ type: "prompt", id: "p", text: "hi" }); await h.until("accepted");
+  const h = await harness(t); h.send({ type: "prompt", id: "p", text: "hi" }); await h.until("accepted"); h.start();
   h.finish("answer"); await h.until("done");
   t.mock.timers.tick(24 * 60 * 60_000);
   h.send({ type: "prompt", id: "next", text: "tomorrow" }); await h.until("accepted");
