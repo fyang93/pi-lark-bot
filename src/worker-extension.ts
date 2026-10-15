@@ -121,6 +121,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     socket.on("data", receive);
     socket.on("error", () => socket?.destroy()); socket.on("close", shutdown);
   });
+  pi.on("input", (event) => { if (event.source === "interactive") connectedChat = false; });
   pi.on("message_start", (event) => {
     if (event.message.role === "assistant") { text = ""; emit({ type: "text", text }); }
   });

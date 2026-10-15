@@ -91,14 +91,16 @@ test("output is chat-wide: subagent results inside a turn or later both finish w
   assert(!h.messages.some((m) => m.text?.includes("private payload")));
 });
 
-test("chat pane local assistant output is forwarded, but thinking and tool result bodies are not", { timeout: 3000 }, async (t) => {
-  const h = await harness(t); h.send({ type: "prompt", id: "first", text: "hi" }); await h.until("accepted");
+test("local TUI replies are not forwarded, while Lark replies are", { timeout: 3000 }, async (t) => {
+  const h = await harness(t);
+  h.send({ type: "prompt", id: "first", text: "hi" }); await h.until("accepted");
   h.emit("input", { source: "interactive", text: "local message" });
-  h.emit("message_end", { message: { role: "toolResult", content: "secret tool body" } });
-  h.emit("message_update", { message: { role: "assistant", content: [{ type: "thinking", thinking: "secret thought" }] } });
   h.finish("local assistant reply");
-  assert.equal((await h.until("done")).text, "local assistant reply");
-  assert(!JSON.stringify(h.messages).includes("secret"));
+  assert.equal(h.messages.some((m) => m.type === "done"), false);
+
+  h.send({ type: "prompt", id: "second", text: "from Lark" }); await h.until("accepted");
+  h.finish("Lark reply");
+  assert.equal((await h.until("done")).text, "Lark reply");
 });
 
 test("abort is chat-scoped and acknowledged separately from assistant output", { timeout: 3000 }, async (t) => {
