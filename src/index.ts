@@ -108,7 +108,7 @@ export default function larkBot(pi: ExtensionAPI): void {
       }
       if (shuttingDown || controller || status === peerStatus) return;
       peerStatus = status;
-      ctx.ui.setStatus("lark-bot", status ? ctx.ui.theme.fg("accent", status) : undefined);
+      ctx.ui.setStatus("lark-bot", status);
     } finally { checkingPeer = false; }
   }
   let restoring = false;

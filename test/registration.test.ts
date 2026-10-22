@@ -22,7 +22,7 @@ test("registers with begin, addon URL, pending poll, and returns credentials", a
   let shown = "";
   const result = await registerBot({ brand: "feishu", signal: new AbortController().signal, onUrl: (url) => { shown = url; } });
   assert.deepEqual(result, { appId: "cli_new", appSecret: "secret", brand: "feishu" });
-  assert.equal(calls[0]!.body, "action=begin&archetype=PersonalAgent&auth_method=client_secret&request_user_info=open_id");
+  assert.equal(calls[0]!.body, "action=begin&archetype=PersonalAgent&auth_method=client_secret&request_user_info=open_id+tenant_brand");
   assert.match(shown, /createOnly=true/);
   const addons = JSON.parse(gunzipSync(Buffer.from(new URL(shown).searchParams.get("addons")!, "base64url")).toString("utf8"));
   assert.equal(addons.preset, false);
@@ -130,14 +130,14 @@ test("cancels the polling delay without making a poll request", async () => {
   await assert.rejects(registerBot({ brand: "feishu", signal: controller.signal,
     onUrl: () => { setImmediate(() => controller.abort()); },
   }), /aborted/);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
 test("expires without polling when the server gives an expired device code", async () => {
   let calls = 0;
-  globalThis.fetch = (async () => { calls++; return response({ verification_uri_complete: "https://accounts.feishu.cn/v", device_code: "d", expires_in: 0, interval: 0 }); }) as typeof fetch;
+  globalThis.fetch = (async () => { calls++; return response({ verification_uri_complete: "https://accounts.feishu.cn/v", device_code: "d", expires_in: 0.001, interval: 0 }); }) as typeof fetch;
   await assert.rejects(registerBot({ brand: "feishu", signal: new AbortController().signal, onUrl: () => {} }), /expired/);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
 test("keeps timeout active while reading the initial response body", async () => {

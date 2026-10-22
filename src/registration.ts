@@ -171,15 +171,16 @@ export async function registerBot(options: RegisterBotOptions): Promise<Register
 
   let baseUrl = `https://${DOMAINS[brand]}`;
   const begin = await request(baseUrl, {
-    action: "begin", archetype: "PersonalAgent", auth_method: "client_secret", request_user_info: "open_id",
+    action: "begin", archetype: "PersonalAgent", auth_method: "client_secret", request_user_info: "open_id tenant_brand",
   }, signal);
   const verification = stringField(begin.verification_uri_complete);
   const deviceCode = stringField(begin.device_code);
   if (!verification || !deviceCode) throw new Error("Bot registration returned an incomplete authorization request");
-  const rawExpires = typeof begin.expires_in === "number" && Number.isFinite(begin.expires_in) && begin.expires_in >= 0 ? begin.expires_in : DEFAULT_EXPIRES_SECONDS;
+  const expiresValue = typeof begin.expire_in === "number" ? begin.expire_in : begin.expires_in;
+  const rawExpires = typeof expiresValue === "number" && Number.isFinite(expiresValue) && expiresValue > 0 ? expiresValue : DEFAULT_EXPIRES_SECONDS;
   const expiresIn = Math.min(rawExpires, 86_400);
   const rawInterval = typeof begin.interval === "number" && Number.isFinite(begin.interval) && begin.interval >= 0 ? begin.interval : DEFAULT_INTERVAL_SECONDS;
-  const interval = Math.min(rawInterval, 60) * 1000;
+  const interval = Math.min(rawInterval > 0 ? rawInterval : DEFAULT_INTERVAL_SECONDS, 60) * 1000;
   const url = officialAuthorizationUrl(verification);
   url.searchParams.set("from", "sdk");
   url.searchParams.set("source", "pi-lark-bot");
@@ -192,8 +193,10 @@ export async function registerBot(options: RegisterBotOptions): Promise<Register
   const deadline = Date.now() + expiresIn * 1000;
   const deadlineSignal = AbortSignal.timeout(Math.ceil(expiresIn * 1000));
   let pollInterval = interval;
+  let firstPoll = true;
   while (Date.now() < deadline) {
-    await wait(Math.min(pollInterval, Math.max(0, deadline - Date.now())), signal, deadlineSignal);
+    if (!firstPoll) await wait(Math.min(pollInterval, Math.max(0, deadline - Date.now())), signal, deadlineSignal);
+    firstPoll = false;
     const result = await request(baseUrl, { action: "poll", device_code: deviceCode }, signal, deadlineSignal);
     const info = result.user_info as Record<string, unknown> | undefined;
     if (info?.tenant_brand === "lark" && baseUrl !== `https://${DOMAINS.lark}`) {
@@ -204,7 +207,7 @@ export async function registerBot(options: RegisterBotOptions): Promise<Register
     const appSecret = stringField(result.client_secret);
     if (appId && appSecret) return { appId, appSecret, brand: info?.tenant_brand === "lark" ? "lark" : brand };
     const errorCode = typeof result.error === "string" ? result.error : undefined;
-    if (errorCode === "slow_down") pollInterval += 5000;
+    if (errorCode === "slow_down") pollInterval = Math.min(pollInterval + 5000, 60_000);
     else if (errorCode && errorCode !== "authorization_pending") throw safeError(errorCode);
   }
   throw new Error("Bot registration expired");
