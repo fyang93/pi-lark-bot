@@ -53,7 +53,9 @@ export class LarkTransport implements BotTransport {
     attachmentCacheDir?: string,
   ) {
     if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
-    const domain = config.brand === "lark" ? sdk.Domain?.Lark : sdk.Domain?.Feishu;
+    // Use explicit API hosts: the SDK enum is numeric (Feishu === 0), and
+    // Lark long-connection discovery is region-bound.
+    const domain = config.brand === "lark" ? "https://open.larksuite.com" : "https://open.feishu.cn";
     // Generated endpoint methods' second parameter is IRequestOptions, not an
     // Axios config, so a timeout there is ignored. This wrapper bounds normal
     // API calls, tenant-token exchange, and WS endpoint discovery for real SDKs.

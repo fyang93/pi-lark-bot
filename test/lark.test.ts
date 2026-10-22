@@ -63,6 +63,7 @@ test("waits for readiness, filters messages, handles reconnect, and force-closes
   assert.equal(transport.state, "starting");
   await fake.ready();
   await starting;
+  assert.equal(fake.clientOptions().domain, "https://open.larksuite.com");
   assert.equal(transport.state, "connected");
   fake.reconnecting();
   assert.equal(transport.state, "reconnecting");
