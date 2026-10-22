@@ -27,6 +27,11 @@ const silentLogger = Object.freeze({
   fatal() {}, error() {}, warn() {}, info() {}, debug() {}, trace() {},
 });
 
+function withDetail(prefix: string, error: unknown): string {
+  const detail = error instanceof Error ? error.message.replace(/[\r\n]+/g, " ").slice(0, 240) : "";
+  return detail ? `${prefix}: ${detail}` : prefix;
+}
+
 type PendingStart = { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 
 /** Tenant-bot Lark/Feishu transport using the SDK's persistent WebSocket. */
@@ -70,7 +75,7 @@ export class LarkTransport implements BotTransport {
         if (this._state === "starting") this.ready();
         else if (this._state !== "stopped") this._state = "connected";
       },
-      onError: () => this.connectionFailed(),
+      onError: (error: Error) => this.connectionFailed(error),
     });
   }
 
@@ -94,9 +99,9 @@ export class LarkTransport implements BotTransport {
         if (typeof info?.bot?.open_id !== "string" || !info.bot.open_id) throw new Error("Missing bot identity");
         this.botOpenId = info.bot.open_id;
         if (this._state === "starting") await this.ws.start({ eventDispatcher: this.dispatcher });
-      })().catch(() => this.failStart("Lark connection could not be started"));
-    } catch (_error) {
-      this.failStart("Lark connection could not be started");
+      })().catch((error) => this.failStart(withDetail("Lark connection could not be started", error)));
+    } catch (error) {
+      this.failStart(withDetail("Lark connection could not be started", error));
     }
     return ready;
   }
@@ -184,13 +189,14 @@ export class LarkTransport implements BotTransport {
     this.settleStart();
   }
 
-  private connectionFailed(): void {
+  private connectionFailed(error?: Error): void {
     if (this._state === "stopped") return;
-    if (this._state === "starting") this.failStart("Lark connection failed");
+    const message = withDetail("Lark connection failed", error);
+    if (this._state === "starting") this.failStart(message);
     else {
       this._state = "stopped";
       this.close();
-      this.report("Lark connection failed");
+      this.report(message);
     }
   }
 
