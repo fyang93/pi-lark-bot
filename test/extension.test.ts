@@ -66,6 +66,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
   const cwd = await mkdtemp(join(tmpdir(), "lark-new-"));
   const env = { PATH: process.env.PATH, HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_BIN_PATH: process.env.HERDR_BIN_PATH };
   let starts = 0, stops = 0, confirmations = 0;
+  const originalFetch = globalThis.fetch;
   const sent: Array<{ chat: string; text: string }> = [];
   t.mock.method(LarkTransport.prototype, "start", async () => { starts++; });
   t.mock.method(LarkTransport.prototype, "stop", async () => { stops++; });
@@ -75,6 +76,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
   const sessions: ReturnType<typeof harness>[] = [];
   const next = () => { const h = harness(cwd); h.ctx.ui.confirm = async () => { confirmations++; return true; }; sessions.push(h); return h; };
   try {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 0, data: { URL: "wss://redacted.invalid" } }))) as typeof fetch;
     await writeFile(join(cwd, "herdr"), '#!/bin/sh\necho "herdr 0.9.1"\n', { mode: 0o700 });
     process.env.PATH = `${cwd}:${env.PATH}`;
     process.env.HERDR_ENV = "1"; process.env.HERDR_PANE_ID = "w1:p0"; delete process.env.HERDR_BIN_PATH;
@@ -93,6 +95,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
     assert.equal(second.statuses.length, 0, "link alone has no Lark status");
     await first.commands.get("lark-bot").handler("on", first.ctx);
     assert.equal(starts, 1, first.messages.join("\n"));
+    assert.equal((await readPrivateJson(join(stateDir, "config.json")) as any).domain, "feishu", "on probes and persists the working region for a legacy config");
     assert.equal(first.statuses.at(-1), "🐤 Feishu");
     assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: true });
     await waitFor(() => second.statuses.at(-1) === "🐤 Feishu");
@@ -164,6 +167,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
     await sixth.handlers.get("session_start")({ reason: "startup" }, sixth.ctx);
     assert.equal(starts, 4, "another app cannot inherit prior on preference");
   } finally {
+    globalThis.fetch = originalFetch;
     for (const h of sessions) await h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx);
     for (const [key, value] of Object.entries(env)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -184,7 +188,7 @@ test("simultaneous automatic starts publish just one listener and push endpoint"
     process.env.PATH = `${cwd}:${env.PATH}`;
     process.env.HERDR_ENV = "1"; process.env.HERDR_PANE_ID = "w1:p0"; delete process.env.HERDR_BIN_PATH;
     const dir = await prepareState(cwd, ".pi");
-    await writePrivateJson(join(dir, "config.json"), { version: 1, brand: "feishu", appId: "cli_test", appSecret: "secret" });
+    await writePrivateJson(join(dir, "config.json"), { version: 1, brand: "feishu", domain: "feishu", appId: "cli_test", appSecret: "secret" });
     await writePrivateJson(join(dir, "enabled.json"), { appId: "cli_test", enabled: true });
     await Promise.all([a, b].map((h) => h.handlers.get("session_start")({ reason: "startup" }, h.ctx)));
     assert.equal(starts, 1);
@@ -215,7 +219,7 @@ test("running Pis take over listening when the owner exits", async (t) => {
     process.env.PATH = `${cwd}:${env.PATH}`;
     process.env.HERDR_ENV = "1"; process.env.HERDR_PANE_ID = "w1:p0"; delete process.env.HERDR_BIN_PATH;
     const dir = await prepareState(cwd, ".pi");
-    await writePrivateJson(join(dir, "config.json"), { version: 1, brand: "feishu", appId: "cli_test", appSecret: "secret" });
+    await writePrivateJson(join(dir, "config.json"), { version: 1, brand: "feishu", domain: "feishu", appId: "cli_test", appSecret: "secret" });
     await writePrivateJson(join(dir, "enabled.json"), { appId: "cli_test", enabled: true });
     await writePrivateJson(join(dir, "push-target.json"),
       { version: 1, appId: "cli_test", chatId: "oc_team", chatType: "group", setBy: "group:oc_team", setAt: "" });

@@ -7,7 +7,7 @@ import type { BotController } from "./controller.ts";
 import { registerPushTools } from "./push-tools.ts";
 import { pushViaOwner, servePush, type Endpoint } from "./push-ipc.ts";
 import { requireHerdr } from "./herdr.ts";
-import { missingBotPermissions, permissionInstructions } from "./registration.ts";
+import { missingBotPermissions, permissionInstructions, probeRegistrationDomain } from "./registration.ts";
 
 const commands = ["link", "on", "off", "allow", "deny", "push", "help"];
 const help = [
@@ -318,6 +318,13 @@ export default function larkBot(pi: ExtensionAPI): void {
           // Configuration may have changed during the confirmation dialog.
           config = await loadConfig(stateDir);
           if (!config || (restoreAppId !== undefined && config.appId !== restoreAppId)) throw new Error("Configuration changed. Check and retry.");
+          if (!config.domain) {
+            const domain = await probeRegistrationDomain(config, config.brand);
+            if (domain) {
+              config = { ...config, domain };
+              await writePrivateJson(join(stateDir, "config.json"), config);
+            }
+          }
           // A queued automatic start must not undo an off completed while it waited for the lock.
           if (automatic && !await enabledFor(stateDir, config.appId)) { await stop(); return; }
           const [{ LarkTransport }, { HerdrWorkers }, { BotController }] = await Promise.all([

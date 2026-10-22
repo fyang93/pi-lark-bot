@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Input, Text, matchesKey } from "@earendil-works/pi-tui";
-import { probeRegistrationDomain, registerBot } from "./registration.ts";
+import { registerBot } from "./registration.ts";
 import type { BotConfig } from "./types.ts";
 import { validateConfig } from "./storage.ts";
 import { renderQrCode } from "./qr.ts";
@@ -44,9 +44,7 @@ export async function connectBot(ctx: ExtensionContext, signal: AbortSignal): Pr
     if (!appId || signal.aborted) return;
     const appSecret = await secretInput(ctx, signal);
     if (!appSecret || signal.aborted) return;
-    const credentials = { appId: appId.trim(), appSecret: appSecret.trim() };
-    const domain = await probeRegistrationDomain(credentials, brand);
-    return validateConfig({ version: 1, brand, domain, ...credentials });
+    return validateConfig({ version: 1, brand, appId: appId.trim(), appSecret: appSecret.trim() });
   }
 
   const brand = "feishu" as const;
@@ -74,8 +72,7 @@ export async function connectBot(ctx: ExtensionContext, signal: AbortSignal): Pr
       },
     }).then(async (result) => {
       if (finished) return;
-      const domain = await probeRegistrationDomain(result, result.brand);
-      finish(validateConfig({ version: 1, brand: result.brand, domain, appId: result.appId,
+      finish(validateConfig({ version: 1, brand: result.brand, appId: result.appId,
         appSecret: result.appSecret }));
     }).catch(() => {
       if (finished) return;

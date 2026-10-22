@@ -25,7 +25,7 @@ export interface RegisteredBot {
   domain?: RegistrationBrand;
 }
 
-export async function probeRegistrationDomain(config: Pick<RegisteredBot, "appId" | "appSecret">, preferred: RegistrationBrand): Promise<RegistrationBrand> {
+export async function probeRegistrationDomain(config: Pick<RegisteredBot, "appId" | "appSecret">, preferred: RegistrationBrand): Promise<RegistrationBrand | undefined> {
   const domains: RegistrationBrand[] = [preferred, preferred === "lark" ? "feishu" : "lark"];
   for (const domain of domains) {
     try {
@@ -36,10 +36,10 @@ export async function probeRegistrationDomain(config: Pick<RegisteredBot, "appId
       });
       const body = await response.json() as any;
       if (body?.code === 0 && typeof body.data?.URL === "string") return domain;
-      if (body?.code !== 1000040351) break;
-    } catch { /* try the alternate region only for a bounded probe */ }
+      if (body?.code !== 1000040351) return undefined;
+    } catch { return undefined; }
   }
-  return preferred;
+  return undefined;
 }
 
 const OPEN_DOMAINS: Record<RegistrationBrand, string> = {
