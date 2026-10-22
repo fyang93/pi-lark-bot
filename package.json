@@ -25,7 +25,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.74.0",
+    "@larksuiteoapi/node-sdk": "^1.76.0",
     "qrcode": "^1.5.4"
   },
   "peerDependencies": {
