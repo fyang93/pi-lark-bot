@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Input, Text, matchesKey } from "@earendil-works/pi-tui";
-import { registerBot } from "./registration.ts";
+import { probeRegistrationDomain, registerBot } from "./registration.ts";
 import type { BotConfig } from "./types.ts";
 import { validateConfig } from "./storage.ts";
 import { renderQrCode } from "./qr.ts";
@@ -32,21 +32,22 @@ async function secretInput(ctx: ExtensionContext, signal: AbortSignal): Promise<
 }
 
 export async function connectBot(ctx: ExtensionContext, signal: AbortSignal): Promise<BotConfig | undefined> {
-  const brandChoice = await ctx.ui.select("Platform", ["Feishu", "Lark"], { signal });
-  if (!brandChoice || signal.aborted) return;
-  const brand = brandChoice === "Feishu" ? "feishu" : "lark";
   const mode = await ctx.ui.select("Connect bot (project-local; does not start listening)", [
     "Register a new bot (recommended)", "Connect an existing bot with a QR code", "Enter existing App ID / App Secret",
   ], { signal });
   if (!mode || signal.aborted) return;
   if (mode.startsWith("Enter")) {
+    const brandChoice = await ctx.ui.select("Platform", ["Feishu", "Lark"], { signal });
+    if (!brandChoice || signal.aborted) return;
+    const brand = brandChoice === "Feishu" ? "feishu" : "lark";
     const appId = await ctx.ui.input("App ID", "cli_…", { signal });
     if (!appId || signal.aborted) return;
     const appSecret = await secretInput(ctx, signal);
     if (!appSecret || signal.aborted) return;
-    return validateConfig({ version: 1, brand, appId: appId.trim(), appSecret: appSecret.trim() });
+    return validateConfig({ version: 1, brand, domain: brand, appId: appId.trim(), appSecret: appSecret.trim() });
   }
 
+  const brand = "feishu" as const;
   const connectExisting = mode.startsWith("Connect an existing");
   return ctx.ui.custom<BotConfig | undefined>((tui, _theme, _keys, done) => {
     const controller = new AbortController();
@@ -69,9 +70,10 @@ export async function connectBot(ctx: ExtensionContext, signal: AbortSignal): Pr
         text = `Use Lark / Feishu to scan this official QR code to ${action} (expires in ${expiresIn}s):\n\n${renderQrCode(url)}\n\nWaiting for authorization… · Esc to cancel\nIf the code wraps, widen the terminal; alternatively open:\n${url}\n\nCredentials are saved only in this project, not the system keychain.`;
         tui.requestRender();
       },
-    }).then((result) => {
+    }).then(async (result) => {
       if (finished) return;
-      finish(validateConfig({ version: 1, brand: result.brand, appId: result.appId,
+      const domain = await probeRegistrationDomain(result, result.brand);
+      finish(validateConfig({ version: 1, brand: result.brand, domain, appId: result.appId,
         appSecret: result.appSecret }));
     }).catch(() => {
       if (finished) return;

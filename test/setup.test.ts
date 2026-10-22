@@ -6,7 +6,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 function context(custom: (factory: any) => Promise<unknown>) {
   let selected = 0;
   return { ui: {
-    async select() { return selected++ === 0 ? "Feishu" : "Enter existing App ID / App Secret"; },
+    async select() { return selected++ === 0 ? "Enter existing App ID / App Secret" : "Feishu"; },
     async input() { return "cli_test"; },
     custom,
   } } as unknown as ExtensionCommandContext;

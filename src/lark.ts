@@ -53,13 +53,12 @@ export class LarkTransport implements BotTransport {
     attachmentCacheDir?: string,
   ) {
     if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
-    // Use explicit API hosts: the SDK enum is numeric (Feishu === 0), and
-    // Lark long-connection discovery is region-bound.
-    const domain = config.brand === "lark" ? "https://open.larksuite.com" : "https://open.feishu.cn";
+    // Product brand and the app's long-connection region can differ.
+    const domain = (config.domain ?? config.brand) === "lark" ? "https://open.larksuite.com" : "https://open.feishu.cn";
     // Generated endpoint methods' second parameter is IRequestOptions, not an
     // Axios config, so a timeout there is ignored. This wrapper bounds normal
     // API calls, tenant-token exchange, and WS endpoint discovery for real SDKs.
-    const httpInstance = boundedHttp(sdk.defaultHttpInstance);
+    const httpInstance = boundedHttp(sdk.defaultHttpInstance, domain);
     const common = { appId: config.appId, appSecret: config.appSecret, domain, httpInstance, logger: silentLogger, loggerLevel: 0 };
     this.client = new sdk.Client(common);
     this.attachmentCache = attachmentCacheDir ? new AttachmentCache(attachmentCacheDir) : undefined;
@@ -341,8 +340,11 @@ export class LarkTransport implements BotTransport {
   }
 }
 
-function boundedHttp(http: LarkSdk["defaultHttpInstance"]): LarkSdk["defaultHttpInstance"] | undefined {
+function boundedHttp(http: LarkSdk["defaultHttpInstance"], domain: string): LarkSdk["defaultHttpInstance"] | undefined {
   if (!http) return undefined; // enables minimal SDK test doubles
+  const primaryEndpoint = `${domain}/callback/ws/endpoint`;
+  const fallbackEndpoint = `${domain === "https://open.larksuite.com" ? "https://open.feishu.cn" : "https://open.larksuite.com"}/callback/ws/endpoint`;
+  let wsEndpoint = primaryEndpoint;
   const options = (value: Record<string, unknown> = {}) => ({
     ...value, timeout: Math.min(Number(value.timeout) || API_TIMEOUT_MS, API_TIMEOUT_MS),
   });
@@ -352,7 +354,15 @@ function boundedHttp(http: LarkSdk["defaultHttpInstance"]): LarkSdk["defaultHttp
     get(target, key, receiver) {
       const method = Reflect.get(target, key, receiver);
       if (typeof method !== "function") return method;
-      if (key === "request") return (value: Record<string, unknown>) => method.call(target, options(value));
+      if (key === "request") return async (value: Record<string, unknown>) => {
+        if (value.url !== primaryEndpoint) return method.call(target, options(value));
+        const result = await method.call(target, options({ ...value, url: wsEndpoint }));
+        // Retry only an explicit region mismatch, never auth/network errors or ordinary API calls.
+        if (result?.code !== 1000040351 || wsEndpoint !== primaryEndpoint) return result;
+        const fallback = await method.call(target, options({ ...value, url: fallbackEndpoint }));
+        if (fallback?.code === 0) wsEndpoint = fallbackEndpoint;
+        return fallback;
+      };
       if (key === "get" || key === "delete" || key === "head" || key === "options") {
         return (url: string, value?: Record<string, unknown>) => method.call(target, url, options(value));
       }

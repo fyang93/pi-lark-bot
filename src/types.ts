@@ -1,6 +1,8 @@
 export interface BotConfig {
   version: 1;
   brand: "feishu" | "lark";
+  /** Region used for long-connection discovery; defaults to brand for old configs. */
+  domain?: "feishu" | "lark";
   appId: string;
   appSecret: string;
 }

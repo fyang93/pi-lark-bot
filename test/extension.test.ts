@@ -265,7 +265,7 @@ test("link only shows a permission dialog when grants are missing or unknown", a
         const h = harness(cwd);
         let choice = 0;
         const dialogs: string[] = [];
-        h.ctx.ui.select = async () => choice++ === 0 ? "Feishu" : "Enter existing App ID / App Secret";
+        h.ctx.ui.select = async () => choice++ === 0 ? "Enter existing App ID / App Secret" : "Feishu";
         h.ctx.ui.input = async () => "cli_test";
         h.ctx.ui.confirm = async (_title, body) => { dialogs.push(body); return true; };
         h.ctx.ui.custom = (async (factory: any) => new Promise((resolve) => {

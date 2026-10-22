@@ -284,6 +284,63 @@ test("real SDK Client sends tenant-token and message HTTP through the timeout wr
   assert.equal(sends[0].data.uuid, sends[1].data.uuid);
 });
 
+test("real SDK discovers the alternate WS region and reuses it without changing the brand or REST domain", async () => {
+  const fake = fakeSdk();
+  const requests: any[] = [];
+  (fake.sdk as any).defaultHttpInstance.request = async (options: any) => {
+    requests.push(options);
+    return options.url.startsWith("https://open.larksuite.com")
+      ? { code: 1000040351, msg: "Incorrect domain name", data: {} }
+      : { code: 0, data: { URL: "wss://example.invalid/ws?device_id=1&service_id=2", ClientConfig: {} } };
+  };
+  new LarkTransport(config, undefined, fake.sdk);
+  const ws = new ActualLark.WSClient(fake.clientOptions());
+  try {
+    assert.equal((await (ws as any).pullConnectConfig()).ok, true);
+    assert.equal((await (ws as any).pullConnectConfig()).ok, true);
+    assert.deepEqual(requests.map((request) => request.url), [
+      "https://open.larksuite.com/callback/ws/endpoint",
+      "https://open.feishu.cn/callback/ws/endpoint",
+      "https://open.feishu.cn/callback/ws/endpoint",
+    ]);
+    assert(requests.every((request) => request.data.AppID === config.appId && request.data.AppSecret === config.appSecret));
+    assert(requests.every((request) => request.timeout === 10_000));
+    assert.equal(config.brand, "lark");
+    assert.equal(fake.clientOptions().domain, "https://open.larksuite.com");
+  } finally { ws.close({ force: true }); }
+});
+
+test("WS region fallback is bidirectional, bounded, and excludes other errors and REST calls", async () => {
+  const fake = fakeSdk();
+  const urls: string[] = [];
+  let code = 1000040351;
+  let networkFailure = false;
+  (fake.sdk as any).defaultHttpInstance.request = async (options: any) => {
+    urls.push(options.url);
+    if (networkFailure) throw new Error("network failure");
+    return { code };
+  };
+  new LarkTransport({ ...config, brand: "feishu" }, undefined, fake.sdk);
+  const http = fake.clientOptions().httpInstance;
+  const endpoint = "https://open.feishu.cn/callback/ws/endpoint";
+  assert.deepEqual(await http.request({ url: endpoint }), { code });
+  assert.deepEqual(urls.splice(0), [endpoint, "https://open.larksuite.com/callback/ws/endpoint"], "both domains fail: only one retry");
+  code = 1000040343;
+  assert.deepEqual(await http.request({ url: endpoint }), { code });
+  assert.deepEqual(urls.splice(0), [endpoint], "do not retry credentials/permission errors");
+  networkFailure = true;
+  await assert.rejects(http.request({ url: endpoint }), /network failure/);
+  assert.deepEqual(urls.splice(0), [endpoint]);
+  networkFailure = false;
+  code = 1000040351;
+  const rest = "https://open.feishu.cn/open-apis/bot/v3/info";
+  await http.request({ url: rest });
+  assert.deepEqual(urls.splice(0), [rest], "do not reroute REST calls");
+  code = 0;
+  await http.request({ url: endpoint });
+  assert.deepEqual(urls.splice(0), [endpoint], "normal Feishu connections are unchanged");
+});
+
 test("the WebSocket client is constructed exactly as the shipping version did", async () => {
   let wsOptions: any, clientOptions: any;
   const fake = fakeSdk();

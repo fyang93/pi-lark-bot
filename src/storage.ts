@@ -47,7 +47,7 @@ export function validateConfig(value: unknown): BotConfig {
     typeof c.appSecret !== "string" || !c.appSecret.trim() || c.appSecret.length > 4096) {
     throw new Error("Invalid bot config: expected brand, cli_ appId and appSecret.");
   }
-  return { version: 1, brand: c.brand!, appId: c.appId, appSecret: c.appSecret };
+  return { version: 1, brand: c.brand!, ...(c.domain === "feishu" || c.domain === "lark" ? { domain: c.domain } : {}), appId: c.appId, appSecret: c.appSecret };
 }
 
 export async function loadConfig(stateDir: string): Promise<BotConfig | undefined> {

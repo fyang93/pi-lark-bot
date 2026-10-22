@@ -22,6 +22,24 @@ export interface RegisteredBot {
   appId: string;
   appSecret: string;
   brand: RegistrationBrand;
+  domain?: RegistrationBrand;
+}
+
+export async function probeRegistrationDomain(config: Pick<RegisteredBot, "appId" | "appSecret">, preferred: RegistrationBrand): Promise<RegistrationBrand> {
+  const domains: RegistrationBrand[] = [preferred, preferred === "lark" ? "feishu" : "lark"];
+  for (const domain of domains) {
+    try {
+      const response = await fetch(`https://${DOMAINS[domain]}/callback/ws/endpoint`, {
+        method: "POST", headers: { "content-type": "application/json", locale: "zh" },
+        body: JSON.stringify({ AppID: config.appId, AppSecret: config.appSecret }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      const body = await response.json() as any;
+      if (body?.code === 0 && typeof body.data?.URL === "string") return domain;
+      if (body?.code !== 1000040351) break;
+    } catch { /* try the alternate region only for a bounded probe */ }
+  }
+  return preferred;
 }
 
 const DOMAINS: Record<RegistrationBrand, string> = {
