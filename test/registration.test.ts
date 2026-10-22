@@ -83,16 +83,18 @@ test("connects an existing app through its QR authorization", async () => {
   assert.equal(qrUrl.searchParams.has("createOnly"), false);
 });
 
-test("switches to Lark polling domain", async () => {
+test("bootstraps Lark authorization on Feishu then switches polling to Lark", async () => {
   const urls: string[] = [];
   let n = 0;
   globalThis.fetch = (async (input) => {
     urls.push(String(input)); n++;
-    return n === 1 ? response({ verification_uri_complete: "https://open.feishu.cn/v", device_code: "d", expires_in: 60, interval: 0.001 })
+    return n === 1 ? response({ verification_uri_complete: "https://open.larksuite.com/v", device_code: "d", expires_in: 60, interval: 0.001 })
       : response(n === 2 ? { user_info: { tenant_brand: "lark" }, error: "authorization_pending" } : { client_id: "cli_l", client_secret: "s", user_info: { tenant_brand: "lark" } }, n === 2 ? 400 : 200);
   }) as typeof fetch;
-  const result = await registerBot({ brand: "feishu", signal: new AbortController().signal, onUrl: () => {} });
+  const result = await registerBot({ brand: "lark", signal: new AbortController().signal, onUrl: () => {} });
   assert.equal(result.brand, "lark");
+  assert.equal(urls[0]!.startsWith("https://accounts.feishu.cn/"), true);
+  assert.equal(urls[1]!.startsWith("https://accounts.feishu.cn/"), true);
   assert.equal(urls[2]!.startsWith("https://accounts.larksuite.com/"), true);
 });
 

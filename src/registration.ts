@@ -169,7 +169,8 @@ export async function registerBot(options: RegisterBotOptions): Promise<Register
   if (brand !== "feishu" && brand !== "lark") throw new Error("Unsupported registration brand");
   if (signal.aborted) throw abortError();
 
-  let baseUrl = `https://${DOMAINS[brand]}`;
+  // Registration always starts on the Feishu endpoint; polling discovers a Lark tenant and switches domains.
+  let baseUrl = `https://${DOMAINS.feishu}`;
   const begin = await request(baseUrl, {
     action: "begin", archetype: "PersonalAgent", auth_method: "client_secret", request_user_info: "open_id tenant_brand",
   }, signal);
