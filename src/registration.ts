@@ -29,7 +29,7 @@ export async function probeRegistrationDomain(config: Pick<RegisteredBot, "appId
   const domains: RegistrationBrand[] = [preferred, preferred === "lark" ? "feishu" : "lark"];
   for (const domain of domains) {
     try {
-      const response = await fetch(`https://${DOMAINS[domain]}/callback/ws/endpoint`, {
+      const response = await fetch(`https://${OPEN_DOMAINS[domain]}/callback/ws/endpoint`, {
         method: "POST", headers: { "content-type": "application/json", locale: "zh" },
         body: JSON.stringify({ AppID: config.appId, AppSecret: config.appSecret }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -42,6 +42,10 @@ export async function probeRegistrationDomain(config: Pick<RegisteredBot, "appId
   return preferred;
 }
 
+const OPEN_DOMAINS: Record<RegistrationBrand, string> = {
+  feishu: "open.feishu.cn",
+  lark: "open.larksuite.com",
+};
 const DOMAINS: Record<RegistrationBrand, string> = {
   feishu: "accounts.feishu.cn",
   lark: "accounts.larksuite.com",

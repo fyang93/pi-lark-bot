@@ -44,7 +44,9 @@ export async function connectBot(ctx: ExtensionContext, signal: AbortSignal): Pr
     if (!appId || signal.aborted) return;
     const appSecret = await secretInput(ctx, signal);
     if (!appSecret || signal.aborted) return;
-    return validateConfig({ version: 1, brand, domain: brand, appId: appId.trim(), appSecret: appSecret.trim() });
+    const credentials = { appId: appId.trim(), appSecret: appSecret.trim() };
+    const domain = await probeRegistrationDomain(credentials, brand);
+    return validateConfig({ version: 1, brand, domain, ...credentials });
   }
 
   const brand = "feishu" as const;

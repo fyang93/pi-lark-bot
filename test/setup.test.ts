@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { connectBot } from "../src/setup.ts";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
+const originalFetch = globalThis.fetch;
+test.afterEach(() => { globalThis.fetch = originalFetch; });
+
 function context(custom: (factory: any) => Promise<unknown>) {
   let selected = 0;
   return { ui: {
@@ -13,6 +16,7 @@ function context(custom: (factory: any) => Promise<unknown>) {
 }
 
 test("manual secret input is masked and never dispatched as a pi message", async () => {
+  globalThis.fetch = (async () => new Response(JSON.stringify({ code: 0, data: { URL: "wss://redacted.invalid" } }))) as typeof fetch;
   const controller = new AbortController();
   const ctx = context((factory) => new Promise((resolve) => {
     const component = factory({ requestRender() {} }, {}, {}, resolve);
@@ -26,6 +30,7 @@ test("manual secret input is masked and never dispatched as a pi message", async
   const result = await connectBot(ctx, controller.signal);
   assert.equal(result?.appSecret, "very-private-secret");
   assert.equal(result?.appId, "cli_test");
+  assert.equal(result?.domain, "feishu");
 });
 
 test("shutdown aborts manual secret dialog and discards the configuration", async () => {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { gunzipSync } from "node:zlib";
-import { missingBotPermissions, permissionInstructions, registerBot } from "../src/registration.ts";
+import { missingBotPermissions, permissionInstructions, probeRegistrationDomain, registerBot } from "../src/registration.ts";
 
 const originalFetch = globalThis.fetch;
 function response(body: unknown, status = 200): Response {
@@ -35,6 +35,22 @@ test("registers with begin, addon URL, pending poll, and returns credentials", a
   assert.equal(permissionUrl.searchParams.get("clientID"), result.appId);
   assert.deepEqual(permissionUrl.searchParams.get("scopes")!.split(","), addons.scopes.tenant);
   assert(!permissionUrl.href.includes(result.appSecret));
+});
+
+test("probes the actual Open API domains and selects the one accepting WS config", async () => {
+  const urls: string[] = [];
+  globalThis.fetch = (async (input) => {
+    urls.push(String(input));
+    return response(urls.length === 1
+      ? { code: 1000040351, msg: "Incorrect domain name" }
+      : { code: 0, data: { URL: "wss://redacted.invalid" } });
+  }) as typeof fetch;
+  const domain = await probeRegistrationDomain({ appId: "cli_lark", appSecret: "secret" }, "lark");
+  assert.equal(domain, "feishu");
+  assert.deepEqual(urls, [
+    "https://open.larksuite.com/callback/ws/endpoint",
+    "https://open.feishu.cn/callback/ws/endpoint",
+  ]);
 });
 
 test("permission checks distinguish tenant grants, missing grants and an unavailable check", async () => {
