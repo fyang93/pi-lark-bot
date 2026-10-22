@@ -356,7 +356,7 @@ export default function larkBot(pi: ExtensionAPI): void {
             onNotice: (text) => { if (!shuttingDown) ctx.ui.notify(text, "info"); },
             onStatus: () => {
               if (shuttingDown) return;
-              ctx.ui.setStatus("lark-bot", ctx.ui.theme.fg("accent", `🐤 ${brand}`));
+              ctx.ui.setStatus("lark-bot", controller?.status.active ? ctx.ui.theme.fg("accent", `🐤 ${brand}`) : undefined);
             },
           });
           transport.setCardActionHandler((messageId, chatId, operatorId, value) => instance.handleModelCardAction(messageId, chatId, operatorId, value));
