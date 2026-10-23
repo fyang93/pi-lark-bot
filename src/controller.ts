@@ -484,7 +484,7 @@ export class BotController {
     const { signal } = abort;
 
     try {
-      if (transport.prepareMessage && message.parentMessageId) message = await transport.prepareMessage(message);
+      if (transport.prepareMessage && (message.parentMessageId || message.resourceReferences?.length)) message = await transport.prepareMessage(message);
       signal.throwIfAborted();
       if (!this.active) return;
       if (message.unsupported === "empty_text") {

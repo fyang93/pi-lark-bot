@@ -20,6 +20,8 @@ export interface IncomingMessage {
   mentionedBot?: boolean;
   /** The directly quoted/replied-to message, if any. */
   parentMessageId?: string;
+  /** Resources embedded in a rich post message; resolved after authorization. */
+  resourceReferences?: Array<{ key: string; name: string; type: "file" | "image"; apiType: "file" | "image" }>;
   /** Text of the directly quoted/replied-to message, resolved after authorization. */
   quotedText?: string;
   attachments?: IncomingAttachment[];

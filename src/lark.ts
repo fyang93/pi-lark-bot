@@ -125,43 +125,39 @@ export class LarkTransport implements BotTransport {
 
   /** Resolve directly quoted resources after authorization; one failed resource never drops the text request. */
   async prepareMessage(message: IncomingMessage): Promise<IncomingMessage> {
-    if (!message.parentMessageId) return message;
-    let item: any;
-    try {
-      // Without this parameter, Lark may return an upgrade placeholder for 2.0 cards.
-      // https://open.feishu.cn/document/server-docs/im-v1/message/get
-      const response = await this.request(() => this.client.im.v1.message.get({
-        path: { message_id: message.parentMessageId }, params: { card_msg_content_type: "user_card_content" },
-      }));
-      item = response?.data?.items?.find((candidate: any) => candidate?.message_id === message.parentMessageId);
-    } catch {
-      return { ...message, preparationWarning: "referenced_message_unavailable" };
+    if (!message.parentMessageId && !message.resourceReferences?.length) return message;
+    let candidates: ReferencedResource[] = message.resourceReferences?.map((resource) => ({ ...resource })) ?? [];
+    let sourceMessageId = message.id;
+    let base = message;
+    if (message.parentMessageId) {
+      let item: any;
+      try {
+        const response = await this.request(() => this.client.im.v1.message.get({
+          path: { message_id: message.parentMessageId }, params: { card_msg_content_type: "user_card_content" },
+        }));
+        item = response?.data?.items?.find((candidate: any) => candidate?.message_id === message.parentMessageId);
+      } catch { return { ...message, preparationWarning: "referenced_message_unavailable" }; }
+      if (!item || item.chat_id !== message.chatId || typeof item.body?.content !== "string") return message;
+      let content: any;
+      try { content = JSON.parse(item.body.content); } catch { return message; }
+      const quotedText = quotedMessageText(content);
+      base = quotedText ? { ...message, quotedText } : message;
+      candidates = referencedResources(item.msg_type, content);
+      sourceMessageId = message.parentMessageId;
     }
-    if (!item || item.chat_id !== message.chatId || typeof item.body?.content !== "string") return message;
-    let content: any;
-    try { content = JSON.parse(item.body.content); } catch { return message; }
-    const quotedText = quotedMessageText(content);
-    const base = quotedText ? { ...message, quotedText } : message;
-    if (!this.attachmentCache) return base;
-    const candidates = referencedResources(item.msg_type, content);
-    if (!candidates.length) return base;
+    if (!this.attachmentCache || !candidates.length) return base;
     const attachments: NonNullable<IncomingMessage["attachments"]> = [];
     for (const candidate of candidates) {
       try {
-        const cached = await this.attachmentCache.get(
-          `${this.config.appId}\0${message.parentMessageId}\0${candidate.key}`,
-          candidate.name,
-          async () => {
-            const resource = await this.downloadResource(message.parentMessageId!, candidate.key, candidate.apiType);
-            const length = Number(resource.headers?.["content-length"] ?? resource.headers?.["Content-Length"]);
-            if (Number.isFinite(length) && length > MAX_ATTACHMENT_BYTES) throw new Error("Referenced resource is larger than 100 MB");
-            return resource.getReadableStream() as AsyncIterable<Uint8Array | string>;
-          },
-        );
-        attachments.push({ status: "ready", type: candidate.type, ...cached, sourceMessageId: message.parentMessageId });
+        const cached = await this.attachmentCache.get(`${this.config.appId}\0${sourceMessageId}\0${candidate.key}`, candidate.name, async () => {
+          const resource = await this.downloadResource(sourceMessageId, candidate.key, candidate.apiType);
+          const length = Number(resource.headers?.["content-length"] ?? resource.headers?.["Content-Length"]);
+          if (Number.isFinite(length) && length > MAX_ATTACHMENT_BYTES) throw new Error("Referenced resource is larger than 100 MB");
+          return resource.getReadableStream() as AsyncIterable<Uint8Array | string>;
+        });
+        attachments.push({ status: "ready", type: candidate.type, ...cached, sourceMessageId });
       } catch {
-        attachments.push({ status: "failed", type: candidate.type, name: candidate.name,
-          sourceMessageId: message.parentMessageId, error: "download_failed" });
+        attachments.push({ status: "failed", type: candidate.type, name: candidate.name, sourceMessageId, error: "download_failed" });
       }
     }
     return { ...base, attachments };
@@ -274,24 +270,27 @@ export class LarkTransport implements BotTransport {
     // controller answers it after the allowlist check, so an unauthorized
     // sender still gets no more than the usual refusal.
     const deliver = (text: string, unsupported?: IncomingMessage["unsupported"]) => this.dispatch(message, userId, text, group, unsupported);
-    if (message.message_type !== "text") return deliver(`(${message.message_type})`, "message_type");
+    if (!["text", "post"].includes(message.message_type)) return deliver(`(${message.message_type})`, "message_type");
     let content: unknown;
     try { content = JSON.parse(message.content); } catch { return deliver("(unparsable)", "content"); }
-    if (!content || typeof (content as { text?: unknown }).text !== "string") return deliver("(no text)", "content");
-    let text = (content as { text: string }).text;
+    const parsed = message.message_type === "post" ? parsePost(content) : parseText(content);
+    let text = parsed.text;
     for (const key of mentionKeys) if (text.includes(key)) text = text.split(key).join("");
     text = text.trim();
-    if (!text) return deliver("(empty)", "empty_text");
-    return deliver(text);
+    if (!text && !parsed.resources.length) return deliver("(empty)", "empty_text");
+    return this.dispatch(message, userId, text, group, undefined, parsed.resources);
   }
 
-  private async dispatch(message: any, userId: string, text: string, group: boolean, unsupported?: IncomingMessage["unsupported"]): Promise<void> {
+  private async dispatch(message: any, userId: string, text: string, group: boolean, unsupported?: IncomingMessage["unsupported"], resources: ReferencedResource[] = []): Promise<void> {
     // The SDK only hands over an event across a live connection, so what
     // matters is whether this transport was stopped, not which phase of the
     // connection lifecycle a status flag happens to hold.
     if (this._state === "stopped" || !this.onMessage) return;
     try {
       await this.onMessage({ id: message.message_id, userId, chatId: message.chat_id, text,
+        ...(resources.length ? { resourceReferences: resources.map((resource) => ({ key: resource.key, name: resource.name,
+          type: resource.type === "image" ? "image" as const : "file" as const,
+          apiType: resource.apiType === "image" ? "image" as const : "file" as const })) } : {}),
         ...(unsupported ? { unsupported } : {}),
         ...(typeof message.parent_id === "string" && message.parent_id ? { parentMessageId: message.parent_id } : {}),
         ...(group ? { chatType: "group" as const, mentionedBot: true } : {}) });
@@ -383,6 +382,35 @@ interface ReferencedResource {
   name: string;
   type: "file" | "image" | "audio" | "video";
   apiType: "file" | "image";
+}
+
+function parseText(value: unknown): { text: string; resources: ReferencedResource[] } {
+  const text = value && typeof value === "object" && typeof (value as any).text === "string" ? (value as any).text : "";
+  return { text, resources: [] };
+}
+
+function parsePost(value: unknown): { text: string; resources: ReferencedResource[] } {
+  const root = value && typeof value === "object" && !Array.isArray(value) ? value as any : {};
+  const locale = root.zh_cn ?? root.en_us ?? root.ja_jp ?? Object.values(root).find((item: any) => item && typeof item === "object");
+  const blocks = locale && Array.isArray(locale.content) ? locale.content : [];
+  const lines: string[] = [], resources: ReferencedResource[] = [];
+  if (typeof locale?.title === "string" && locale.title) lines.push(locale.title);
+  for (const block of blocks) {
+    if (!Array.isArray(block)) continue;
+    const parts: string[] = [];
+    for (const item of block) {
+      if (!item || typeof item !== "object") continue;
+      if (typeof item.text === "string") parts.push(item.text);
+      else if (item.tag === "img" && typeof item.image_key === "string") {
+        resources.push({ key: item.image_key, name: "image.bin", type: "image", apiType: "image" }); parts.push("[图片]");
+      } else if ((item.tag === "media" || item.tag === "file") && typeof item.file_key === "string") {
+        const name = typeof item.file_name === "string" && item.file_name ? item.file_name : "attachment.bin";
+        resources.push({ key: item.file_key, name, type: "file", apiType: "file" }); parts.push(`[文件: ${name}]`);
+      }
+    }
+    if (parts.join("")) lines.push(parts.join(""));
+  }
+  return { text: lines.join("\n"), resources };
 }
 
 function referencedResources(messageType: unknown, value: unknown): ReferencedResource[] {
