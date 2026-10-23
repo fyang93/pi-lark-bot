@@ -270,8 +270,15 @@ export class LarkTransport implements BotTransport {
     // controller answers it after the allowlist check, so an unauthorized
     // sender still gets no more than the usual refusal.
     const deliver = (text: string, unsupported?: IncomingMessage["unsupported"]) => this.dispatch(message, userId, text, group, unsupported);
-    if (!["text", "post"].includes(message.message_type)) return deliver(`(${message.message_type})`, "message_type");
     let content: unknown;
+    if (["file", "image"].includes(message.message_type)) {
+      try { content = JSON.parse(message.content); } catch { return deliver("(unparsable)", "content"); }
+      const resources = referencedResources(message.message_type, content);
+      if (!resources.length) return deliver(`(${message.message_type})`, "message_type");
+      // Keep the user's prompt empty; the attachment metadata is passed separately.
+      return this.dispatch(message, userId, "", group, undefined, resources);
+    }
+    if (!["text", "post"].includes(message.message_type)) return deliver(`(${message.message_type})`, "message_type");
     try { content = JSON.parse(message.content); } catch { return deliver("(unparsable)", "content"); }
     const parsed = message.message_type === "post" ? parsePost(content) : parseText(content);
     let text = parsed.text;

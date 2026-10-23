@@ -103,6 +103,19 @@ test("groups require a real bot mention; an addressed but empty prompt is answer
   } finally { await transport.stop(); }
 });
 
+test("accepts a standalone file and passes it as an attachment request", async () => {
+  const fake = fakeSdk(); const transport = new LarkTransport(config, undefined, fake.sdk);
+  const received: any[] = [];
+  const starting = transport.start(async (message) => { received.push(message); });
+  await fake.ready(); await starting;
+  try {
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_type: "file",
+      content: JSON.stringify({ file_key: "file-key", file_name: "form.xlsx" }) } });
+    assert.equal(received[0].text, "");
+    assert.deepEqual(received[0].resourceReferences, [{ key: "file-key", name: "form.xlsx", type: "file", apiType: "file" }]);
+  } finally { await transport.stop(); }
+});
+
 test("captures a reply parent and caches its file resource for the authorized controller", async () => {
   const root = await mkdtemp(join(tmpdir(), "lark-file-cache-"));
   const fake = fakeSdk();
