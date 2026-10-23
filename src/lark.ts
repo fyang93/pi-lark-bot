@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { BotConfig, BotTransport, IncomingMessage } from "./types.js";
 import { AttachmentCache, MAX_ATTACHMENT_BYTES } from "./attachment-cache.js";
@@ -30,8 +31,11 @@ const debugEnabled = process.env.PI_LARK_BOT_DEBUG === "1";
 
 function debugLog(event: string, value: unknown): void {
   if (!debugEnabled) return;
-  try { console.error(`[pi-lark-bot debug] ${event} ${JSON.stringify(value)}`); }
-  catch { console.error(`[pi-lark-bot debug] ${event}`); }
+  let line = `[pi-lark-bot debug] ${event}`;
+  try { line += ` ${JSON.stringify(value)}`; } catch { /* keep the event name */ }
+  try { console.error(line); } catch { /* diagnostics must not affect delivery */ }
+  try { appendFileSync(`${process.cwd()}/.pi/lark-bot/debug.log`, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 }); }
+  catch { /* the workspace may not have a writable state directory */ }
 }
 
 function withDetail(prefix: string, error: unknown): string {
