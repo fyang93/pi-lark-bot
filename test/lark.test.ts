@@ -116,6 +116,17 @@ test("accepts a standalone file and passes it as an attachment request", async (
   } finally { await transport.stop(); }
 });
 
+test("reports an unsupported post payload instead of treating it as an empty prompt", async () => {
+  const fake = fakeSdk(); const transport = new LarkTransport(config, undefined, fake.sdk);
+  const received: any[] = [];
+  const starting = transport.start(async (message) => { received.push(message); });
+  await fake.ready(); await starting;
+  try {
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_type: "post", content: JSON.stringify({ unknown: true }) } });
+    assert.deepEqual(received[0], { id: "om_1", userId: "ou_1", chatId: "oc_1", text: "(post content unavailable)", unsupported: "content" });
+  } finally { await transport.stop(); }
+});
+
 test("parses Feishu flat posts with an uploaded file", async () => {
   const fake = fakeSdk(); const transport = new LarkTransport(config, undefined, fake.sdk);
   const received: any[] = [];

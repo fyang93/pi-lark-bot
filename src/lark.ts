@@ -288,19 +288,39 @@ export class LarkTransport implements BotTransport {
     let content: unknown;
     if (["file", "image"].includes(message.message_type)) {
       try { content = JSON.parse(message.content); } catch { return deliver("(unparsable)", "content"); }
-      const resources = referencedResources(message.message_type, content);
+      let resources: ReferencedResource[];
+      try { resources = referencedResources(message.message_type, content); }
+      catch (error) {
+        debugLog("parse-error", { messageId: message.message_id, messageType: message.message_type,
+          error: error instanceof Error ? error.message : String(error) });
+        return deliver("(message content could not be parsed)", "content");
+      }
       if (!resources.length) return deliver(`(${message.message_type})`, "message_type");
       // Keep the user's prompt empty; the attachment metadata is passed separately.
       return this.dispatch(message, userId, "", group, undefined, resources);
     }
     if (!["text", "post"].includes(message.message_type)) return deliver(`(${message.message_type})`, "message_type");
     try { content = JSON.parse(message.content); } catch { return deliver("(unparsable)", "content"); }
-    const parsed = message.message_type === "post" ? parsePost(content) : parseText(content);
+    let parsed: { text: string; resources: ReferencedResource[] };
+    try {
+      parsed = message.message_type === "post" ? parsePost(content) : parseText(content);
+    } catch (error) {
+      // Parsing must never turn a received event into a silent drop.
+      debugLog("parse-error", { messageId: message.message_id, messageType: message.message_type,
+        error: error instanceof Error ? error.message : String(error) });
+      return deliver("(message content could not be parsed)", "content");
+    }
     debugLog("parsed", { messageId: message.message_id, text: parsed.text, resources: parsed.resources });
     let text = parsed.text;
     for (const key of mentionKeys) if (text.includes(key)) text = text.split(key).join("");
     text = text.trim();
-    if (!text && !parsed.resources.length) return deliver("(empty)", "empty_text");
+    if (!text && !parsed.resources.length) {
+      // An addressed post was received, but its payload shape is unsupported.
+      // Report that explicitly instead of misleading the user with the empty-mention hint.
+      return message.message_type === "post"
+        ? deliver("(post content unavailable)", "content")
+        : deliver("(empty)", "empty_text");
+    }
     return this.dispatch(message, userId, text, group, undefined, parsed.resources);
   }
 
