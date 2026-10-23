@@ -116,6 +116,21 @@ test("accepts a standalone file and passes it as an attachment request", async (
   } finally { await transport.stop(); }
 });
 
+test("parses Feishu flat posts with an uploaded file", async () => {
+  const fake = fakeSdk(); const transport = new LarkTransport(config, undefined, fake.sdk);
+  const received: any[] = [];
+  const starting = transport.start(async (message) => { received.push(message); });
+  await fake.ready(); await starting;
+  try {
+    await fake.emit({ ...textEvent, message: { ...textEvent.message, message_type: "post", content: JSON.stringify({
+      title: "", content: [[{ tag: "text", text: "帮我填一下", style: [] }]],
+      files: [{ file_key: "file-key", file_name: "form.xlsx" }],
+    }) } });
+    assert.equal(received[0].text, "帮我填一下");
+    assert.deepEqual(received[0].resourceReferences, [{ key: "file-key", name: "form.xlsx", type: "file", apiType: "file" }]);
+  } finally { await transport.stop(); }
+});
+
 test("captures a reply parent and caches its file resource for the authorized controller", async () => {
   const root = await mkdtemp(join(tmpdir(), "lark-file-cache-"));
   const fake = fakeSdk();

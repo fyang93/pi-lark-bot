@@ -414,7 +414,9 @@ function parseText(value: unknown): { text: string; resources: ReferencedResourc
 
 function parsePost(value: unknown): { text: string; resources: ReferencedResource[] } {
   const root = value && typeof value === "object" && !Array.isArray(value) ? value as any : {};
-  const locale = root.zh_cn ?? root.en_us ?? root.ja_jp ?? Object.values(root).find((item: any) => item && typeof item === "object");
+  // Feishu sends either a locale wrapper (zh_cn/en_us) or a flat post object.
+  const locale = root.zh_cn ?? root.en_us ?? root.ja_jp ?? (Array.isArray(root.content) ? root :
+    Object.values(root).find((item: any) => item && typeof item === "object" && Array.isArray(item.content)));
   const blocks = locale && Array.isArray(locale.content) ? locale.content : [];
   const lines: string[] = [], resources: ReferencedResource[] = [];
   if (typeof locale?.title === "string" && locale.title) lines.push(locale.title);
@@ -432,6 +434,14 @@ function parsePost(value: unknown): { text: string; resources: ReferencedResourc
       }
     }
     if (parts.join("")) lines.push(parts.join(""));
+  }
+  // Newer Feishu clients put uploaded files beside content rather than inside a
+  // rich-text block. They are still part of this one post request.
+  const files = Array.isArray(root.files) ? root.files : [];
+  for (const file of files) {
+    if (typeof file?.file_key !== "string" || !file.file_key) continue;
+    const name = typeof file.file_name === "string" && file.file_name ? file.file_name : "attachment.bin";
+    resources.push({ key: file.file_key, name, type: "file", apiType: "file" });
   }
   return { text: lines.join("\n"), resources };
 }
