@@ -26,6 +26,13 @@ const RETRYABLE_CODES = new Set([90002, 90013, 99991400, 99991663]);
 const silentLogger = Object.freeze({
   fatal() {}, error() {}, warn() {}, info() {}, debug() {}, trace() {},
 });
+const debugEnabled = process.env.PI_LARK_BOT_DEBUG === "1";
+
+function debugLog(event: string, value: unknown): void {
+  if (!debugEnabled) return;
+  try { console.error(`[pi-lark-bot debug] ${event} ${JSON.stringify(value)}`); }
+  catch { console.error(`[pi-lark-bot debug] ${event}`); }
+}
 
 function withDetail(prefix: string, error: unknown): string {
   const detail = error instanceof Error ? error.message.replace(/[\r\n]+/g, " ").slice(0, 240) : "";
@@ -243,6 +250,10 @@ export class LarkTransport implements BotTransport {
     if (typeof message?.message_id !== "string" || typeof message?.chat_id !== "string") return undefined;
     const userId = event.sender.sender_id?.open_id;
     if (typeof userId !== "string" || !userId) return undefined;
+    debugLog("incoming", {
+      messageId: message.message_id, chatId: message.chat_id, chatType: message.chat_type,
+      messageType: message.message_type, parentId: message.parent_id, content: message.content,
+    });
     const group = message.chat_type === "group";
 
     // Decide whether the message is addressed to this bot before judging its
@@ -281,6 +292,7 @@ export class LarkTransport implements BotTransport {
     if (!["text", "post"].includes(message.message_type)) return deliver(`(${message.message_type})`, "message_type");
     try { content = JSON.parse(message.content); } catch { return deliver("(unparsable)", "content"); }
     const parsed = message.message_type === "post" ? parsePost(content) : parseText(content);
+    debugLog("parsed", { messageId: message.message_id, text: parsed.text, resources: parsed.resources });
     let text = parsed.text;
     for (const key of mentionKeys) if (text.includes(key)) text = text.split(key).join("");
     text = text.trim();
