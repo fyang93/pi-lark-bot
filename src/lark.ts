@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, constants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
+import { basename, resolve } from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { BotConfig, BotTransport, IncomingMessage } from "./types.js";
-import { AttachmentCache, MAX_ATTACHMENT_BYTES } from "./attachment-cache.js";
+import { AttachmentCache, MAX_ATTACHMENT_BYTES, safeFilename } from "./attachment-cache.js";
 
 /** The SDK surface used here; exported so integration tests can supply a real-shaped fake. */
 export interface LarkSdk {
@@ -62,6 +64,7 @@ export class LarkTransport implements BotTransport {
     private readonly onError: (error: Error) => void = () => {},
     sdk: LarkSdk = Lark as unknown as LarkSdk,
     attachmentCacheDir?: string,
+    private readonly projectDir = process.cwd(),
   ) {
     if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
     // Product brand and the app's long-connection region can differ.
@@ -133,6 +136,44 @@ export class LarkTransport implements BotTransport {
   }
 
   async update(messageId: string, text: string): Promise<void> { await this.updateCard(messageId, card(text)); }
+
+  /** Upload a user-selected local file and send it as a native Feishu/Lark file message. */
+  async sendFile(chatId: string, inputPath: string, displayName?: string): Promise<string> {
+    const root = await realpath(this.projectDir);
+    // The user decides which readable local file to share. Relative paths are
+    // resolved from the workspace; absolute paths are accepted as-is.
+    const localPath = inputPath.startsWith("sandbox:") ? inputPath.slice("sandbox:".length) : inputPath;
+    const path = await realpath(resolve(root, localPath));
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let bytes: Buffer;
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.size === 0 || info.size > 30 * 1024 * 1024) throw new Error("File must be non-empty and no larger than 30 MB.");
+      bytes = Buffer.alloc(info.size);
+      let offset = 0;
+      while (offset < info.size) {
+        const { bytesRead } = await handle.read(bytes, offset, info.size - offset, offset);
+        if (!bytesRead) throw new Error("File changed while being read.");
+        offset += bytesRead;
+      }
+    } finally { await handle.close(); }
+    const fileName = safeFilename(displayName || basename(path));
+    const extension = fileName.toLowerCase().split(".").pop() ?? "";
+    const fileType = ({ pdf: "pdf", doc: "doc", docx: "doc", xls: "xls", xlsx: "xls", ppt: "ppt", pptx: "ppt", mp4: "mp4", opus: "opus" } as Record<string, string>)[extension] ?? "stream";
+    const uploaded = await this.request(async () => {
+      const result = await this.client.im.v1.file.create({ data: { file_type: fileType, file_name: fileName, file: bytes } });
+      return result?.file_key ? { code: 0, data: result } : result;
+    });
+    const fileKey = uploaded?.data?.file_key;
+    if (typeof fileKey !== "string" || !fileKey) throw this.failure();
+    const data = { msg_type: "file", content: JSON.stringify({ file_key: fileKey }), uuid: randomUUID() };
+    const response = await this.request(() => this.client.im.v1.message.create({
+      data: { ...data, receive_id: chatId }, params: { receive_id_type: "chat_id" },
+    }));
+    const id = response?.data?.message_id;
+    if (typeof id !== "string" || !id) throw this.failure();
+    return id;
+  }
 
   /** Resolve directly quoted resources after authorization; one failed resource never drops the text request. */
   async prepareMessage(message: IncomingMessage): Promise<IncomingMessage> {
@@ -387,9 +428,10 @@ function boundedHttp(http: LarkSdk["defaultHttpInstance"], domain: string): Lark
   const primaryEndpoint = `${domain}/callback/ws/endpoint`;
   const fallbackEndpoint = `${domain === "https://open.larksuite.com" ? "https://open.feishu.cn" : "https://open.larksuite.com"}/callback/ws/endpoint`;
   let wsEndpoint = primaryEndpoint;
-  const options = (value: Record<string, unknown> = {}) => ({
-    ...value, timeout: Math.min(Number(value.timeout) || API_TIMEOUT_MS, API_TIMEOUT_MS),
-  });
+  const options = (value: Record<string, unknown> = {}) => {
+    const maximum = typeof value.url === "string" && value.url.endsWith("/im/v1/files") && value.method === "POST" ? 60_000 : API_TIMEOUT_MS;
+    return { ...value, timeout: Math.min(Number(value.timeout) || maximum, maximum) };
+  };
   // Tenant token exchange calls HttpInstance.post(), whereas generated OpenAPI
   // methods call request(). Proxy both forms without changing SDK internals.
   return new Proxy(http, {

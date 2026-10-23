@@ -171,6 +171,17 @@ test("model turns do not receive chat identity system prompts", async (t) => {
   assert.equal(h.emit("before_agent_start", { systemPrompt: "base" }), undefined);
 });
 
+test("single file-send tool routes the path through controller IPC", { timeout: 3000 }, async (t) => {
+  const h = await harness(t);
+  const tool = h.tools.get("lark_send_file");
+  assert.ok(tool);
+  const result = tool.execute("call", { path: "/project/out.xlsx" });
+  const request = await h.until("request");
+  assert.deepEqual({ action: request.action, path: request.path }, { action: "send-file", path: "/project/out.xlsx" });
+  h.send({ type: "response", id: request.id, ok: true, text: "文件已发送" });
+  assert.match(JSON.stringify(await result), /文件已发送/);
+});
+
 test("push tools use controller IPC and do not carry chat credentials", { timeout: 3000 }, async (t) => {
   const h = await harness(t);
   const result = h.tools.get("lark_push").execute("call", { text: "notice" });

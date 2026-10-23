@@ -53,6 +53,7 @@ pi install -l git:github.com/fyang93/pi-lark-bot
    - `im:message.group_at_msg:readonly`
    - `im:message:readonly`
    - `im:message:update`
+   - `im:resource:upload`（发送文件附件）
 4. 使用 `/model` 按钮菜单时，启用回调订阅 `card.action.trigger`。
 5. 群聊使用前，将机器人加入群。
 
@@ -96,6 +97,8 @@ pi install -l git:github.com/fyang93/pi-lark-bot
 ### 主动推送
 
 在目标聊天里告诉机器人：“以后把消息推送到这里。”之后可让 pi 或 skill 使用 `lark_push` 主动发送通知、报告。
+
+当用户要求交付生成文件时，Pi 会调用唯一的文件发送工具 `lark_send_file`，代码将用户选择的本地文件上传并作为附件发送到当前聊天；支持任意普通文件，受飞书单文件 30 MB 上限约束。工具不会扫描或自动发送回复中提及的路径。
 
 每个项目只有一个推送目标，未设置时不能推送。同项目各本机 Pi 会话均可使用 `lark_push`；非监听会话经本机私有 IPC 交由唯一监听者处理，共享当前目标和每分钟 20 张的限流。监听者关闭或不可用时推送报错。单次推送最多 4 张卡片。
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -13,8 +13,8 @@ const config: BotConfig = { version: 1, brand: "lark", appId: "cli_123", appSecr
 function fakeSdk() {
   let handler: ((event: unknown) => Promise<void>) | undefined;
   let clientOptions: any;
-  const calls: { create: any[]; reply: any[]; patch: any[]; get: any[]; resource: any[]; start: number; close: any[]; http: any[] } = {
-    create: [], reply: [], patch: [], get: [], resource: [], start: 0, close: [], http: [],
+  const calls: { create: any[]; reply: any[]; patch: any[]; get: any[]; resource: any[]; uploads: any[]; start: number; close: any[]; http: any[] } = {
+    create: [], reply: [], patch: [], get: [], resource: [], uploads: [], start: 0, close: [], http: [],
   };
   let callbacks: Record<string, (() => void) | undefined> = {};
   let started!: () => void;
@@ -28,9 +28,10 @@ function fakeSdk() {
   const messageResource = {
     get: async (payload: unknown) => { calls.resource.push(payload); return { headers: {}, getReadableStream: () => Readable.from([]) }; },
   };
+  const file = { create: async (payload: unknown) => { calls.uploads.push(payload); return { file_key: "uploaded-file-key" }; } };
   class Client {
     constructor(options: any) { clientOptions = options; }
-    im = { v1: { message: api, messageResource } };
+    im = { v1: { message: api, messageResource, file } };
     async request(payload: any) { assert.equal(payload.url, "/open-apis/bot/v3/info"); return { code: 0, bot: { open_id: "ou_bot" } }; }
   }
   class EventDispatcher { constructor(_options?: any) {} register(handles: any) { handler = handles["im.message.receive_v1"]; } }
@@ -45,7 +46,7 @@ function fakeSdk() {
   };
   return {
     sdk: { Client, EventDispatcher, WSClient, defaultHttpInstance, Domain: { Feishu: "feishu", Lark: "lark" } } as unknown as LarkSdk,
-    calls, api, messageResource, clientOptions: () => clientOptions, emit: async (event: unknown) => handler?.(event),
+    calls, api, messageResource, file, clientOptions: () => clientOptions, emit: async (event: unknown) => handler?.(event),
     ready: async () => { await startEvent; callbacks.onReady?.(); }, error: () => callbacks.onError?.(),
     reconnecting: () => callbacks.onReconnecting?.(), reconnected: () => callbacks.onReconnected?.(),
   };
@@ -54,6 +55,25 @@ function fakeSdk() {
 const textEvent = { sender: { sender_type: "user", sender_id: { open_id: "ou_1" } }, message: {
   message_id: "om_1", chat_id: "oc_1", chat_type: "p2p", message_type: "text", content: '{"text":"hello"}',
 } };
+
+test("uploads and sends user-selected local files as native file messages", async () => {
+  const root = await mkdtemp(join(tmpdir(), "lark-send-file-"));
+  const outside = `${root}-outside.txt`;
+  await mkdir(join(root, "out"), { recursive: true });
+  await writeFile(join(root, "out", "report.xlsx"), Buffer.from("workbook"));
+  const fake = fakeSdk();
+  const transport = new LarkTransport(config, undefined, fake.sdk, undefined, root);
+  try {
+    assert.equal(await transport.sendFile("oc_1", `sandbox:${join(root, "out", "report.xlsx")}`), "out-1");
+    assert.deepEqual(fake.calls.uploads[0].data, {
+      file_type: "xls", file_name: "report.xlsx", file: Buffer.from("workbook"),
+    });
+    assert.equal(fake.calls.create[0].data.msg_type, "file");
+    assert.deepEqual(JSON.parse(fake.calls.create[0].data.content), { file_key: "uploaded-file-key" });
+    await writeFile(outside, "user selected this file");
+    assert.equal(await transport.sendFile("oc_1", outside), "out-1", "files outside the project are allowed when explicitly selected");
+  } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { force: true }); }
+});
 
 test("waits for readiness, filters messages, handles reconnect, and force-closes", async () => {
   const fake = fakeSdk();

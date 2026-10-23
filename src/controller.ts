@@ -421,6 +421,17 @@ export class BotController {
   async handleWorkerRequest(key: string, request: WorkerRequest): Promise<WorkerResponse> {
     if (!this.active) return { ok: false, text: "Lark 机器人当前未在监听。" };
     if (request.action === "push") return this.push(request.text);
+    if (request.action === "send-file") {
+      const chat = this.chats.get(key);
+      if (!chat || !this.options.transport.sendFile) return { ok: false, text: "当前聊天暂不支持发送文件。" };
+      try {
+        await this.options.transport.sendFile(chat.chatId, request.path, request.name);
+        return { ok: true, text: `文件已发送：${request.name ?? request.path}` };
+      } catch (error) {
+        this.onError(error);
+        return { ok: false, text: "文件发送失败。请确认文件可读取、非空且不超过 30 MB；失败后未自动重试。" };
+      }
+    }
     if (request.action === "target-status") return { ok: true, text: this.describeTarget() };
     if (request.action === "clear-target") {
       await this.setPushTarget(undefined);

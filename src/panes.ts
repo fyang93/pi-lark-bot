@@ -35,6 +35,11 @@ function parseRequest(message: any): WorkerRequest | undefined {
     return typeof message.text === "string" && message.text && Buffer.byteLength(message.text) <= MAX_REQUEST_TEXT
       ? { action: "push", text: message.text } : undefined;
   }
+  if (message.action === "send-file") {
+    return typeof message.path === "string" && message.path.length > 0 && message.path.length <= 4096 &&
+      (message.name === undefined || typeof message.name === "string" && message.name.length <= 240)
+      ? { action: "send-file", path: message.path, name: message.name } : undefined;
+  }
   return ["set-target", "clear-target", "target-status"].includes(message.action)
     ? { action: message.action } as WorkerRequest : undefined;
 }

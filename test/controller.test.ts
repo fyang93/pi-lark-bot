@@ -13,6 +13,7 @@ class FakeTransport implements BotTransport {
   sends: { chat: string; text: string; reply?: string }[] = [];
   updates: string[] = [];
   receiver?: (message: IncomingMessage) => Promise<void>;
+  sendFile?: (chat: string, path: string, name?: string) => Promise<string>;
   stopped = false;
   async start(receiver: (message: IncomingMessage) => Promise<void>) { this.receiver = receiver; }
   async stop() { this.stopped = true; }
@@ -498,6 +499,27 @@ test("rejected senders get a code the operator can allowlist, and the picker lis
     assert.equal(restored.listDenied().length, 0, "rejection history never outlives the listener");
     await restored.stop();
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("file delivery is routed to the originating chat and reports failures without retry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-send-file-controller-"));
+  const transport = new FakeTransport();
+  const files: Array<{ chat: string; path: string; name?: string }> = [];
+  transport.sendFile = async (chat: string, path: string, name?: string) => { files.push({ chat, path, name }); return "file-message"; };
+  const bot = new BotController({ config, stateDir: dir, transport, workers: {
+    async open() { return { async run() {}, async close() {} }; }, async close() {},
+  } });
+  try {
+    await bot.start();
+    await bot.receive({ ...msg("input", "ou_a"), chatId: "oc_user" }); await bot.drain();
+    const sent = await bot.handleWorkerRequest("ou_a", { action: "send-file", path: "/tmp/result.xlsx", name: "result.xlsx" });
+    assert.deepEqual(files, [{ chat: "oc_user", path: "/tmp/result.xlsx", name: "result.xlsx" }]);
+    assert.equal(sent.ok, true);
+    transport.sendFile = async () => { throw new Error("upload failed"); };
+    const failed = await bot.handleWorkerRequest("ou_a", { action: "send-file", path: "/tmp/result.xlsx" });
+    assert.equal(failed.ok, false);
+    assert.equal(files.length, 1, "failed sends are not retried");
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test("the push target is set from the worker's own chat, persists, and gates pushing", async () => {

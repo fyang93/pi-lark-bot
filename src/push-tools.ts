@@ -9,6 +9,8 @@ import type { WorkerResponse } from "./types.ts";
  */
 export interface PushToolHandlers {
   push(text: string, ctx: ExtensionContext): Promise<WorkerResponse>;
+  /** Only chat-bound workers supply this; the controller resolves the destination. */
+  sendFile?(path: string, name?: string): Promise<WorkerResponse>;
   /** Omitted for a session that belongs to no chat, where "set this chat" has no meaning. */
   target?(action: "set" | "clear" | "status"): Promise<WorkerResponse>;
 }
@@ -37,6 +39,19 @@ export function registerPushTools(pi: ExtensionAPI, handlers: PushToolHandlers):
       text: Type.String({ description: "Plain text to post. Write it so it makes sense to readers who cannot see this conversation." }),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => result(await handlers.push(params.text, ctx)),
+  });
+
+  if (handlers.sendFile) pi.registerTool({
+    name: "lark_send_file",
+    label: "Send File to This Chat",
+    description: "Upload a local file and send it as an attachment to this Feishu/Lark conversation. Use only when the user asks to receive a file. The user decides which file to share. Feishu/Lark upload limit is 30 MB per file. Do not use for the global push target.",
+    promptSnippet: "Send a user-selected local file to the current Feishu/Lark conversation",
+    promptGuidelines: ["When asked to deliver a generated file, call lark_send_file with its local project path. Do not claim delivery unless this tool succeeds."],
+    parameters: Type.Object({
+      path: Type.String({ description: "Absolute path or workspace-relative path to the file the user selected." }),
+      name: Type.Optional(Type.String({ description: "Optional filename shown to the recipient." })),
+    }),
+    execute: async (_toolCallId, params) => result(await handlers.sendFile!(params.path, params.name)),
   });
 
   if (!handlers.target) return;

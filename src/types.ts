@@ -53,6 +53,7 @@ export interface PushTarget {
 /** Worker-initiated request over the controller IPC socket. */
 export type WorkerRequest =
   | { action: "push"; text: string }
+  | { action: "send-file"; path: string; name?: string }
   | { action: "set-target" }
   | { action: "clear-target" }
   | { action: "target-status" };
@@ -90,6 +91,8 @@ export interface BotTransport {
   stop(): Promise<void>;
   send(chatId: string, text: string, replyTo?: string): Promise<string>;
   update(messageId: string, text: string): Promise<void>;
+  /** Upload and deliver a local project file as a Feishu/Lark file message. */
+  sendFile?(chatId: string, path: string, name?: string): Promise<string>;
   /** Resolve quoted resources only after sender authorization succeeds. */
   prepareMessage?(message: IncomingMessage): Promise<IncomingMessage>;
   sendCard?(chatId: string, card: object, replyTo?: string): Promise<string>;

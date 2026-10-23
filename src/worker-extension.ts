@@ -105,6 +105,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
 
   if (socketPath) registerPushTools(pi, {
     push: (value) => request({ action: "push", text: value }),
+    sendFile: (path, name) => request({ action: "send-file", path, name }),
     target: (action) => request({ action: action === "set" ? "set-target" : action === "clear" ? "clear-target" : "target-status" }),
   });
   pi.on("before_agent_start", (event) => groupChatId
