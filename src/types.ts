@@ -1,3 +1,5 @@
+export const MAX_PROMPT_BYTES = 64_000;
+
 export interface BotConfig {
   version: 1;
   brand: "feishu" | "lark";
@@ -80,7 +82,8 @@ export interface WorkerFactory {
   open(userId: string): Promise<ConversationWorker>;
   /** Delete only this conversation's saved Pi history and close its pane. */
   reset?(userId: string): Promise<void>;
-  /** Select the model used when this conversation's pane is next opened. */
+  /** Read or change this conversation's saved Pi model selection. */
+  getModel?(userId: string): Promise<ModelSpec | undefined>;
   setModel?(userId: string, model: ModelSpec): Promise<void>;
   close(): Promise<void>;
 }

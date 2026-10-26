@@ -76,7 +76,7 @@ export async function connectBot(ctx: ExtensionContext, signal: AbortSignal): Pr
         appSecret: result.appSecret }));
     }).catch(() => {
       if (finished) return;
-      text = "Authorization failed, was denied or expired. Press Esc to retry or enter existing credentials.";
+      text = "授权失败、被拒绝或已过期。按 Esc 返回重试，或手动输入已有凭据。";
       tui.requestRender();
     });
     return {

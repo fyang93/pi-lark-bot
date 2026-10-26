@@ -24,7 +24,13 @@ if (process.argv[2] === "--child") {
       if (message.type === "abort") { send({ type: "accepted", id: message.id }); continue; }
       if (message.type !== "prompt") continue;
       if (message.text === "CRASH") process.exit(0);
-      fs.appendFileSync(session, JSON.stringify(message) + "\n");
+      if (!fs.existsSync(session)) fs.writeFileSync(session, JSON.stringify({
+        type: "session", version: 3, id: "fixture", cwd: config.cwd, timestamp: new Date().toISOString(),
+      }) + "\n");
+      const leaf = JSON.parse(fs.readFileSync(session, "utf8").trim().split("\n").at(-1));
+      fs.appendFileSync(session, JSON.stringify({ type: "custom_message", customType: "lark_input",
+        id: message.id, parentId: leaf.type === "session" ? null : leaf.id, timestamp: new Date().toISOString(),
+        content: message.text, display: true }) + "\n");
       send({ type: "accepted", id: message.id });
       if (message.text === "NO_OUTPUT") continue;
       send({ type: "done", id: "wrong-id", text: "must-ignore" });
@@ -80,6 +86,7 @@ if (process.argv[2] === "--child") {
     assert.equal(command.length, 3);
     assert.equal(command[0], process.execPath);
     assert.equal(path.basename(command[1]), "launch-worker.cjs");
+    record({ action: "run", args: JSON.parse(fs.readFileSync(command[2], "utf8")).args });
     const child = spawn(process.execPath, [__filename, "--child", command[2]], { detached: true, stdio: "ignore" });
     child.unref();
     const saved = JSON.parse(fs.readFileSync(file(args[0]), "utf8"));

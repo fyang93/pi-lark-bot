@@ -150,7 +150,7 @@ test("quoted files are prepared only after authorization and their cache paths r
     await bot.drain();
     assert.deepEqual(prepared, ["allowed"]);
     assert.match(prompts[0]!, /\/private\/cache\/report\.csv/);
-    assert.match(prompts[0]!, /untrusted user input/);
+    assert.match(prompts[0]!, /untrusted input/);
   } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -436,7 +436,7 @@ test("stop during asynchronous startup cannot resurrect a listener", async () =>
     workers: { async open() { throw new Error("unexpected"); }, async close() {} } });
   try {
     const starting = bot.start();
-    const rejected = assert.rejects(starting, /stopped during startup/);
+    const rejected = assert.rejects(starting, /在启动期间已停止/);
     await bot.stop(); await rejected;
     assert.equal(starts, 0); assert.equal(bot.status.active, false);
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -452,7 +452,7 @@ test("late transport handshake after stop is closed again and cannot report star
     workers: { async open() { throw new Error("unexpected"); }, async close() {} } });
   try {
     const starting = bot.start();
-    const rejected = assert.rejects(starting, /stopped during connection startup/);
+    const rejected = assert.rejects(starting, /在建立连接期间已停止/);
     await began.promise; await bot.stop(); gate.resolve(); await rejected;
     assert.equal(live, false); assert.equal(bot.status.active, false);
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -624,6 +624,119 @@ test("a message addressed to the bot is always answered, even when it cannot be 
     assert(transport.sends.every((send) => send.reply), "each answer quotes the message it refers to");
     await bot.stop();
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("long final replies are delivered losslessly in bounded cards", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-long-output-"));
+  const transport = new FakeTransport(), answer = "你好🙂\n".repeat(5000);
+  const bot = new BotController({ config, stateDir: dir, transport, workers: {
+    async open() { return { async run(_text, emit) { emit({ type: "done", text: answer }); }, async close() {} }; }, async close() {},
+  } });
+  try {
+    await bot.start(); await bot.receive(msg("question")); await bot.drain();
+    const parts = [...transport.updates, ...transport.sends.slice(1).map((send) => send.text)];
+    assert.equal(parts.join(""), answer);
+    assert(parts.length > 1 && parts.every((part) => Buffer.byteLength(part) <= 12_000));
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("failed final delivery is reported in Chinese without resending the answer", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-output-failure-"));
+  const transport = new FakeTransport(); let errors = 0, attempts = 0;
+  transport.update = async () => { attempts++; throw new Error("private SDK error"); };
+  const bot = new BotController({ config, stateDir: dir, transport, onError: () => { errors++; }, workers: {
+    async open() { return { async run(_text, emit) { emit({ type: "done", text: "answer" }); }, async close() {} }; }, async close() {},
+  } });
+  try {
+    await bot.start(); await bot.receive(msg("question")); await bot.drain();
+    assert.equal(errors, 1); assert.equal(attempts, 1);
+    assert.match(transport.sends.at(-1)!.text, /回复发送失败/);
+    assert(!JSON.stringify(transport.sends).includes("private SDK error"));
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("stopping during final delivery prevents continuation cards", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-long-output-stop-"));
+  const transport = new FakeTransport(), began = deferred(), gate = deferred();
+  transport.update = async () => { began.resolve(); await gate.promise; };
+  const bot = new BotController({ config, stateDir: dir, transport, workers: {
+    async open() { return { async run(_text, emit) { emit({ type: "done", text: "x".repeat(30_000) }); }, async close() {} }; }, async close() {},
+  } });
+  try {
+    await bot.start(); await bot.receive(msg("question")); await began.promise;
+    const stopping = bot.stop(); gate.resolve(); await stopping;
+    assert.equal(transport.sends.length, 1, "only the initial placeholder was sent");
+  } finally { gate.resolve(); await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("expanded quotes and attachment metadata are checked before opening a worker", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-expanded-input-"));
+  const transport = new FakeTransport(); let opens = 0;
+  const prompts: string[] = [];
+  (transport as BotTransport).prepareMessage = async (message) => message.id === "quote"
+    ? { ...message, quotedText: "中".repeat(22_000) }
+    : { ...message, attachments: [{ status: "failed", type: "file", name: "x".repeat(64_000), sourceMessageId: "parent", error: "download_failed" }] };
+  const bot = new BotController({ config, stateDir: dir, transport, workers: {
+    async open() { opens++; return { async run(text) { prompts.push(text); }, async close() {} }; }, async close() {},
+  } });
+  try {
+    await bot.start();
+    for (const id of ["quote", "metadata"]) await bot.receive({ ...msg(id), parentMessageId: "parent" });
+    await bot.drain();
+    assert.equal(opens, 0); assert.deepEqual(prompts, []);
+    assert.equal(transport.sends.length, 2);
+    assert(transport.sends.every((send) => send.text.includes("消息及引用内容过长")));
+    await bot.receive({ ...msg("valid"), text: "x".repeat(64_000) }); await bot.drain();
+    assert.equal(opens, 1); assert.equal(Buffer.byteLength(prompts[0]!), 64_000);
+  } finally { await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("concurrent pushes reserve their whole card budget before sending", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lark-push-concurrent-"));
+  const transport = new FakeTransport(), gate = deferred();
+  const bot = new BotController({ config, stateDir: dir, transport, workers: {
+    async open() { throw new Error("unused"); }, async close() {},
+  } });
+  try {
+    await bot.start();
+    await bot.setPushTarget({ version: 1, appId: config.appId, chatId: "oc_team", chatType: "group", setBy: "local", setAt: "" });
+    for (let i = 0; i < 15; i++) await bot.push("one card");
+    const send = transport.send.bind(transport);
+    transport.send = async (...args) => { await gate.promise; return send(...args); };
+    const first = bot.push("a".repeat(36_000));
+    assert.equal((await bot.push("b".repeat(36_000))).ok, false);
+    gate.resolve(); assert.equal((await first).ok, true);
+    assert.equal(transport.sends.length, 18);
+    assert.equal((await bot.push("remaining one")).ok, true);
+    assert.equal((await bot.push("remaining two")).ok, true);
+    assert.equal((await bot.push("over budget")).ok, false);
+  } finally { gate.resolve(); await bot.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("push reservations survive slow sends and are released after failed attempts age out", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "lark-push-slow-")), transport = new FakeTransport(), gate = deferred();
+  const bot = new BotController({ config, stateDir: dir, transport, workers: {
+    async open() { throw new Error("unused"); }, async close() {},
+  } });
+  try {
+    await bot.start();
+    await bot.setPushTarget({ version: 1, appId: config.appId, chatId: "oc_team", chatType: "group", setBy: "local", setAt: "" });
+    const send = transport.send.bind(transport), text = "a".repeat(36_000);
+    transport.send = async (...args) => { if (args[1].length === 12_000) await gate.promise; return send(...args); };
+    const slow = bot.push(text);
+    t.mock.timers.tick(61_000);
+    for (let i = 0; i < 17; i++) assert.equal((await bot.push("one card")).ok, true);
+    assert.equal((await bot.push("over budget")).ok, false, "the slow push still owns its three reservations");
+    gate.resolve(); assert.equal((await slow).ok, true);
+    t.mock.timers.tick(61_000);
+    transport.send = async () => { throw new Error("network failed"); };
+    assert.equal((await bot.push(text)).ok, false);
+    t.mock.timers.tick(61_000);
+    transport.send = send;
+    for (let i = 0; i < 20; i++) assert.equal((await bot.push("one card")).ok, true);
+    assert.equal((await bot.push("over budget")).ok, false, "no failed reservation remains pending forever");
+  } finally { gate.resolve(); await bot.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test("model failures never cause automatic re-delivery, even in a cold session", async () => {

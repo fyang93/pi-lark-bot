@@ -7,7 +7,7 @@ import { join } from "node:path";
 import workerExtension from "../src/worker-extension.ts";
 
 async function harness(t: TestContext, options: { fail?: boolean; brand?: string } = {}) {
-  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_GROUP_CHAT_ID", "PI_LARK_BOT_BRAND"];
+  const keys = ["PI_LARK_BOT_SOCKET", "PI_LARK_BOT_RUN_ID", "PI_LARK_BOT_TOKEN", "PI_LARK_BOT_WORKER", "PI_LARK_BOT_BRAND"];
   const old = keys.map((key) => process.env[key]);
   const root = await mkdtemp(join(tmpdir(), "pi-lark-worker-test-"));
   let peer: Socket | undefined;
@@ -166,9 +166,16 @@ test("long idle periods do not close the bridge", { timeout: 3000 }, async (t) =
   assert.equal(h.shutdowns, 0); assert.equal(h.aborts, 0);
 });
 
-test("model turns do not receive chat identity system prompts", async (t) => {
-  const h = await harness(t);
-  assert.equal(h.emit("before_agent_start", { systemPrompt: "base" }), undefined);
+test("workers do not inject chat identity system prompts", async (t) => {
+  const old = process.env.PI_LARK_BOT_GROUP_CHAT_ID;
+  process.env.PI_LARK_BOT_GROUP_CHAT_ID = "oc_group";
+  try {
+    const h = await harness(t);
+    assert.equal(h.emit("before_agent_start", { systemPrompt: "base" }), undefined);
+  } finally {
+    if (old === undefined) delete process.env.PI_LARK_BOT_GROUP_CHAT_ID;
+    else process.env.PI_LARK_BOT_GROUP_CHAT_ID = old;
+  }
 });
 
 test("single file-send tool routes the path through controller IPC", { timeout: 3000 }, async (t) => {

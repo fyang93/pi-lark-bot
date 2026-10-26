@@ -2,10 +2,9 @@ import { createConnection, type Socket } from "node:net";
 import { randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerPushTools } from "./push-tools.ts";
-import type { WorkerEvent, WorkerRequest, WorkerResponse } from "./types.ts";
+import { MAX_PROMPT_BYTES, type WorkerEvent, type WorkerRequest, type WorkerResponse } from "./types.ts";
 
 const MAX_FRAME_BYTES = 512 * 1024;
-const MAX_PROMPT_BYTES = 64_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 function textFrom(message: any): string {
   if (typeof message?.content === "string") return message.content;
@@ -17,7 +16,6 @@ function textFrom(message: any): string {
 export default function larkWorkerExtension(pi: ExtensionAPI): void {
   const socketPath = process.env.PI_LARK_BOT_SOCKET;
   const runId = process.env.PI_LARK_BOT_RUN_ID;
-  const groupChatId = process.env.PI_LARK_BOT_GROUP_CHAT_ID;
   const token = process.env.PI_LARK_BOT_TOKEN;
   let socket: Socket | undefined, ctx: ExtensionContext | undefined, buffer = "";
   let stopping = false, forwardReply = false, outputOpen = false, text = "";
@@ -108,14 +106,11 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
     sendFile: (path, name) => request({ action: "send-file", path, name }),
     target: (action) => request({ action: action === "set" ? "set-target" : action === "clear" ? "clear-target" : "target-status" }),
   });
-  pi.on("before_agent_start", (event) => groupChatId
-    ? { systemPrompt: `${event.systemPrompt}\n\nThis is group chat \`${groupChatId}\`.` }
-    : undefined);
   pi.on("session_start", (_event, eventCtx) => {
     ctx = eventCtx;
     ctx.ui.setStatus("lark-bot", `🐣 ${process.env.PI_LARK_BOT_BRAND === "feishu" ? "Feishu" : "Lark"}`);
     if (!socketPath || !runId || !token) {
-      ctx.ui.notify("Lark worker IPC is not configured", "error"); ctx.shutdown(); return;
+      ctx.ui.notify("Lark 会话未配置本机通信连接，请重新打开会话。", "error"); ctx.shutdown(); return;
     }
     socket = createConnection(socketPath); socket.setEncoding("utf8");
     socket.on("connect", () => { send({ type: "hello", runId, token }); send({ type: "ready" }); });
@@ -148,7 +143,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   });
   pi.on("ui_prompt_start", () => { if (outputOpen) emit({ type: "progress", text: "正在等待本地确认…" }); });
   const blockSwitch = () => {
-    ctx?.ui.notify("This pane is bound to one Lark chat. Stop the bot before managing its saved session separately.", "warning");
+    ctx?.ui.notify("此分屏已绑定一个 Lark 聊天。请先停止机器人，再单独管理会话历史。", "warning");
     return { cancel: true as const };
   };
   pi.on("session_before_switch", blockSwitch); pi.on("session_before_fork", blockSwitch);

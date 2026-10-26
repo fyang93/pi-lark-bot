@@ -48,7 +48,7 @@ async function verifiedOwner(stateDir: string, endpoint: { cwd: string; appId: s
 async function enabledFor(stateDir: string, appId: string): Promise<boolean> {
   try {
     const value = await readPrivateJson(join(stateDir, "enabled.json")) as { appId?: unknown; enabled?: unknown };
-    if (!value || typeof value.appId !== "string" || typeof value.enabled !== "boolean") throw new Error("Invalid enabled.json");
+    if (!value || typeof value.appId !== "string" || typeof value.enabled !== "boolean") throw new Error("enabled.json 格式无效，请检查自动监听配置。");
     return value.appId === appId && value.enabled;
   } catch (error) { if (isMissing(error)) return false; throw error; }
 }
@@ -59,17 +59,17 @@ const OPEN_ID = /^o[a-z]_[A-Za-z0-9_-]{6,120}$/;
 async function editAllowlistOffline(stateDir: string, appId: string, command: "allow" | "deny", input: string): Promise<{ ok: boolean; text: string }> {
   const value = input.trim();
   if (!OPEN_ID.test(value)) {
-    return { ok: false, text: `Not a valid open_id: ${value}. Start the listener with /lark-bot on to resolve a short code.` };
+    return { ok: false, text: `open_id 无效：${value}。如需使用授权码，请先执行 /lark-bot on。` };
   }
   const unlock = await acquireLock(stateDir);
   try {
     const users = await loadAllowlist(stateDir, appId);
     if (command === "allow") {
-      if (users.has(value)) return { ok: true, text: `${value} is already allowlisted.` };
+      if (users.has(value)) return { ok: true, text: `${value} 已在白名单中。` };
       users.add(value);
-    } else if (!users.delete(value)) return { ok: false, text: `${value} is not allowlisted.` };
+    } else if (!users.delete(value)) return { ok: false, text: `${value} 不在白名单中。` };
     await saveAllowlist(stateDir, appId, users);
-    return { ok: true, text: command === "allow" ? `Allowlisted ${value}.` : `Removed ${value} from the allowlist.` };
+    return { ok: true, text: command === "allow" ? `已将 ${value} 加入白名单。` : `已将 ${value} 移出白名单。` };
   } finally { await unlock(); }
 }
 
@@ -165,21 +165,21 @@ export default function larkBot(pi: ExtensionAPI): void {
       }
       await restore(ctx, cwd, stateDir);
     } catch {
-      ctx.ui.notify("Could not restore Lark bot. Run /lark-bot on to retry.", "error");
+      ctx.ui.notify("无法恢复 Lark 机器人，请执行 /lark-bot on 重试。", "error");
     }
   });
   // Every local Pi exposes the tool; non-owners send through the sole owner's
   // outbound endpoint, so the controller remains the authority for target and rate.
   registerPushTools(pi, { push: async (text, ctx) => {
-    if (!ctx.isProjectTrusted()) return { ok: false, text: "Trust this project before using Lark push." };
+    if (!ctx.isProjectTrusted()) return { ok: false, text: "请先信任当前项目，再使用 Lark 推送。" };
     const cwd = await realpath(ctx.cwd);
     if (controller && started?.cwd === cwd) return controller.push(text);
     const stateDir = join(cwd, CONFIG_DIR_NAME, "lark-bot");
     let preference: { appId?: unknown; enabled?: unknown };
     try { preference = await readPrivateJson(join(stateDir, "enabled.json")) as typeof preference; }
-    catch (error) { if (isMissing(error)) return { ok: false, text: "Lark bot is not listening in this project." }; throw error; }
+    catch (error) { if (isMissing(error)) return { ok: false, text: "此项目的 Lark 机器人当前未在监听。" }; throw error; }
     if (!preference || preference.enabled !== true || typeof preference.appId !== "string")
-      return { ok: false, text: "Lark bot is not listening in this project." };
+      return { ok: false, text: "此项目的 Lark 机器人当前未在监听。" };
     return pushViaOwner(stateDir, cwd, preference.appId, text);
   } });
   pi.registerCommand("lark-bot", {
@@ -190,14 +190,14 @@ export default function larkBot(pi: ExtensionAPI): void {
     handler: (args, ctx) => run(args, ctx),
   });
   async function run(args: string, ctx: ExtensionContext, restoreAppId?: string, automatic = false): Promise<void> {
-      if (ctx.mode !== "tui") { ctx.ui.notify("/lark-bot requires an interactive pi TUI.", "error"); return; }
+      if (ctx.mode !== "tui") { ctx.ui.notify("/lark-bot 需要在交互式 Pi 终端中使用。", "error"); return; }
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const [command] = parts;
       const rest = parts.slice(1).join(" ");
       if (command === "help") { ctx.ui.notify(help, "info"); return; }
       if (command && !commands.includes(command)) { ctx.ui.notify(help, "warning"); return; }
-      if (!ctx.isProjectTrusted()) { ctx.ui.notify("Trust this project first.", "error"); return; }
-      if (operation || shuttingDown) { if (!automatic) ctx.ui.notify("Another operation is still in progress. Try again later.", "warning"); return; }
+      if (!ctx.isProjectTrusted()) { ctx.ui.notify("请先信任当前项目。", "error"); return; }
+      if (operation || shuttingDown) { if (!automatic) ctx.ui.notify("另一个操作尚未完成，请稍后重试。", "warning"); return; }
       operation = true;
       try {
         const cwd = await realpath(ctx.cwd);
@@ -224,7 +224,7 @@ export default function larkBot(pi: ExtensionAPI): void {
           return;
         }
         if (command === "off") {
-          if (!controller && (await inspectLock(stateDir)).state === "running") throw new Error("Another pi holds the project lock. Run /lark-bot off in that pi session.");
+          if (!controller && (await inspectLock(stateDir)).state === "running") throw new Error("另一个 Pi 持有项目锁，请在该会话执行 /lark-bot off。");
           // A non-owner cannot turn off somebody else's live controller.
           if (controller) await writePrivateJson(join(stateDir, "enabled.json"), { appId: started!.appId, enabled: false });
           else {
@@ -239,14 +239,14 @@ export default function larkBot(pi: ExtensionAPI): void {
         }
         if (command === "allow" || command === "deny" || command === "push") {
           const config = await loadConfig(stateDir);
-          if (!config) throw new Error("Run /lark-bot link first.");
+          if (!config) throw new Error("请先执行 /lark-bot link 连接机器人。");
           // Allowlist and push target are controller state. Editing them from a
           // second pi while another one listens would be silently overwritten.
           if (!controller && (await inspectLock(stateDir)).state === "running") {
-            throw new Error(`Another pi holds the project lock. Run /lark-bot ${command} in that pi session.`);
+            throw new Error(`另一个 Pi 持有项目锁，请在该会话执行 /lark-bot ${command}。`);
           }
           if (command === "push") {
-            if (rest && rest !== "off") { ctx.ui.notify("Usage: /lark-bot push [off]", "warning"); return; }
+            if (rest && rest !== "off") { ctx.ui.notify("用法：/lark-bot push [off]", "warning"); return; }
             if (rest === "off") {
               // A running controller reports the change through onNotice.
               if (controller) await controller.setPushTarget(undefined);
@@ -276,14 +276,14 @@ export default function larkBot(pi: ExtensionAPI): void {
             if (index < 0) return;
             input = recent[index]!.userId;
           }
-          if (!input) { ctx.ui.notify(`Usage: /lark-bot ${command} <open_id>`, "warning"); return; }
+          if (!input) { ctx.ui.notify(`用法：/lark-bot ${command} <open_id>`, "warning"); return; }
           const result = controller
             ? await (command === "allow" ? controller.allow(input) : controller.deny(input))
             : await editAllowlistOffline(stateDir, config.appId, command, input);
           ctx.ui.notify(result.text, result.ok ? "info" : "warning");
           return;
         }
-        if (controller) { ctx.ui.notify("Run /lark-bot off before changing configuration or restarting.", "warning"); return; }
+        if (controller) { ctx.ui.notify("请先执行 /lark-bot off，再修改配置或重启监听。", "warning"); return; }
         await prepareState(cwd, CONFIG_DIR_NAME);
         if (command === "link") {
           const unlock = await acquireLock(stateDir);
@@ -299,7 +299,7 @@ export default function larkBot(pi: ExtensionAPI): void {
             if (missing?.length === 0) {
               ctx.ui.notify("Required bot permissions are granted. Run /lark-bot on to start listening.", "info");
             } else {
-              const title = missing ? "Missing bot permissions" : "Could not verify bot permissions";
+              const title = missing ? "机器人缺少所需权限" : "无法确认机器人权限";
               const note = permissionInstructions(config, missing);
               ctx.ui.notify(`${title}\n${note}`, "warning");
               await ctx.ui.confirm(title, `${note}\n\nClose this notice when finished (credentials are already saved).`, { signal: setupAbort.signal });
@@ -308,16 +308,16 @@ export default function larkBot(pi: ExtensionAPI): void {
           return;
         }
         let config = await loadConfig(stateDir);
-        if (!config) throw new Error("Run /lark-bot link first.");
+        if (!config) throw new Error("请先执行 /lark-bot link 连接机器人。");
         requireHerdr();
-        if (restoreAppId !== undefined && config.appId !== restoreAppId) throw new Error("Bot configuration changed. Run /lark-bot on to enable it again.");
+        if (restoreAppId !== undefined && config.appId !== restoreAppId) throw new Error("机器人配置已变化，请重新执行 /lark-bot on。");
         if (restoreAppId === undefined && !await ctx.ui.confirm("Enable remote code execution?", "New users require local approval (10-second timeout; default choice is Confirm), whether they contact the bot directly or @mention it in a group. Sessions share project files, and group replies are visible to group members.", { signal: setupAbort.signal })) return;
         if (shuttingDown) return;
         release = await acquireLock(stateDir);
         try {
           // Configuration may have changed during the confirmation dialog.
           config = await loadConfig(stateDir);
-          if (!config || (restoreAppId !== undefined && config.appId !== restoreAppId)) throw new Error("Configuration changed. Check and retry.");
+          if (!config || (restoreAppId !== undefined && config.appId !== restoreAppId)) throw new Error("配置已变化，请检查后重试。");
           if (!config.domain) {
             const domain = await probeRegistrationDomain(config, config.brand);
             if (domain) {
@@ -335,10 +335,10 @@ export default function larkBot(pi: ExtensionAPI): void {
           const onError = (error: unknown) => {
             if (Date.now() - lastErrorAt < 5000 || shuttingDown) return;
             lastErrorAt = Date.now();
-            // Never dump SDK errors, subprocess objects, payloads or credentials.
-            const detail = error instanceof Error && /^(Lark (API|connection)|Pi worker|Timed out waiting for pi worker|herdr |Cannot inspect herdr|Unable to locate the pi CLI)/.test(error.message)
-              ? ` (${error.message.slice(0, 240)})` : "";
-            ctx.ui.notify(`Lark bot operation failed${detail}. Check connectivity, app permissions and the session pane. Generated history is preserved locally.`, "error");
+            // Only our sanitized transport and herdr errors may reach the UI.
+            const detail = error instanceof Error && /^(Lark (接口|连接)|herdr |无法读取 herdr)/.test(error.message)
+              ? `（${error.message.slice(0, 240)}）` : "";
+            ctx.ui.notify(`Lark 机器人操作失败${detail}，请检查网络、应用权限和对应分屏。历史已保存在本机。`, "error");
           };
           const brand = config.brand === "lark" ? "Lark" : "Feishu";
           const transport = new LarkTransport(config, onError, undefined, join(stateDir, "attachments"), cwd);
@@ -379,10 +379,10 @@ export default function larkBot(pi: ExtensionAPI): void {
           ctx.ui.notify("Lark bot enabled: only allowlisted users can use direct messages or group @mentions. Run /lark-bot off to disable.", "info");
         } catch (error) { await stop(); throw error; }
       } catch (error) {
-        const text = error instanceof Error ? error.message : "Lark bot operation failed";
+        const text = error instanceof Error ? error.message : "Lark 机器人操作失败，请检查配置后重试。";
         // Automatic takeovers retry every poll: another Pi winning the lock is
         // expected, and a persistent failure is reported once.
-        if (automatic && (/already has a running|recovery is in progress/.test(text) || text === lastAutomaticError)) return;
+        if (automatic && (/已有正在运行或身份未确认|正在恢复控制端/.test(text) || text === lastAutomaticError)) return;
         if (automatic) lastAutomaticError = text;
         ctx.ui.notify(text, "error");
       } finally { operation = false; }

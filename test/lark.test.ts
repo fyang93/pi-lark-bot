@@ -193,6 +193,59 @@ test("captures a reply parent and caches its file resource for the authorized co
   } finally { await transport.stop(); await rm(root, { recursive: true, force: true }); }
 });
 
+test("quoted posts reuse the normal parser for text and embedded resources", async () => {
+  const root = await mkdtemp(join(tmpdir(), "lark-quoted-post-"));
+  try {
+    for (const wrapped of [false, true]) {
+      const fake = fakeSdk();
+      const post = { title: "Report", content: [[{ tag: "text", text: "Body" },
+        { tag: "img", image_key: "quoted-image" }, { tag: "file", file_key: "quoted-file", file_name: "report.csv" }]] };
+      fake.api.get = async () => ({ code: 0, data: { items: [{ message_id: "parent", chat_id: "oc_1", msg_type: "post",
+        body: { content: JSON.stringify(wrapped ? { zh_cn: post } : post) } }] } });
+      fake.messageResource.get = async (payload: any) => {
+        fake.calls.resource.push(payload);
+        return { headers: {}, getReadableStream: () => Readable.from([Buffer.from("data")]) };
+      };
+      const transport = new LarkTransport(config, undefined, fake.sdk, join(root, String(wrapped)));
+      const prepared = await transport.prepareMessage({ id: "reply", userId: "ou_1", chatId: "oc_1", text: "explain", parentMessageId: "parent" });
+      assert.match(prepared.quotedText!, /Report\nBody/);
+      assert.equal(prepared.attachments?.length, 2);
+      assert(prepared.attachments!.every((file) => file.status === "ready" && file.sourceMessageId === "parent"));
+      assert.deepEqual(fake.calls.resource.map((call) => call.path.file_key), ["quoted-image", "quoted-file"]);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("reply attachments survive both quoted attachments and an unreadable parent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "lark-reply-attachments-"));
+  try {
+    for (const kind of ["text", "file", "missing", "invalid", "other-chat", "error"]) {
+      const fake = fakeSdk();
+      fake.api.get = async () => {
+        if (kind === "error") throw new Error("private error");
+        return { code: 0, data: { items: kind === "missing" ? [] : [{ message_id: "parent",
+          chat_id: kind === "other-chat" ? "oc_other" : "oc_1", msg_type: kind,
+          body: { content: kind === "invalid" ? "invalid json" : JSON.stringify({ text: "Old message", file_key: "old-file", file_name: "old.txt" }) } }] } };
+      };
+      fake.messageResource.get = async (payload: any) => {
+        fake.calls.resource.push(payload);
+        return { headers: {}, getReadableStream: () => Readable.from([Buffer.from("data")]) };
+      };
+      const transport = new LarkTransport(config, undefined, fake.sdk, join(root, kind));
+      const prepared = await transport.prepareMessage({ id: "reply", userId: "ou_1", chatId: "oc_1", text: "analyze", parentMessageId: "parent",
+        resourceReferences: [{ key: "new-image", name: "image.bin", type: "image", apiType: "image" }] });
+      assert.equal(prepared.attachments?.[0]?.status, "ready");
+      assert.equal(prepared.attachments?.[0]?.sourceMessageId, "reply");
+      assert.deepEqual(fake.calls.resource[0].path, { message_id: "reply", file_key: "new-image" });
+      if (kind === "file") {
+        assert.equal(prepared.attachments?.length, 2);
+        assert.deepEqual(fake.calls.resource[1].path, { message_id: "parent", file_key: "old-file" });
+      } else assert.equal(prepared.attachments?.length, 1);
+      if (!["text", "file"].includes(kind)) assert.equal(prepared.preparationWarning, "referenced_message_unavailable");
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("extracts quoted text from an interactive card reply", async () => {
   const fake = fakeSdk();
   const report = "美股持仓复核完成｜账户权益约$84.55k。邮轮主题集中度约18.2%。";
@@ -226,7 +279,7 @@ test("rejects a pending start on SDK failure or explicit stop and cleans up", as
   const failedTransport = new LarkTransport(config, undefined, failed.sdk);
   const failedStart = failedTransport.start(async () => {});
   failed.error();
-  await assert.rejects(failedStart, /Lark connection failed/);
+  await assert.rejects(failedStart, /Lark 连接失败/);
   assert.equal(failedTransport.state, "stopped");
   assert.deepEqual(failed.calls.close, [{ force: true }]);
 
@@ -234,7 +287,7 @@ test("rejects a pending start on SDK failure or explicit stop and cleans up", as
   const stoppedTransport = new LarkTransport(config, undefined, stopped.sdk);
   const stoppedStart = stoppedTransport.start(async () => {});
   await stoppedTransport.stop();
-  await assert.rejects(stoppedStart, /Lark connection was stopped/);
+  await assert.rejects(stoppedStart, /Lark 连接已停止/);
   assert.equal(stoppedTransport.state, "stopped");
   assert.deepEqual(stopped.calls.close, [{ force: true }]);
 });
@@ -245,7 +298,7 @@ test("times out an initial handshake and force-closes", async (t) => {
   const transport = new LarkTransport(config, undefined, fake.sdk);
   const starting = transport.start(async () => {});
   (t.mock.timers as any).tick(30_000);
-  await assert.rejects(starting, /Lark connection timed out/);
+  await assert.rejects(starting, /Lark 连接超时/);
   assert.equal(transport.state, "stopped");
   assert.deepEqual(fake.calls.close, [{ force: true }]);
 });
@@ -313,7 +366,7 @@ test("uses idempotent create/reply/patch cards and bounded HTTP/retries", async 
 
   attempts = 0;
   (transport as any).client.im.v1.message.create = async () => { attempts++; return { code: 12345, data: { message_id: "bad" } }; };
-  await assert.rejects(transport.send("oc_1", "x"), /Lark API request failed/);
+  await assert.rejects(transport.send("oc_1", "x"), /Lark 接口请求失败/);
   assert.equal(attempts, 1);
 });
 

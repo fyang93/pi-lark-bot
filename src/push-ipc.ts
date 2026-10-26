@@ -31,13 +31,13 @@ export async function servePush(stateDir: string, cwd: string, appId: string, ow
       void (async () => {
         let request: { token?: unknown; cwd?: unknown; appId?: unknown; text?: unknown };
         try { request = JSON.parse(input.slice(0, end)); }
-        catch { socket.end(JSON.stringify(failure("Invalid push request")) + "\n"); return; }
+        catch { socket.end(JSON.stringify(failure("推送请求格式无效。")) + "\n"); return; }
         const authorized = request.token === endpoint.token && request.cwd === cwd && request.appId === appId;
         const response = authorized && (request as { type?: unknown }).type === "ping"
           ? { ok: true, type: "status", cwd, appId, socket: endpoint.socket, ownerToken }
           : authorized && typeof request.text === "string" && Buffer.byteLength(request.text) <= MAX_TEXT
-            ? await push(request.text).catch(() => failure("Lark push failed"))
-            : failure("Unauthorized push request");
+            ? await push(request.text).catch(() => failure("Lark 推送失败，请检查连接与权限。"))
+            : failure("推送请求未获授权。");
         socket.end(JSON.stringify(response) + "\n");
       })();
     });
@@ -67,29 +67,29 @@ export async function servePush(stateDir: string, cwd: string, appId: string, ow
 }
 
 export async function pushViaOwner(stateDir: string, cwd: string, appId: string, text: string): Promise<WorkerResponse> {
-  if (Buffer.byteLength(text) > MAX_TEXT) return failure("Push text is too large");
-  if ((await inspectLock(stateDir)).state !== "running") return failure("Lark bot is not listening in this project.");
+  if (Buffer.byteLength(text) > MAX_TEXT) return failure("推送内容过长，请缩短后重试。");
+  if ((await inspectLock(stateDir)).state !== "running") return failure("此项目的 Lark 机器人当前未在监听。");
   let endpoint: Endpoint;
   try { endpoint = await readPrivateJson(join(stateDir, "push-endpoint.json")) as Endpoint; }
-  catch (error) { if (isMissing(error)) return failure("Lark bot is not listening in this project."); throw error; }
+  catch (error) { if (isMissing(error)) return failure("此项目的 Lark 机器人当前未在监听。"); throw error; }
   if (endpoint.cwd !== cwd || endpoint.appId !== appId || typeof endpoint.token !== "string" ||
-    !/^[a-f0-9]{64}$/.test(endpoint.token) || typeof endpoint.socket !== "string") return failure("Lark push endpoint does not match this project or bot.");
+    !/^[a-f0-9]{64}$/.test(endpoint.token) || typeof endpoint.socket !== "string") return failure("Lark 推送端点与当前项目或机器人不匹配。");
   return new Promise((resolve) => {
     const socket = createConnection(endpoint.socket); let response = "", done = false;
     const finish = (value: WorkerResponse) => { if (done) return; done = true; socket.destroy(); resolve(value); };
-    socket.setEncoding("utf8"); socket.setTimeout(45_000, () => finish(failure("Lark push endpoint timed out")));
-    socket.on("error", () => finish(failure("Lark bot owner is unavailable.")));
-    socket.on("close", () => finish(failure("Lark bot owner disconnected.")));
+    socket.setEncoding("utf8"); socket.setTimeout(45_000, () => finish(failure("Lark 推送端点响应超时，请检查监听会话。")));
+    socket.on("error", () => finish(failure("无法连接 Lark 监听会话，请确认机器人仍在监听。")));
+    socket.on("close", () => finish(failure("Lark 监听会话已断开，推送状态不确定，请检查聊天记录。")));
     socket.on("connect", () => socket.write(JSON.stringify({ token: endpoint.token, cwd, appId, text }) + "\n"));
     socket.on("data", (chunk: string) => {
       response += chunk;
-      if (Buffer.byteLength(response) > 4096) { finish(failure("Invalid Lark push response")); return; }
+      if (Buffer.byteLength(response) > 4096) { finish(failure("Lark 推送响应格式无效。")); return; }
       const end = response.indexOf("\n");
       if (end < 0) return;
       try {
         const value = JSON.parse(response.slice(0, end)) as WorkerResponse;
-        finish(typeof value.ok === "boolean" && typeof value.text === "string" ? value : failure("Invalid Lark push response"));
-      } catch { finish(failure("Invalid Lark push response")); }
+        finish(typeof value.ok === "boolean" && typeof value.text === "string" ? value : failure("Lark 推送响应格式无效。"));
+      } catch { finish(failure("Lark 推送响应格式无效。")); }
     });
   });
 }

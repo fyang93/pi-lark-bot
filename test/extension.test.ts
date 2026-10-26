@@ -44,7 +44,7 @@ test("loading extension is inert; /lark-bot defaults to status and never writes 
     assert.equal(await h.handlers.get("session_before_fork")({ position: "at" }, probe), undefined);
     assert.equal(asked, 0);
     assert.deepEqual(await readdir(cwd), []);
-    await assert.rejects(h.tools.get("lark_push").execute("call", { text: "hello" }, undefined, undefined, h.ctx), /not listening/);
+    await assert.rejects(h.tools.get("lark_push").execute("call", { text: "hello" }, undefined, undefined, h.ctx), /未在监听/);
     await h.commands.get("lark-bot").handler("", h.ctx);
     assert(h.messages.at(-1)?.includes("not connected"));
     assert(h.messages.at(-1)?.includes("stopped"));
@@ -120,14 +120,14 @@ test("linked on persists across launches; two sessions elect one listener; off s
       socket.on("connect", () => socket.write(JSON.stringify({ token: "wrong", cwd: endpoint.cwd, appId: endpoint.appId, text: "forged" }) + "\n"));
       socket.on("data", (chunk) => { data += chunk; if (data.includes("\n")) { socket.destroy(); resolve(data); } });
     });
-    assert.match(forged, /Unauthorized push request/);
+    assert.match(forged, /推送请求未获授权/);
     assert.equal((await pushViaOwner(stateDir, cwd, "cli_wrong", "wrong app")).ok, false);
     assert.equal(sent.length, 1, "forged and mismatched requests never send");
     for (let i = 1; i < 20; i++) await push(i % 2 ? first : second, `shared ${i}`);
     await assert.rejects(push(second, "over limit"), /每分钟最多 20/);
     assert.equal(sent.length, 20, "all local sessions share the controller's push limit");
     await second.commands.get("lark-bot").handler("off", second.ctx);
-    assert(second.messages.at(-1)?.includes("Another pi holds the project lock"));
+    assert(second.messages.at(-1)?.includes("另一个 Pi 持有项目锁"));
     assert.equal(stops, 0, "a non-owner cannot stop the owner");
     assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: true });
     await first.handlers.get("session_shutdown")({ reason: "quit" }, first.ctx);
@@ -147,7 +147,7 @@ test("linked on persists across launches; two sessions elect one listener; off s
     await third.commands.get("lark-bot").handler("off", third.ctx);
     assert.equal(third.statuses.at(-1), undefined, "owner off clears status");
     await waitFor(() => second.statuses.at(-1) === undefined);
-    await assert.rejects(push(second, "after off"), /not listening/);
+    await assert.rejects(push(second, "after off"), /未在监听/);
     await assert.rejects(readPrivateJson(join(stateDir, "push-endpoint.json")), /ENOENT/);
     assert.deepEqual(await readPrivateJson(join(stateDir, "enabled.json")), { appId: "cli_test", enabled: false });
     const fourth = next();
@@ -232,7 +232,7 @@ test("running Pis take over listening when the owner exits", async (t) => {
       !!await readPrivateJson(join(dir, "push-endpoint.json")).catch(() => undefined));
     await b.tools.get("lark_push").execute("call", { text: "after takeover" }, undefined, undefined, b.ctx);
     assert.deepEqual(sent, ["after takeover"]);
-    assert(![b, c].some((h) => h.messages.some((m) => /already has a running|recovery/.test(m))), "losing the race is silent");
+    assert(![b, c].some((h) => h.messages.some((m) => /已有正在运行或身份未确认|正在恢复控制端/.test(m))), "losing the race is silent");
     for (const h of [b, c]) await h.commands.get("lark-bot").handler("off", h.ctx);
     await waitFor(() => [b, c].every((h) => h.statuses.at(-1) === undefined));
     await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -308,7 +308,7 @@ test("untrusted project commands are rejected and unknown commands show help", a
   const h = harness("/does-not-exist");
   h.ctx.isProjectTrusted = () => false;
   await h.commands.get("lark-bot").handler("on", h.ctx);
-  assert(h.messages.at(-1)?.includes("Trust"));
+  assert(h.messages.at(-1)?.includes("请先信任当前项目"));
   await h.commands.get("lark-bot").handler("unknown", h.ctx);
   assert(h.messages.at(-1)?.includes("/lark-bot link"));
 });
@@ -320,7 +320,7 @@ test("/lark-bot allow, deny and push edit project state without starting a liste
     const run = (args: string) => h.commands.get("lark-bot").handler(args, h.ctx);
 
     await run("push");
-    assert(h.messages.at(-1)?.includes("link first"), "every local edit needs credentials");
+    assert(h.messages.at(-1)?.includes("请先执行 /lark-bot link"), "every local edit needs credentials");
 
     const stateDir = await prepareState(cwd, ".pi");
     await writePrivateJson(join(stateDir, "config.json"),
@@ -332,19 +332,19 @@ test("/lark-bot allow, deny and push edit project state without starting a liste
     await run("allow");
     assert(h.messages.at(-1)?.includes("No recent rejections"), "codes need a running listener to resolve");
     await run("allow not-an-id");
-    assert(h.messages.at(-1)?.includes("Not a valid open_id"));
+    assert(h.messages.at(-1)?.includes("open_id 无效"));
 
     await run("allow ou_alice0001");
-    assert(h.messages.at(-1)?.includes("Allowlisted ou_alice0001"));
+    assert(h.messages.at(-1)?.includes("已将 ou_alice0001 加入白名单"));
     assert.deepEqual(await readPrivateJson(join(stateDir, "allowlist.json")),
       { appId: "cli_test", users: ["ou_alice0001"] });
     await run("allow ou_alice0001");
-    assert(h.messages.at(-1)?.includes("already allowlisted"));
+    assert(h.messages.at(-1)?.includes("已在白名单中"));
 
     await run("deny ou_alice0001");
     assert.deepEqual(await readPrivateJson(join(stateDir, "allowlist.json")), { appId: "cli_test", users: [] });
     await run("deny ou_alice0001");
-    assert(h.messages.at(-1)?.includes("not allowlisted"));
+    assert(h.messages.at(-1)?.includes("不在白名单中"));
 
     await writePrivateJson(join(stateDir, "push-target.json"),
       { version: 1, appId: "cli_test", chatId: "oc_team", chatType: "group", setBy: "group:oc_team", setAt: "" });

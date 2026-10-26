@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { __panesTest__, HerdrWorkers } from "../src/panes.ts";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { WorkerEvent } from "../src/types.ts";
 
 test("user session keys are deterministic and do not expose identifiers", () => {
@@ -43,6 +44,42 @@ async function fixture(settings: Record<string, string> = {}) {
   return { root, options, cleanup };
 }
 
+test("model choices persist in native Pi history, including before the first prompt", { timeout: 10000 }, async () => {
+  const f = await fixture(), chosen = { provider: "p", id: "chosen" };
+  const options = { ...f.options, model: { provider: "p", id: "default" } };
+  const first = new HerdrWorkers(options);
+  let resumed: HerdrWorkers | undefined;
+  try {
+    await first.setModel("ou_a", chosen);
+    await first.close();
+    resumed = new HerdrWorkers(options);
+    assert.deepEqual(await resumed.getModel("ou_a"), chosen);
+    assert.equal(await resumed.getModel("ou_b"), undefined, "private selections are isolated");
+    const otherApp = new HerdrWorkers({ ...options, appId: "cli_other" });
+    assert.equal(await otherApp.getModel("ou_a"), undefined, "another app cannot inherit the choice");
+    await otherApp.close();
+    const worker = await resumed.open("ou_a");
+    const launches = () => readFile(join(f.root, "creates.jsonl"), "utf8").then((text) => text.trim().split("\n").map((line) => JSON.parse(line)).filter((entry) => entry.action === "run"));
+    let args = (await launches()).at(-1).args as string[];
+    assert.equal(args[args.indexOf("--model") + 1], "p/chosen");
+    await worker.run("keep this history", () => {});
+    const path = resumed.list()[0]!.sessionFile;
+    await resumed.setModel("ou_a", { provider: "p", id: "next" });
+    assert.equal(SessionManager.open(path).getBranch().filter((entry) => entry.type === "custom_message").length, 1);
+    await resumed.close();
+    resumed = new HerdrWorkers(options);
+    assert.deepEqual(await resumed.getModel("ou_a"), { provider: "p", id: "next" });
+    await resumed.open("ou_a");
+    args = (await launches()).at(-1).args;
+    assert.equal(args[args.indexOf("--model") + 1], "p/next");
+    await resumed.reset("ou_a");
+    assert.equal(await resumed.getModel("ou_a"), undefined);
+    await resumed.open("ou_a");
+    args = (await launches()).at(-1).args;
+    assert.equal(args[args.indexOf("--model") + 1], "p/default", "/new clears both history and model selection");
+  } finally { await first.close(); await resumed?.close(); await f.cleanup(); }
+});
+
 test("real socket/subprocess bridge reuses users, preserves Unicode, filters wrong IDs and restores sessions", { timeout: 10000 }, async () => {
   const f = await fixture();
   const factory = new HerdrWorkers({ ...f.options, env: { TEST_READY_DELAY: "50" } });
@@ -62,13 +99,13 @@ test("real socket/subprocess bridge reuses users, preserves Unicode, filters wro
     assert.equal(events.at(-1)?.text, prompt);
     assert(!events.some((event) => event.text === "must-ignore"));
     const sessionFile = factory.list().find((pane) => pane.userId === "ou_a")!.sessionFile;
-    assert.equal(JSON.parse((await readFile(sessionFile, "utf8")).trim()).text, prompt);
+    assert.equal(JSON.parse((await readFile(sessionFile, "utf8")).trim().split("\n").at(-1)!).content, prompt);
     await factory.close();
     assert.equal(factory.list().length, 0);
     resumed = new HerdrWorkers(f.options);
     const again = await resumed.open("ou_a"); await again.run("follow-up", () => {});
     assert.equal(resumed.list()[0]!.sessionFile, sessionFile);
-    assert.equal((await readFile(sessionFile, "utf8")).trim().split("\n").length, 2);
+    assert.equal((await readFile(sessionFile, "utf8")).trim().split("\n").length, 3);
   } finally { await factory.close(); await resumed?.close(); await f.cleanup(); }
 });
 
@@ -81,14 +118,15 @@ test("handoff does not wait for output; the next message and interrupt reach the
     await worker.interrupt!();
     assert.equal(await factory.open("ou_a"), worker);
     const history = await readFile(factory.list()[0]!.sessionFile, "utf8");
-    assert.equal(history.trim().split("\n").length, 2);
+    assert.equal(history.trim().split("\n").length, 3);
   } finally { await factory.close(); await f.cleanup(); }
 });
 
 test("workers split the controller's own pane unfocused, else open a background tab", { timeout: 10000 }, async () => {
   for (const [layout, zoomed, expected] of [
-    [[["w1:p0", 120, 40]], false, { action: "split", target: "w1:p0", direction: "right" }],
-    [[["w1:p0", 120, 40], ["w1:p7", 100, 60]], false, { action: "split", target: "w1:p0", direction: "right" }],  // never another pane
+    [[["w1:p0", 160, 48]], false, { action: "split", target: "w1:p0", direction: "right" }],
+    [[["w1:p0", 80, 48], ["w1:p7", 200, 60]], false, { action: "split", target: "w1:p0", direction: "down" }],  // never another pane
+    [[["w1:p0", 120, 40]], false, { action: "tab" }],
     [[["w1:p0", 90, 18]], false, { action: "tab" }],
     [[["w1:p0", 90, 18], ["w1:p7", 200, 50]], false, { action: "tab" }],  // too small: a tab, not the bigger neighbour
     [[["w1:p0", 160, 50]], true, { action: "tab" }],
@@ -126,13 +164,13 @@ test("an uninspectable layout creates nothing, and a failed launch closes its pa
   let f = await fixture({ TEST_LAYOUT_FAIL: "1" });
   let workers = new HerdrWorkers(f.options);
   try {
-    await assert.rejects(workers.open("ou_a"), /Cannot inspect herdr layout/);
+    await assert.rejects(workers.open("ou_a"), /无法读取 herdr 布局/);
     assert(!(await readdir(f.root)).includes("creates.jsonl"));
   } finally { await workers.close(); await f.cleanup(); }
   f = await fixture({ TEST_RUN_FAIL: "1" });
   workers = new HerdrWorkers(f.options);
   try {
-    await assert.rejects(workers.open("ou_a"), /herdr pane run failed \(pane_not_found\)/);
+    await assert.rejects(workers.open("ou_a"), /herdr pane run 执行失败（pane_not_found）/);
     assert.deepEqual((await readdir(f.root)).filter(file => /^pane-\d+\.json$/.test(file)), []);
   } finally { await workers.close(); await f.cleanup(); }
 });

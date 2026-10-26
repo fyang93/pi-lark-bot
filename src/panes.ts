@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { createServer, type Server, type Socket } from "node:net";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { privateDir, writePrivateJson } from "./storage.ts";
 import type { BotConfig, ConversationWorker, ModelSpec, WorkerEvent, WorkerFactory, WorkerRequest, WorkerResponse } from "./types.ts";
 
@@ -46,6 +47,14 @@ function parseRequest(message: any): WorkerRequest | undefined {
 export interface PaneSnapshot { userId: string; paneId?: string; sessionFile: string; connected: boolean }
 function sessionKey(appId: string, userId: string): string {
   return createHash("sha256").update(`${appId}\0${userId}`).digest("hex");
+}
+function sessionPath(options: HerdrWorkersOptions, userId: string): string {
+  return resolve(options.stateDir ?? join(options.cwd, ".pi", "lark-bot"), "sessions", `${sessionKey(options.appId, userId)}.jsonl`);
+}
+function savedModel(path: string): ModelSpec | undefined {
+  if (!existsSync(path)) return;
+  const entry = SessionManager.open(path).getBranch().reverse().find((entry) => entry.type === "model_change");
+  return entry ? { provider: entry.provider, id: entry.modelId } : undefined;
 }
 function piCliPath(): string {
   const candidates = new Set<string>();
@@ -100,7 +109,7 @@ class PaneWorker implements ConversationWorker {
   private onEvent?: (event: WorkerEvent) => void;
   private readonly deliveries = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   constructor(private options: HerdrWorkersOptions, private userId: string) {
-    this.sessionFile = resolve(options.stateDir ?? join(options.cwd, ".pi", "lark-bot"), "sessions", `${sessionKey(options.appId, userId)}.jsonl`);
+    this.sessionFile = sessionPath(options, userId);
   }
   /** Pane and herdr agent name; reveals no user identifier. */
   get name(): string { return `lark-${sessionKey(this.options.appId, this.userId).slice(0, 10)}`; }
@@ -156,10 +165,10 @@ class PaneWorker implements ConversationWorker {
       if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_LARK_BOT_") || ["PI_SESSION_ID", "PI_SESSION_FILE"].includes(key)) delete childEnv[key];
     }
     Object.assign(childEnv, { PI_LARK_BOT_WORKER: "1", PI_LARK_BOT_BRAND: this.options.brand ?? "lark", PI_LARK_BOT_SOCKET: socketPath, PI_LARK_BOT_RUN_ID: runId, PI_LARK_BOT_TOKEN: token });
-    if (this.userId.startsWith("group:")) childEnv.PI_LARK_BOT_GROUP_CHAT_ID = this.userId.slice("group:".length);
     const extension = this.options.workerExtensionPath ?? fileURLToPath(new URL("./worker-extension.ts", import.meta.url));
     const args = ["--session", this.sessionFile, "-e", extension];
-    if (this.options.model) args.push("--model", `${this.options.model.provider}/${this.options.model.id}`);
+    const model = savedModel(this.sessionFile) ?? this.options.model;
+    if (model) args.push("--model", `${model.provider}/${model.id}`);
     if (this.options.thinkingLevel) args.push("--thinking", this.options.thinkingLevel);
     const launchFile = join(this.tempDir, "launch.json");
     await writePrivateJson(launchFile, { cli: piCliPath(), args, cwd: this.options.cwd, env: childEnv });
@@ -286,7 +295,6 @@ class PaneWorker implements ConversationWorker {
 
 export class HerdrWorkers implements WorkerFactory {
   private entries = new Map<string, { worker: PaneWorker; promise: Promise<PaneWorker>; started: boolean }>();
-  private readonly models = new Map<string, ModelSpec>();
   private closed = false;
   private closing?: Promise<void>;
   constructor(private options: HerdrWorkersOptions) {
@@ -297,7 +305,7 @@ export class HerdrWorkers implements WorkerFactory {
     if (this.closed) return Promise.reject(new Error("HerdrWorkers is closed"));
     const old = this.entries.get(userId);
     if (old && (old.worker.isConnected() || !old.started)) return old.promise;
-    const worker = new PaneWorker({ ...this.options, model: this.models.get(userId) ?? this.options.model }, userId);
+    const worker = new PaneWorker(this.options, userId);
     const entry = { worker, promise: undefined as unknown as Promise<PaneWorker>, started: false };
     entry.promise = Promise.resolve().then(async () => {
       await old?.worker.close();
@@ -321,19 +329,23 @@ export class HerdrWorkers implements WorkerFactory {
       await entry.promise.catch(() => {});
       if (this.entries.get(userId) === entry) this.entries.delete(userId);
     }
-    const sessionFile = new PaneWorker({ ...this.options, model: this.models.get(userId) ?? this.options.model }, userId).sessionFile;
-    await rm(sessionFile, { force: true });
-    this.models.delete(userId);
+    await rm(sessionPath(this.options, userId), { force: true });
   }
+  async getModel(userId: string): Promise<ModelSpec | undefined> { return savedModel(sessionPath(this.options, userId)); }
   async setModel(userId: string, model: ModelSpec): Promise<void> {
     if (this.closed) throw new Error("HerdrWorkers is closed");
-    this.models.set(userId, model);
     const entry = this.entries.get(userId);
     if (entry) {
       await entry.worker.close();
       await entry.promise.catch(() => {});
       if (this.entries.get(userId) === entry) this.entries.delete(userId);
     }
+    const path = sessionPath(this.options, userId);
+    await privateDir(dirname(path));
+    // Pi defers new files until a conversation starts; a model choice must survive even before the first prompt.
+    if (!existsSync(path)) await writeFile(path,
+      `${JSON.stringify(SessionManager.inMemory(this.options.cwd).getHeader())}\n`, { flag: "wx", mode: 0o600 });
+    SessionManager.open(path).appendModelChange(model.provider, model.id);
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;

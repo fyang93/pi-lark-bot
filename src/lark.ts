@@ -40,11 +40,6 @@ function debugLog(event: string, value: unknown): void {
   catch { /* the workspace may not have a writable state directory */ }
 }
 
-function withDetail(prefix: string, error: unknown): string {
-  const detail = error instanceof Error ? error.message.replace(/[\r\n]+/g, " ").slice(0, 240) : "";
-  return detail ? `${prefix}: ${detail}` : prefix;
-}
-
 type PendingStart = { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 
 /** Tenant-bot Lark/Feishu transport using the SDK's persistent WebSocket. */
@@ -66,7 +61,7 @@ export class LarkTransport implements BotTransport {
     attachmentCacheDir?: string,
     private readonly projectDir = process.cwd(),
   ) {
-    if (!config.appId || !config.appSecret) throw new Error("Lark app credentials are required");
+    if (!config.appId || !config.appSecret) throw new Error("请先配置 Lark 应用凭据。");
     // Product brand and the app's long-connection region can differ.
     const domain = (config.domain ?? config.brand) === "lark" ? "https://open.larksuite.com" : "https://open.feishu.cn";
     // Generated endpoint methods' second parameter is IRequestOptions, not an
@@ -90,7 +85,7 @@ export class LarkTransport implements BotTransport {
         if (this._state === "starting") this.ready();
         else if (this._state !== "stopped") this._state = "connected";
       },
-      onError: (error: Error) => this.connectionFailed(error),
+      onError: () => this.connectionFailed(),
     });
   }
 
@@ -99,11 +94,11 @@ export class LarkTransport implements BotTransport {
   setCardActionHandler(handler: (messageId: string, chatId: string, operatorId: string | undefined, value: unknown) => Promise<void>): void { this.onCardAction = handler; }
 
   start(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void> {
-    if (this._state !== "stopped") return Promise.reject(new Error("Lark transport is already started"));
+    if (this._state !== "stopped") return Promise.reject(new Error("Lark 连接已启动，请勿重复启动。"));
     this.onMessage = onMessage;
     this._state = "starting";
     const ready = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => this.failStart("Lark connection timed out"), START_TIMEOUT_MS);
+      const timer = setTimeout(() => this.failStart("Lark 连接超时，请检查网络后重试。"), START_TIMEOUT_MS);
       this.pendingStart = { resolve, reject, timer };
     });
     try {
@@ -114,16 +109,16 @@ export class LarkTransport implements BotTransport {
         if (typeof info?.bot?.open_id !== "string" || !info.bot.open_id) throw new Error("Missing bot identity");
         this.botOpenId = info.bot.open_id;
         if (this._state === "starting") await this.ws.start({ eventDispatcher: this.dispatcher });
-      })().catch((error) => this.failStart(withDetail("Lark connection could not be started", error)));
-    } catch (error) {
-      this.failStart(withDetail("Lark connection could not be started", error));
+      })().catch(() => this.failStart("无法启动 Lark 连接，请检查网络及应用凭据。"));
+    } catch {
+      this.failStart("无法启动 Lark 连接，请检查网络及应用凭据。");
     }
     return ready;
   }
 
   async stop(): Promise<void> {
     if (this._state === "starting") {
-      this.failStart("Lark connection was stopped"); // also force-closes exactly once
+      this.failStart("Lark 连接已停止。"); // also force-closes exactly once
       return;
     }
     this._state = "stopped"; // ignores late SDK callbacks and prevents reconnect resurrection
@@ -178,28 +173,27 @@ export class LarkTransport implements BotTransport {
   /** Resolve directly quoted resources after authorization; one failed resource never drops the text request. */
   async prepareMessage(message: IncomingMessage): Promise<IncomingMessage> {
     if (!message.parentMessageId && !message.resourceReferences?.length) return message;
-    let candidates: ReferencedResource[] = message.resourceReferences?.map((resource) => ({ ...resource })) ?? [];
-    let sourceMessageId = message.id;
+    const candidates: Array<ReferencedResource & { sourceMessageId: string }> =
+      message.resourceReferences?.map((resource) => ({ ...resource, sourceMessageId: message.id })) ?? [];
     let base = message;
     if (message.parentMessageId) {
-      let item: any;
       try {
         const response = await this.request(() => this.client.im.v1.message.get({
           path: { message_id: message.parentMessageId }, params: { card_msg_content_type: "user_card_content" },
         }));
-        item = response?.data?.items?.find((candidate: any) => candidate?.message_id === message.parentMessageId);
-      } catch { return { ...message, preparationWarning: "referenced_message_unavailable" }; }
-      if (!item || item.chat_id !== message.chatId || typeof item.body?.content !== "string") return message;
-      let content: any;
-      try { content = JSON.parse(item.body.content); } catch { return message; }
-      const quotedText = quotedMessageText(content);
-      base = quotedText ? { ...message, quotedText } : message;
-      candidates = referencedResources(item.msg_type, content);
-      sourceMessageId = message.parentMessageId;
+        const item = response?.data?.items?.find((candidate: any) => candidate?.message_id === message.parentMessageId);
+        if (!item || item.chat_id !== message.chatId || typeof item.body?.content !== "string") throw new Error("Invalid quoted message");
+        const content = JSON.parse(item.body.content);
+        const quoted = item.msg_type === "post" ? parsePost(content)
+          : { text: quotedMessageText(content), resources: referencedResources(item.msg_type, content) };
+        if (quoted.text) base = { ...message, quotedText: quoted.text };
+        candidates.push(...quoted.resources.map((resource) => ({ ...resource, sourceMessageId: message.parentMessageId! })));
+      } catch { base = { ...message, preparationWarning: "referenced_message_unavailable" }; }
     }
     if (!this.attachmentCache || !candidates.length) return base;
     const attachments: NonNullable<IncomingMessage["attachments"]> = [];
     for (const candidate of candidates) {
+      const { sourceMessageId } = candidate;
       try {
         const cached = await this.attachmentCache.get(`${this.config.appId}\0${sourceMessageId}\0${candidate.key}`, candidate.name, async () => {
           const resource = await this.downloadResource(sourceMessageId, candidate.key, candidate.apiType);
@@ -238,9 +232,9 @@ export class LarkTransport implements BotTransport {
     this.settleStart();
   }
 
-  private connectionFailed(error?: Error): void {
+  private connectionFailed(): void {
     if (this._state === "stopped") return;
-    const message = withDetail("Lark connection failed", error);
+    const message = "Lark 连接失败，请检查网络与应用配置。";
     if (this._state === "starting") this.failStart(message);
     else {
       this._state = "stopped";
@@ -274,7 +268,7 @@ export class LarkTransport implements BotTransport {
 
   private close(): void {
     try { this.ws.close({ force: true }); }
-    catch (_error) { this.report("Lark connection could not be stopped"); }
+    catch (_error) { this.report("无法关闭 Lark 连接，请检查监听会话。"); }
   }
 
   private async cardAction(value: unknown): Promise<void> {
@@ -413,8 +407,9 @@ export class LarkTransport implements BotTransport {
   }
 
   private failure(): Error {
-    this.report("Lark API request failed");
-    return new Error("Lark API request failed");
+    const message = "Lark 接口请求失败，请检查网络与应用权限。";
+    this.report(message);
+    return new Error(message);
   }
 
   private report(message: string): void {

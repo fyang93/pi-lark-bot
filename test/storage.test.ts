@@ -28,7 +28,7 @@ test("refuses symlinked auth files and config directories", async () => {
   const root = await mkdtemp(join(tmpdir(), "lark-storage-"));
   try {
     await mkdir(join(root, "actual")); await symlink(join(root, "actual"), join(root, ".pi"));
-    await assert.rejects(prepareState(root, ".pi"), /symlink/);
+    await assert.rejects(prepareState(root, ".pi"), /符号链接/);
     const path = join(root, "actual", "config.json");
     await writeFile(path, JSON.stringify(config));
     await symlink(path, join(root, "linked.json"));
@@ -42,13 +42,13 @@ test("exclusive lock prevents duplicate project listeners and releases idempoten
     assert.deepEqual(await inspectLock(root), { state: "none" });
     const unlock = await acquireLock(root);
     assert.deepEqual(await inspectLock(root), { state: "running", pid: process.pid });
-    await assert.rejects(acquireLock(root), /running or unverified/);
+    await assert.rejects(acquireLock(root), /正在运行或身份未确认/);
     await unlock(); await unlock();
     assert.deepEqual(await inspectLock(root), { state: "none" });
     const unlock2 = await acquireLock(root); await unlock2();
     const lockPath = join(root, "controller.lock");
     await writePrivateJson(lockPath, { pid: 0 });
-    await assert.rejects(acquireLock(root), /unverified/);
+    await assert.rejects(acquireLock(root), /身份未确认/);
     assert.deepEqual(await readPrivateJson(lockPath), { pid: 0 });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -76,7 +76,7 @@ test("dead owner is recovered once; unresponsive socket is never reclaimed", asy
     await writePrivateJson(join(root, "push-endpoint.json"),
       { cwd: root, appId: "cli_test", token: "secret", ownerToken: "old", socket: socketPath });
     assert.equal((await inspectLock(root)).state, "invalid", "unresponsive socket must fail closed");
-    await assert.rejects(acquireLock(root), /unverified/);
+    await assert.rejects(acquireLock(root), /身份未确认/);
     assert.deepEqual(await readPrivateJson(lockPath), { pid: 2147483647, token: "old" });
   } finally {
     for (const peer of peers) peer.destroy();
@@ -92,13 +92,13 @@ test("config rejects malformed secrets and unsupported brands", () => {
 });
 
 test("push target and allowlist files reject malformed content", () => {
-  assert.throws(() => validatePushTarget({ version: 1, appId: "cli_test", chatId: "oc_team" }), /Invalid push-target/);
-  assert.throws(() => validatePushTarget({ version: 1, appId: "cli_test", chatId: "../escape", chatType: "group" }), /Invalid push-target/);
-  assert.throws(() => validatePushTarget({ version: 2, appId: "cli_test", chatId: "oc_team", chatType: "group" }), /Invalid push-target/);
+  assert.throws(() => validatePushTarget({ version: 1, appId: "cli_test", chatId: "oc_team" }), /push-target.json 格式无效/);
+  assert.throws(() => validatePushTarget({ version: 1, appId: "cli_test", chatId: "../escape", chatType: "group" }), /push-target.json 格式无效/);
+  assert.throws(() => validatePushTarget({ version: 2, appId: "cli_test", chatId: "oc_team", chatType: "group" }), /push-target.json 格式无效/);
   assert.deepEqual(
     validatePushTarget({ version: 1, appId: "cli_test", chatId: "oc_team", chatType: "group", extra: "dropped" }),
     { version: 1, appId: "cli_test", chatId: "oc_team", chatType: "group", setBy: "", setAt: "" });
-  assert.throws(() => validateAllowlist({ appId: "cli_test", users: ["ou_a", 7] }), /Invalid allowlist/);
-  assert.throws(() => validateAllowlist({ appId: "cli_test" }), /Invalid allowlist/);
+  assert.throws(() => validateAllowlist({ appId: "cli_test", users: ["ou_a", 7] }), /allowlist.json 格式无效/);
+  assert.throws(() => validateAllowlist({ appId: "cli_test" }), /allowlist.json 格式无效/);
   assert.deepEqual(validateAllowlist({ appId: "cli_test", users: ["ou_a"] }), { appId: "cli_test", users: ["ou_a"] });
 });

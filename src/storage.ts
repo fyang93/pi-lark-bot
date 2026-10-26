@@ -13,7 +13,7 @@ export function isMissing(error: unknown): boolean {
 export async function privateDir(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
   const stat = await lstat(path);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Refusing unsafe directory: ${path}`);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`目录不安全，已拒绝访问：${path}`);
   await chmod(path, 0o700);
 }
 
@@ -21,10 +21,10 @@ export async function readPrivateJson(path: string, repairPermissions = true): P
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) throw new Error(`Invalid private file: ${path}`);
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) throw new Error(`私有文件无效或过大：${path}`);
     if (repairPermissions) await handle.chmod(0o600);
     try { return JSON.parse(await handle.readFile("utf8")); }
-    catch { throw new Error(`Invalid JSON in private file: ${path}`); }
+    catch { throw new Error(`私有文件的 JSON 格式无效：${path}`); }
   } finally { await handle.close(); }
 }
 
@@ -45,7 +45,7 @@ export function validateConfig(value: unknown): BotConfig {
   if (!c || c.version !== 1 || !["feishu", "lark"].includes(c.brand ?? "") ||
     typeof c.appId !== "string" || !/^cli_[a-zA-Z0-9_-]+$/.test(c.appId) ||
     typeof c.appSecret !== "string" || !c.appSecret.trim() || c.appSecret.length > 4096) {
-    throw new Error("Invalid bot config: expected brand, cli_ appId and appSecret.");
+    throw new Error("机器人配置无效：请检查品牌、以 cli_ 开头的 App ID 和 App Secret。");
   }
   return { version: 1, brand: c.brand!, ...(c.domain === "feishu" || c.domain === "lark" ? { domain: c.domain } : {}), appId: c.appId, appSecret: c.appSecret };
 }
@@ -54,7 +54,7 @@ export async function loadConfig(stateDir: string): Promise<BotConfig | undefine
   try {
     for (const dir of [dirname(stateDir), stateDir]) {
       const stat = await lstat(dir);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Refusing unsafe config directory: ${dir}`);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`配置目录不安全，已拒绝访问：${dir}`);
     }
     return validateConfig(await readPrivateJson(join(stateDir, "config.json")));
   } catch (error) { if (isMissing(error)) return undefined; throw error; }
@@ -64,7 +64,7 @@ export async function loadConfig(stateDir: string): Promise<BotConfig | undefine
 export function validateAllowlist(value: unknown): { appId: string; users: string[] } {
   const stored = value as { appId?: unknown; users?: unknown } | null;
   if (!stored || typeof stored.appId !== "string" || !Array.isArray(stored.users) ||
-    stored.users.some((user) => typeof user !== "string" || !user)) throw new Error("Invalid allowlist.json");
+    stored.users.some((user) => typeof user !== "string" || !user)) throw new Error("allowlist.json 格式无效，请检查白名单文件。");
   return { appId: stored.appId, users: stored.users as string[] };
 }
 
@@ -85,7 +85,7 @@ export function validatePushTarget(value: unknown): PushTarget {
   if (!target || target.version !== 1 || typeof target.appId !== "string" || !target.appId ||
     typeof target.chatId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(target.chatId) ||
     (target.chatType !== "p2p" && target.chatType !== "group")) {
-    throw new Error("Invalid push-target.json: expected appId, chatId and chatType.");
+    throw new Error("push-target.json 格式无效：请检查 appId、chatId 和 chatType。");
   }
   return { version: 1, appId: target.appId, chatId: target.chatId, chatType: target.chatType,
     setBy: typeof target.setBy === "string" ? target.setBy : "",
@@ -110,11 +110,11 @@ export async function savePushTarget(stateDir: string, target: PushTarget | unde
 export async function prepareState(cwd: string, configDirName: string): Promise<string> {
   const parent = join(cwd, configDirName);
   await mkdir(parent, { recursive: true });
-  if ((await lstat(parent)).isSymbolicLink()) throw new Error("Project config directory must not be a symlink.");
+  if ((await lstat(parent)).isSymbolicLink()) throw new Error("项目配置目录不能是符号链接。");
   const ignore = join(parent, ".gitignore");
   let content = "";
   try {
-    if ((await lstat(ignore)).isSymbolicLink()) throw new Error("Project .gitignore must not be a symlink.");
+    if ((await lstat(ignore)).isSymbolicLink()) throw new Error("项目配置目录中的 .gitignore 不能是符号链接。");
     content = await readFile(ignore, "utf8");
   } catch (error) { if (!isMissing(error)) throw error; }
   if (!content.split(/\r?\n/).includes("/lark-bot/")) {
@@ -189,26 +189,26 @@ export async function acquireLock(stateDir: string): Promise<(() => Promise<void
   try { await claim(); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    if ((await inspectLock(stateDir)).state !== "stale") throw new Error("This project already has a running or unverified lark-bot controller.");
+    if ((await inspectLock(stateDir)).state !== "stale") throw new Error("此项目已有正在运行或身份未确认的 Lark 控制端，请检查 owner 会话。");
     const mutex = join(stateDir, "controller.recovery");
     try { await mkdir(mutex, { mode: 0o700 }); }
-    catch { throw new Error("Controller recovery is in progress or unverified; retry or inspect manually."); }
+    catch { throw new Error("正在恢复控制端，或恢复状态无法确认；请稍后重试或手动检查。"); }
     try {
       const before = await lstat(path);
       if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid?.() ||
-        (before.mode & 0o777) !== 0o600) throw new Error("Unsafe controller lock; inspect manually.");
+        (before.mode & 0o777) !== 0o600) throw new Error("控制端锁文件不安全，请手动检查。");
       const record = await readPrivateJson(path, false) as Lock;
-      if ((await inspectLock(stateDir)).state !== "stale") throw new Error("Controller owner changed during recovery.");
+      if ((await inspectLock(stateDir)).state !== "stale") throw new Error("恢复期间控制端 owner 已变化，请重新检查。");
       const after = await lstat(path);
-      if (before.ino !== after.ino || before.dev !== after.dev) throw new Error("Controller lock changed during recovery.");
+      if (before.ino !== after.ino || before.dev !== after.dev) throw new Error("恢复期间控制端锁文件已变化，请重新检查。");
       // Only a dead process with a missing/refused endpoint may be reclaimed.
       const endpointPath = join(stateDir, "push-endpoint.json");
       try {
         const entry = await lstat(endpointPath);
         if (!entry.isFile() || entry.isSymbolicLink() || entry.uid !== process.getuid?.() ||
-          (entry.mode & 0o777) !== 0o600) throw new Error("Unsafe controller endpoint.");
+          (entry.mode & 0o777) !== 0o600) throw new Error("控制端端点文件不安全，请手动检查。");
         const endpoint = await readPrivateJson(endpointPath, false) as Endpoint;
-        if (endpoint.ownerToken !== record.token) throw new Error("Unverified controller endpoint.");
+        if (endpoint.ownerToken !== record.token) throw new Error("无法确认控制端端点的身份，请手动检查。");
         await unlink(endpointPath);
       } catch (e) { if (!isMissing(e)) throw e; }
       await unlink(path);

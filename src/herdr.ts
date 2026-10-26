@@ -7,14 +7,14 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const options = { encoding: "utf8" as const, timeout: 10_000 };
 const bin = () => process.env.HERDR_BIN_PATH || "herdr";
-const MIN_COLUMNS = 50, MIN_ROWS = 15;
+const MIN_COLUMNS = 80, MIN_ROWS = 24;
 
 export function requireHerdr(): void {
   if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) {
-    throw new Error("Start pi inside herdr before running /lark-bot on.");
+    throw new Error("请先在 herdr 分屏中启动 Pi，再执行 /lark-bot on。");
   }
   try { execFileSync(bin(), ["--version"], { ...options, timeout: 5000 }); }
-  catch { throw new Error("herdr must be installed and available on PATH."); }
+  catch { throw new Error("请安装 herdr，并确认可从 PATH 执行。"); }
 }
 
 /** herdr prints `{result}` or `{error: {code, message}}` (exit 1); raise its message, never output bodies. */
@@ -24,7 +24,7 @@ async function herdr(args: string[]): Promise<any> {
   catch (error: any) {
     let code = "failed";
     try { code = JSON.parse(error.stdout || error.stderr).error.code; } catch {}
-    throw new Error(`herdr ${args.slice(0, 2).join(" ")} failed (${code})`);
+    throw new Error(`herdr ${args.slice(0, 2).join(" ")} 执行失败（${code}）。`);
   }
   return stdout.trim() ? JSON.parse(stdout).result : undefined;
 }
@@ -43,7 +43,7 @@ export async function createSurface(name: string, command: string[]): Promise<st
   requireHerdr();
   let layout: any;
   try { ({ layout } = await herdr(["pane", "layout", "--pane", process.env.HERDR_PANE_ID!])); }
-  catch { throw new Error("Cannot inspect herdr layout; worker creation was not attempted."); }
+  catch { throw new Error("无法读取 herdr 布局，未创建 Pi 会话分屏。"); }
   // Split only the controller's own pane, never another pane the user may be working in;
   // a background tab when it is too small or zoomed. Never unzoom or rearrange the layout.
   const parent = process.env.HERDR_PANE_ID!;
