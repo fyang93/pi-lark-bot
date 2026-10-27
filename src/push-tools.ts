@@ -25,15 +25,10 @@ export function registerPushTools(pi: ExtensionAPI, handlers: PushToolHandlers):
   pi.registerTool({
     name: "lark_push",
     label: "Lark Push",
-    description: [
-      "Send a message to this project's globally configured Feishu/Lark push target chat.",
-      "The push target is a single project-wide chat. It is often NOT the chat you are currently talking to,",
-      "and its readers may not see this conversation, so make the text self-contained.",
-      "Fails when no push target is configured.",
-    ].join(" "),
+    description: "Push to the project-wide Lark target (may differ from this chat). Each message supports at most 4 Markdown tables.",
     promptSnippet: "Post a message to the configured Lark push target chat",
     promptGuidelines: [
-      "Use lark_push only when the user or a skill explicitly asks for something to be pushed, posted or reported to the Lark push target. Never use lark_push to answer the current conversation: an ordinary reply already reaches it.",
+      "Use only for an explicit push request; split content exceeding 4 Markdown tables into multiple self-contained messages.",
     ],
     parameters: Type.Object({
       text: Type.String({ description: "Plain text to post. Write it so it makes sense to readers who cannot see this conversation." }),
@@ -44,9 +39,9 @@ export function registerPushTools(pi: ExtensionAPI, handlers: PushToolHandlers):
   if (handlers.sendFile) pi.registerTool({
     name: "lark_send_file",
     label: "Send File to This Chat",
-    description: "Upload a local file and send it as an attachment to this Feishu/Lark conversation. Use only when the user asks to receive a file. The user decides which file to share. Feishu/Lark upload limit is 30 MB per file. Do not use for the global push target.",
+    description: "Send a user-selected file to this chat (max 30 MB). Use only on request; never for the global push target.",
     promptSnippet: "Send a user-selected local file to the current Feishu/Lark conversation",
-    promptGuidelines: ["When asked to deliver a generated file, call lark_send_file with its local project path. Do not claim delivery unless this tool succeeds."],
+    promptGuidelines: ["Send only the file the user selected; claim delivery only after success."],
     parameters: Type.Object({
       path: Type.String({ description: "Absolute path or workspace-relative path to the file the user selected." }),
       name: Type.Optional(Type.String({ description: "Optional filename shown to the recipient." })),
