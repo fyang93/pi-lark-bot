@@ -537,5 +537,20 @@ function quotedMessageText(value: unknown): string | undefined {
 }
 
 function card(text: string): object {
-  return { schema: "2.0", config: { width_mode: "fill" }, body: { elements: [{ tag: "markdown", content: text }] } };
+  return { schema: "2.0", config: { width_mode: "fill" }, body: { elements: [{ tag: "markdown", content: cardMarkdown(text) }] } };
+}
+
+/**
+ * Card markdown reads ![alt](target) as an uploaded image key; any other target
+ * (a local path or URL) rejects the whole card with 200570. Degrade those to text
+ * or a link, leaving fenced code untouched.
+ */
+export function cardMarkdown(text: string): string {
+  return text.split(/(```[\s\S]*?(?:```|$))/).map((part, index) => index % 2 ? part : part.replace(
+    /!\[([^\]\n]*)\]\(([^)\n]*)\)/g, (match, alt: string, inner: string) => {
+      const target = inner.trim().replace(/\s+"[^"]*"$/, "");
+      if (/^img_[\w-]+$/.test(target)) return match;
+      const label = alt.trim() || "图片";
+      return /^https?:\/\//i.test(target) ? `[${label}](${target})` : `🖼️ ${label}（${target}）`;
+    })).join("");
 }

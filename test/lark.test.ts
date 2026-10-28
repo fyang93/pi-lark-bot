@@ -330,6 +330,19 @@ test("Markdown tables use JSON 2.0 cards for sends, replies and updates, and rem
     params: { card_msg_content_type: "user_card_content" } });
 });
 
+test("Markdown images without an image key degrade to text so the card is not rejected", async () => {
+  const fake = fakeSdk();
+  const transport = new LarkTransport(config, undefined, fake.sdk);
+  await transport.update("out-1", [
+    "![二维码](/home/u/auth.png)", "![](https://example.com/a.png \"t\")", "![ok](img_v3_02ad_abc-1)",
+    "```md\n![raw](/keep.png)\n```",
+  ].join("\n"));
+  assert.equal(JSON.parse(fake.calls.patch[0].data.content).body.elements[0].content, [
+    "🖼️ 二维码（/home/u/auth.png）", "[图片](https://example.com/a.png)", "![ok](img_v3_02ad_abc-1)",
+    "```md\n![raw](/keep.png)\n```",
+  ].join("\n"));
+});
+
 test("uses idempotent create/reply/patch cards and bounded HTTP/retries", async () => {
   const fake = fakeSdk();
   const transport = new LarkTransport(config, undefined, fake.sdk);
