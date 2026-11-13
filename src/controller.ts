@@ -3,14 +3,29 @@ import { isMissing, loadAllowlist, loadPushTarget, readPrivateJson, saveAllowlis
 import { MAX_PROMPT_BYTES, conversationKey, type BotConfig, type BotTransport, type IncomingMessage, type ModelSpec, type PushTarget, type ConversationWorker, type WorkerFactory, type WorkerEvent, type WorkerRequest, type WorkerResponse } from "./types.ts";
 import { modelPickerCard, modelSelectedCard, parseModelCardAction } from "./model-card.ts";
 
-/** Conservative UTF-8 payload bound, including room for card JSON overhead. */
+/** Where a full part may end: after a blank line, else a line break, else a sentence end, if that is in its second half. */
+function breakPoint(part: string): number {
+  for (const pattern of [/\n\s*\n/g, /\n/g, /[。！？；.!?;]\s*/g]) {
+    let end = -1;
+    for (const match of part.matchAll(pattern)) end = match.index! + match[0].length;
+    if (end >= part.length / 2) return end;
+  }
+  return part.length;
+}
+
+/** Conservative UTF-8 payload bound, including room for card JSON overhead. Parts end at paragraph, line or sentence breaks when possible. */
 export function splitText(text: string, maxBytes = 12_000): string[] {
   if (maxBytes < 4) throw new Error("maxBytes must be at least 4");
   const parts: string[] = [];
   let part = "", bytes = 0;
   for (const char of text) {
     const size = Buffer.byteLength(char);
-    if (bytes + size > maxBytes) { parts.push(part); part = ""; bytes = 0; }
+    if (bytes + size > maxBytes) {
+      const end = breakPoint(part);
+      parts.push(part.slice(0, end));
+      part = part.slice(end); bytes = Buffer.byteLength(part);
+      if (bytes + size > maxBytes) { parts.push(part); part = ""; bytes = 0; }
+    }
     part += char; bytes += size;
   }
   if (part) parts.push(part);

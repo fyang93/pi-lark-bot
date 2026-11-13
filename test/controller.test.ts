@@ -465,6 +465,24 @@ test("UTF8 chunking is lossless, including supplementary Unicode", () => {
   assert(chunks.every((x) => Buffer.byteLength(x) <= 12_000));
 });
 
+test("chunks end at paragraph breaks, not inside a word", () => {
+  const paragraph = "隔夜仓位的风险需要单独说明。".repeat(40);
+  const text = Array.from({ length: 12 }, () => paragraph).join("\n\n");
+  const chunks = splitText(text);
+  assert.equal(chunks.join(""), text);
+  assert(chunks.length > 1);
+  assert(chunks.every((x) => Buffer.byteLength(x) <= 12_000));
+  assert(chunks.slice(0, -1).every((x) => x.endsWith("\n\n")));
+  assert(chunks.slice(1).every((x) => x.startsWith("隔夜")));
+});
+
+test("chunks fall back to a hard cut when no break exists", () => {
+  const text = "字".repeat(9_000);
+  const chunks = splitText(text);
+  assert.equal(chunks.join(""), text);
+  assert(chunks.every((x) => Buffer.byteLength(x) <= 12_000));
+});
+
 test("rejected senders get a code the operator can allowlist, and the picker list stays bounded", async () => {
   const dir = await mkdtemp(join(tmpdir(), "lark-denied-"));
   try {
