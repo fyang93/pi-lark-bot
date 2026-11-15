@@ -176,7 +176,7 @@ class PaneWorker implements ConversationWorker {
     // Pass the actual parent environment privately, preserving the new pane's
     // own herdr identity in the launcher. Remote messages only use IPC.
     const launcher = fileURLToPath(new URL("./launch-worker.cjs", import.meta.url));
-    this.paneId = await createSurface(this.name, [process.execPath, launcher, launchFile]);
+    this.paneId = await createSurface(this.name, [process.execPath, launcher, launchFile], this.abort.signal);
     this.checkOpen();
   }
 

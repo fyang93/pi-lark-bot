@@ -61,16 +61,24 @@ if (process.argv[2] === "--child") {
     return `w1:p${n}`;
   };
   const file = (pane) => path.join(root, `pane-${pane.replace("w1:p", "")}.json`);
+  fs.appendFileSync(path.join(root, "calls.jsonl"), JSON.stringify(process.argv.slice(2)) + "\n");
+  const geometryFile = path.join(root, "geometry.json");
+  const geometry = fs.existsSync(geometryFile) ? JSON.parse(fs.readFileSync(geometryFile, "utf8")) : {};
+  const current = geometry.current || { pane_id: "w1:p0", workspace_id: "w1", tab_id: "w1:t0" };
   if (group === "--version") console.log("herdr 0.9.1");
+  else if (group === "pane" && action === "current") ok({ pane: current });
+  else if (group === "pane" && action === "list") ok({ panes: geometry.panes || [current] });
   else if (group === "pane" && action === "layout") {
     if (process.env.TEST_LAYOUT_FAIL === "1") fail("pane_not_found");
     const panes = JSON.parse(process.env.TEST_LAYOUT || '[["w1:p0",160,50]]');
-    ok({ layout: { zoomed: process.env.TEST_ZOOMED === "1", panes: panes.map(([pane_id, width, height]) => ({ pane_id, rect: { width, height } })) } });
+    ok({ layout: geometry.layouts?.[args[1]] || { zoomed: process.env.TEST_ZOOMED === "1", panes: panes.map(([pane_id, width, height]) => ({ pane_id, rect: { width, height } })) } });
   } else if (group === "pane" && action === "split") {
     record({ action: "split", target: args[0], direction: args[2], focus: args[3], cwd: args[5] });
+    if (process.env.TEST_SPLIT_DELAY) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.TEST_SPLIT_DELAY));
+    if (geometry.afterCreate) fs.writeFileSync(geometryFile, JSON.stringify(geometry.afterCreate));
     ok({ pane: { pane_id: newPane() } });
   } else if (group === "tab" && action === "create") {
-    record({ action: "tab", focus: args[0], label: args[2], cwd: args[4] });
+    record({ action: "tab", workspace: args[1], focus: args[2], label: args[4], cwd: args[6] });
     ok({ root_pane: { pane_id: newPane() }, tab: {} });
   } else if ((group === "pane" || group === "agent") && action === "rename") {
     if (!fs.existsSync(file(args[0]))) fail("pane_not_found");
@@ -80,6 +88,7 @@ if (process.argv[2] === "--child") {
     ok({});
   } else if (group === "pane" && action === "run") {
     if (process.env.TEST_RUN_FAIL === "1") fail("pane_not_found");
+    if (process.env.TEST_RUN_NOOP === "1") { record({ action: "run", pane: args[0] }); ok({}); return; }
     // The shell would run `'node' 'launcher' 'launch.json'`; check it is quoted literal argv.
     const command = [...args[1].matchAll(/'((?:[^']|'\\'')*)'/g)].map(m => m[1].replace(/'\\''/g, "'"));
     const assert = require("node:assert/strict");

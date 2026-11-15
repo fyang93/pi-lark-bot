@@ -1,6 +1,6 @@
 // herdr panes for worker sessions. Pane ids look like `w1:p2`.
-// Workers open as unfocused splits of the controller's own pane, or in a
-// background tab when splitting it would leave either half too small.
+// Reuse owned worker panes without disturbing the user's focused pane; fall
+// back to background tabs in the controller's workspace when no split fits.
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -18,9 +18,9 @@ export function requireHerdr(): void {
 }
 
 /** herdr prints `{result}` or `{error: {code, message}}` (exit 1); raise its message, never output bodies. */
-async function herdr(args: string[]): Promise<any> {
+async function herdr(args: string[], overrides: { timeout?: number; signal?: AbortSignal } = {}): Promise<any> {
   let stdout: string;
-  try { ({ stdout } = await execFileAsync(bin(), args, options)); }
+  try { ({ stdout } = await execFileAsync(bin(), args, { ...options, ...overrides })); }
   catch (error: any) {
     let code = "failed";
     try { code = JSON.parse(error.stdout || error.stderr).error.code; } catch {}
@@ -29,33 +29,72 @@ async function herdr(args: string[]): Promise<any> {
   return stdout.trim() ? JSON.parse(stdout).result : undefined;
 }
 
-/** Split direction that leaves both halves usable; a cell is about twice as tall as wide. */
+/** Split direction that leaves both halves usable, side by side first. */
 export function splitDirection(width: number, height: number): "right" | "down" | null {
-  const fits = { right: Math.floor(width / 2) >= MIN_COLUMNS && height >= MIN_ROWS, down: width >= MIN_COLUMNS && Math.floor(height / 2) >= MIN_ROWS };
-  const order: ("right" | "down")[] = height * 2 > width ? ["down", "right"] : ["right", "down"];
-  return order.find(direction => fits[direction]) ?? null;
+  if (Math.floor(width / 2) >= MIN_COLUMNS && height >= MIN_ROWS) return "right";
+  if (width >= MIN_COLUMNS && Math.floor(height / 2) >= MIN_ROWS) return "down";
+  return null;
 }
 
 const quote = (part: string) => `'${part.replace(/'/g, `'\\''`)}'`;
 
-/** Open a pane named `name` and run `command` (literal argv, shell-quoted) in its shell; returns the pane id. */
-export async function createSurface(name: string, command: string[]): Promise<string> {
-  requireHerdr();
-  let layout: any;
-  try { ({ layout } = await herdr(["pane", "layout", "--pane", process.env.HERDR_PANE_ID!])); }
-  catch { throw new Error("无法读取 herdr 布局，未创建 Pi 会话分屏。"); }
-  // Split only the controller's own pane, never another pane the user may be working in;
-  // a background tab when it is too small or zoomed. Never unzoom or rearrange the layout.
-  const parent = process.env.HERDR_PANE_ID!;
-  const own = layout.zoomed ? undefined : layout.panes.find((pane: any) => pane.pane_id === parent);
-  const direction = own && splitDirection(own.rect.width, own.rect.height);
+// Queue only layout inspection + creation, not worker startup. Parallel messages
+// must see the geometry resulting from the preceding split.
+let creationQueue: Promise<unknown> = Promise.resolve();
+const opened = new Set<string>();
+
+async function openPane(name: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  let current: any, target: string, direction: "right" | "down" | null = null;
+  try {
+    // HERDR_PANE_ID can be a stale launch-time alias after the controller moves.
+    ({ pane: current } = await herdr(["pane", "current", "--current"], { signal }));
+    const parent = current.pane_id;
+    target = parent;
+    const { panes } = await herdr(["pane", "list", "--workspace", current.workspace_id], { signal });
+    // Only pane list reports workspace-wide focus; layout focus is per tab.
+    const focused = panes.find((pane: any) => pane.focused)?.pane_id;
+    const tabs = new Map<string, string[]>();
+    for (const pane of panes) tabs.set(pane.tab_id, [...tabs.get(pane.tab_id) ?? [], pane.pane_id]);
+    const layouts = [parent, ...[...tabs]
+      .filter(([tab, ids]) => tab !== current.tab_id && ids.every(id => opened.has(id)))
+      .map(([, ids]) => ids[0])];
+    const area = (pane: any) => pane.rect.width * pane.rect.height;
+    for (const id of layouts) {
+      const { layout } = await herdr(["pane", "layout", "--pane", id], { signal });
+      if (layout.zoomed) continue;
+      const agents = layout.panes.filter((pane: any) => opened.has(pane.pane_id) && pane.pane_id !== focused);
+      const own = layout.panes.filter((pane: any) => pane.pane_id === parent);
+      for (const pane of [...agents.sort((a: any, b: any) => area(b) - area(a)), ...own]) {
+        direction = splitDirection(pane.rect.width, pane.rect.height);
+        if (direction) { target = pane.pane_id; break; }
+      }
+      if (direction) break;
+    }
+  } catch { throw new Error("无法读取 herdr 布局，未创建 Pi 会话分屏。"); }
+  signal?.throwIfAborted();
+  // Do not time out or abort creation: herdr may already have created the pane,
+  // and its reply is the only way to learn the id needed for cleanup.
   const pane: string = direction
-    ? (await herdr(["pane", "split", parent, "--direction", direction, "--no-focus", "--cwd", "/"])).pane.pane_id
-    : (await herdr(["tab", "create", "--no-focus", "--label", name, "--cwd", "/"])).root_pane.pane_id;
-  await herdr(["pane", "rename", pane, name]).catch(() => {});
-  try { await herdr(["pane", "run", pane, command.map(quote).join(" ")]); }
-  catch (error) { closeSurface(pane); throw error; }
+    ? (await herdr(["pane", "split", target!, "--direction", direction, "--no-focus", "--cwd", "/"], { timeout: 0 })).pane.pane_id
+    : (await herdr(["tab", "create", "--workspace", current.workspace_id, "--no-focus", "--label", name, "--cwd", "/"], { timeout: 0 })).root_pane.pane_id;
+  opened.add(pane);
   return pane;
+}
+
+/** Open a pane named `name` and run `command` (literal argv, shell-quoted) in its shell; returns the pane id. */
+export async function createSurface(name: string, command: string[], signal?: AbortSignal): Promise<string> {
+  requireHerdr();
+  const opening = creationQueue.then(() => openPane(name, signal));
+  creationQueue = opening.catch(() => {});
+  const pane = await opening;
+  try {
+    signal?.throwIfAborted();
+    await herdr(["pane", "rename", pane, name]).catch(() => {});
+    signal?.throwIfAborted();
+    await herdr(["pane", "run", pane, command.map(quote).join(" ")]);
+    return pane;
+  } catch (error) { closeSurface(pane); throw error; }
 }
 
 /**
@@ -80,10 +119,12 @@ export async function nameAgent(pane: string, name: string, attempts = 10): Prom
  * name only once this pane's agent holds it, or another agent's pane could be closed.
  */
 export function closeSurface(pane: string, agent?: string): void {
+  opened.delete(pane);
   if (agent) {
     try { pane = JSON.parse(execFileSync(bin(), ["agent", "get", agent], { ...options, timeout: 5000 })).result.agent.pane_id ?? pane; }
     catch { /* not (or no longer) a named agent: use the pane it was opened in */ }
   }
+  opened.delete(pane);
   try { execFileSync(bin(), ["pane", "close", pane], { ...options, stdio: "ignore", timeout: 5000 }); }
   catch { /* an already-closed pane needs no cleanup */ }
 }
