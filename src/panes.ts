@@ -130,6 +130,8 @@ class PaneWorker implements ConversationWorker {
     this.resources = this.prepareAndLaunch(runId, token, resolveReady);
     this.startTask = Promise.all([this.resources, ready]).then(() => {
       if (this.closed) throw new Error("Pi worker closed during startup");
+      // The worker can report ready before herdr acknowledges the launch.
+      if (this.paneId) void nameAgent(this.paneId, this.name).then((held) => { this.named = held; });
     }).catch(async (error) => { await this.close(); throw error; }).finally(() => {
       clearTimeout(timer); this.rejectReady = undefined;
     });
@@ -210,7 +212,6 @@ class PaneWorker implements ConversationWorker {
         }
         if (message.type === "ready") {
           this.ready = true; resolveReady();
-          if (this.paneId) void nameAgent(this.paneId, this.name).then((held) => { this.named = held; });
         }
         else this.handle(message);
       }

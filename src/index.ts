@@ -338,7 +338,7 @@ export default function larkBot(pi: ExtensionAPI): void {
             // Only our sanitized transport and herdr errors may reach the UI.
             const detail = error instanceof Error && /^(Lark (接口|连接)|herdr |无法读取 herdr)/.test(error.message)
               ? `（${error.message.slice(0, 240)}）` : "";
-            ctx.ui.notify(`Lark 机器人操作失败${detail}，请检查网络、应用权限和对应分屏。历史已保存在本机。`, "error");
+            ctx.ui.notify(`Lark 机器人操作失败${detail}，请检查网络、应用权限和对应的 herdr 标签页。历史已保存在本机。`, "error");
           };
           const brand = config.brand === "lark" ? "Lark" : "Feishu";
           const transport = new LarkTransport(config, onError, undefined, join(stateDir, "attachments"), cwd);

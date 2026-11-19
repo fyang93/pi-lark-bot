@@ -85,10 +85,15 @@ test("real socket/subprocess bridge reuses users, preserves Unicode, filters wro
   const factory = new HerdrWorkers({ ...f.options, env: { TEST_READY_DELAY: "50" } });
   let resumed: HerdrWorkers | undefined;
   try {
-    const [a, a2, b] = await Promise.all([factory.open("ou_a"), factory.open("ou_a"), factory.open("ou_b")]);
+    const [a, a2, b] = await Promise.all([factory.open("ou_a"), factory.open("ou_a"), factory.open("group:oc_a")]);
     assert.equal(a, a2); assert.notEqual(a, b);
     assert.equal(factory.list().length, 2);
     assert.notEqual(factory.list()[0]!.paneId, factory.list()[1]!.paneId);
+    const tabs = (await readFile(join(f.root, "creates.jsonl"), "utf8")).trim().split("\n")
+      .map(line => JSON.parse(line)).filter(entry => entry.action === "tab");
+    assert.equal(tabs.length, 2, "one private tab and one group tab, no duplicate for the same chat");
+    assert(tabs.every(tab => tab.workspace === "w1" && tab.focus === "--no-focus"));
+    assert.notEqual(tabs[0].label, tabs[1].label);
     const events: WorkerEvent[] = [];
     const prompt = "你好🙂\n!this-is-not-shell\n'\"\\";
     let done!: () => void;
@@ -122,49 +127,40 @@ test("handoff does not wait for output; the next message and interrupt reach the
   } finally { await factory.close(); await f.cleanup(); }
 });
 
-test("workers split the controller's own pane unfocused, else open a background tab", { timeout: 10000 }, async () => {
-  for (const [layout, zoomed, expected] of [
-    [[["w1:p0", 160, 48]], false, { action: "split", target: "w1:p0", direction: "right" }],
-    [[["w1:p0", 80, 48], ["w1:p7", 200, 60]], false, { action: "split", target: "w1:p0", direction: "down" }],  // never another pane
-    [[["w1:p0", 120, 40]], false, { action: "tab" }],
-    [[["w1:p0", 90, 18]], false, { action: "tab" }],
-    [[["w1:p0", 90, 18], ["w1:p7", 200, 50]], false, { action: "tab" }],  // too small: a tab, not the bigger neighbour
-    [[["w1:p0", 160, 50]], true, { action: "tab" }],
-  ] as const) {
-    const f = await fixture({ TEST_LAYOUT: JSON.stringify(layout), TEST_ZOOMED: zoomed ? "1" : "0" });
-    const workers = new HerdrWorkers(f.options);
-    try {
-      const worker = await workers.open("ou_a");
-      const [create] = (await readFile(join(f.root, "creates.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
-      assert.equal(create.action, expected.action);
-      assert.equal(create.focus, "--no-focus");
-      assert.equal(create.cwd, "/");
-      if ("target" in expected) { assert.equal(create.target, expected.target); assert.equal(create.direction, expected.direction); }
-      const paneId = workers.list()[0]!.paneId!;
-      assert.match(paneId, /^w1:p\d+$/);
-      const read = async () => {
-        try { return JSON.parse(await readFile(join(f.root, `pane-${paneId.replace("w1:p", "")}.json`), "utf8")); }
-        catch { return {}; } // The fixture rewrites this file non-atomically while naming the pane.
-      };
-      let pane: any = {};
-      for (let i = 0; i < 250 && !pane.agent; i++) {
-        pane = await read();
-        if (!pane.agent) await new Promise((done) => setTimeout(done, 20));
-      }
-      assert.match(pane.label, /^lark-[a-f0-9]{10}$/);
-      assert.equal(pane.agent, pane.label, "the ready worker is named in herdr's agents sidebar");
-      await worker.run("worker", () => {});
-      await workers.close();
-      assert.deepEqual((await readdir(f.root)).filter(file => /^pane-\d+\.json$/.test(file)), [], "close the owned pane");
-    } finally { await workers.close(); await f.cleanup(); }
-  }
+test("the background tab's worker is named even when ready arrives before launch acknowledgement", { timeout: 10000 }, async () => {
+  const f = await fixture({ TEST_RUN_GATE: "1" });
+  const workers = new HerdrWorkers(f.options);
+  const opening = workers.open("ou_a");
+  const release = () => writeFile(join(f.root, "release-run"), "");
+  try {
+    const readyDeadline = Date.now() + 2000;
+    while (!workers.list()[0]?.connected && Date.now() < readyDeadline) await new Promise(done => setTimeout(done, 20));
+    assert.equal(workers.list()[0]?.connected, true);
+    assert.equal(workers.list()[0]?.paneId, undefined, "herdr has not acknowledged the launch");
+    await release();
+    await opening;
+    const paneId = workers.list()[0]!.paneId!;
+    const filename = join(f.root, `pane-${paneId.replace("w1:p", "")}.json`);
+    let pane: { agent?: string; label: string } | undefined;
+    const namingDeadline = Date.now() + 2000;
+    while (!pane?.agent && Date.now() < namingDeadline) {
+      try { pane = JSON.parse(await readFile(filename, "utf8")); }
+      catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+      if (!pane?.agent) await new Promise(done => setTimeout(done, 20));
+    }
+    assert(pane);
+    assert.match(pane.label, /^lark-[a-f0-9]{10}$/);
+    assert.equal(pane.agent, pane.label, "the ready worker is named in herdr's agents sidebar");
+    await workers.close();
+    assert.deepEqual((await readdir(f.root)).filter(file => /^pane-\d+\.json$/.test(file)), []);
+  } finally { await release(); await workers.close(); await f.cleanup(); }
 });
 
-test("an uninspectable layout creates nothing, and a failed launch closes its pane", { timeout: 10000 }, async () => {
-  let f = await fixture({ TEST_LAYOUT_FAIL: "1" });
+test("an unresolved controller workspace creates no tab, and a failed launch closes its root pane", { timeout: 10000 }, async () => {
+  let f = await fixture({ TEST_CURRENT_FAIL: "1" });
   let workers = new HerdrWorkers(f.options);
   try {
-    await assert.rejects(workers.open("ou_a"), /无法读取 herdr 布局/);
+    await assert.rejects(workers.open("ou_a"), /herdr pane current 执行失败（pane_not_found）/);
     assert(!(await readdir(f.root)).includes("creates.jsonl"));
   } finally { await workers.close(); await f.cleanup(); }
   f = await fixture({ TEST_RUN_FAIL: "1" });
@@ -208,10 +204,17 @@ test("closing while startup is pending rejects promptly and cleans resources", {
 
 test("startup deadline cancels the pending handshake and permits a clean retry", { timeout: 10000 }, async () => {
   const f = await fixture();
-  const factory = new HerdrWorkers({ ...f.options, startupTimeoutMs: 250, env: { TEST_READY_DELAY: "2000" } });
+  const env = { TEST_READY_DELAY: "5000" };
+  const factory = new HerdrWorkers({ ...f.options, startupTimeoutMs: 1500, env });
   try {
-    await assert.rejects(factory.open("ou_a"), /Timed out|closed/);
+    await assert.rejects(factory.open("ou_a"), /Timed out waiting for pi worker startup/);
+    const calls = (await readFile(join(f.root, "calls.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    assert(calls.some(call => call[0] === "pane" && call[1] === "run"), "the worker started but did not become ready");
     assert.deepEqual(factory.list(), []);
+    assert.deepEqual((await readdir(f.root)).filter(file => /^pane-\d+\.json$/.test(file)), []);
+    env.TEST_READY_DELAY = "0";
+    await factory.open("ou_a");
+    assert.equal(factory.list()[0]?.connected, true);
   } finally { await factory.close(); await f.cleanup(); }
 });
 

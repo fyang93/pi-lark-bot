@@ -329,7 +329,7 @@ export class BotController {
       try { await worker?.interrupt?.(); }
       catch (error) {
         this.onError(error);
-        await transport.send(message.chatId, "无法确认 Pi 是否已停止，请检查对应分屏。", message.id);
+        await transport.send(message.chatId, "无法确认 Pi 是否已停止，请检查对应的 herdr 标签页。", message.id);
         return;
       }
       await transport.send(message.chatId, current || worker ? "已请求 Pi 中断当前操作；已交给 Pi 的排队消息由 Pi 管理。" : "当前没有会话。", message.id);
@@ -444,7 +444,7 @@ export class BotController {
     await saveAllowlist(this.options.stateDir, this.options.config.appId, this.allowlist);
     this.options.onStatus?.();
     // Existing panes keep running; removal only stops the next message from this sender.
-    return { ok: true, text: `已将 ${userId} 移出白名单。现有分屏继续运行；后续消息需重新授权。` };
+    return { ok: true, text: `已将 ${userId} 移出白名单。已打开的对话标签页继续运行；后续消息需重新授权。` };
   }
 
   /** Worker panes hold no credentials, so every push and target change is resolved here. */

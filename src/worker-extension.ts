@@ -143,7 +143,7 @@ export default function larkWorkerExtension(pi: ExtensionAPI): void {
   });
   pi.on("ui_prompt_start", () => { if (outputOpen) emit({ type: "progress", text: "正在等待本地确认…" }); });
   const blockSwitch = () => {
-    ctx?.ui.notify("此分屏已绑定一个 Lark 聊天。请先停止机器人，再单独管理会话历史。", "warning");
+    ctx?.ui.notify("此标签页已绑定一个 Lark 聊天。请先停止机器人，再单独管理会话历史。", "warning");
     return { cancel: true as const };
   };
   pi.on("session_before_switch", blockSwitch); pi.on("session_before_fork", blockSwitch);

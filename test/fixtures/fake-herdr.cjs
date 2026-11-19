@@ -53,33 +53,47 @@ if (process.argv[2] === "--child") {
   const ok = (result) => console.log(JSON.stringify({ result }));
   const fail = (code) => { console.log(JSON.stringify({ error: { code, message: code } })); process.exit(1); };
   const record = (entry) => fs.appendFileSync(path.join(root, "creates.jsonl"), JSON.stringify(entry) + "\n");
-  const newPane = () => {
+  const newPane = (workspace) => {
     const counter = path.join(root, "pane-counter");
     const n = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0) + 1;
     fs.writeFileSync(counter, String(n));
     fs.writeFileSync(path.join(root, `pane-${n}.json`), "{}");
-    return `w1:p${n}`;
+    return `${workspace}:p${n}`;
   };
-  const file = (pane) => path.join(root, `pane-${pane.replace("w1:p", "")}.json`);
+  const file = (pane) => path.join(root, `pane-${pane.split(":p").at(-1)}.json`);
+  const probe = (kind, pane) => {
+    const counter = `${file(pane)}-${kind}`;
+    const count = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0) + 1;
+    fs.writeFileSync(counter, String(count));
+    return count;
+  };
+  const waitForRelease = (gate) => {
+    const deadline = Date.now() + 5000;
+    const cell = new Int32Array(new SharedArrayBuffer(4));
+    while (!fs.existsSync(path.join(root, gate))) {
+      if (Date.now() >= deadline) fail("test_gate_timeout");
+      Atomics.wait(cell, 0, 0, 10);
+    }
+  };
   fs.appendFileSync(path.join(root, "calls.jsonl"), JSON.stringify(process.argv.slice(2)) + "\n");
-  const geometryFile = path.join(root, "geometry.json");
-  const geometry = fs.existsSync(geometryFile) ? JSON.parse(fs.readFileSync(geometryFile, "utf8")) : {};
-  const current = geometry.current || { pane_id: "w1:p0", workspace_id: "w1", tab_id: "w1:t0" };
   if (group === "--version") console.log("herdr 0.9.1");
-  else if (group === "pane" && action === "current") ok({ pane: current });
-  else if (group === "pane" && action === "list") ok({ panes: geometry.panes || [current] });
-  else if (group === "pane" && action === "layout") {
-    if (process.env.TEST_LAYOUT_FAIL === "1") fail("pane_not_found");
-    const panes = JSON.parse(process.env.TEST_LAYOUT || '[["w1:p0",160,50]]');
-    ok({ layout: geometry.layouts?.[args[1]] || { zoomed: process.env.TEST_ZOOMED === "1", panes: panes.map(([pane_id, width, height]) => ({ pane_id, rect: { width, height } })) } });
-  } else if (group === "pane" && action === "split") {
-    record({ action: "split", target: args[0], direction: args[2], focus: args[3], cwd: args[5] });
-    if (process.env.TEST_SPLIT_DELAY) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.TEST_SPLIT_DELAY));
-    if (geometry.afterCreate) fs.writeFileSync(geometryFile, JSON.stringify(geometry.afterCreate));
-    ok({ pane: { pane_id: newPane() } });
+  else if (group === "pane" && action === "current") {
+    if (process.env.TEST_CURRENT_FAIL === "1") fail("pane_not_found");
+    const currentFile = path.join(root, "current.json");
+    const current = fs.existsSync(currentFile) ? JSON.parse(fs.readFileSync(currentFile, "utf8")) : { pane_id: "w1:p0", workspace_id: "w1" };
+    ok({ pane: current });
   } else if (group === "tab" && action === "create") {
+    const pane_id = newPane(args[1]);
     record({ action: "tab", workspace: args[1], focus: args[2], label: args[4], cwd: args[6] });
-    ok({ root_pane: { pane_id: newPane() }, tab: {} });
+    if (process.env.TEST_TAB_GATE === args[4]) waitForRelease("release-tab");
+    ok({ root_pane: { pane_id }, tab: {} });
+  } else if (group === "pane" && action === "process-info") {
+    if (process.env.TEST_PROBE_FAIL === "1") fail("unknown_command");
+    const foreground_processes = [{ pid: 7 }];
+    if (probe("process-info", args[1]) <= Number(process.env.TEST_SHELL_BUSY_CHECKS || 0)) foreground_processes.push({ pid: 8 });
+    ok({ process_info: { shell_pid: 7, foreground_processes } });
+  } else if (group === "pane" && action === "read") {
+    if (probe("screen", args[0]) > Number(process.env.TEST_EMPTY_SCREEN_CHECKS || 0)) console.log("$ ");
   } else if ((group === "pane" || group === "agent") && action === "rename") {
     if (!fs.existsSync(file(args[0]))) fail("pane_not_found");
     if (group === "agent" && process.env.TEST_NAME_TAKEN === "1") fail("agent_name_taken");
@@ -88,18 +102,22 @@ if (process.argv[2] === "--child") {
     ok({});
   } else if (group === "pane" && action === "run") {
     if (process.env.TEST_RUN_FAIL === "1") fail("pane_not_found");
-    if (process.env.TEST_RUN_NOOP === "1") { record({ action: "run", pane: args[0] }); ok({}); return; }
-    // The shell would run `'node' 'launcher' 'launch.json'`; check it is quoted literal argv.
-    const command = [...args[1].matchAll(/'((?:[^']|'\\'')*)'/g)].map(m => m[1].replace(/'\\''/g, "'"));
-    const assert = require("node:assert/strict");
-    assert.equal(command.length, 3);
-    assert.equal(command[0], process.execPath);
-    assert.equal(path.basename(command[1]), "launch-worker.cjs");
-    record({ action: "run", args: JSON.parse(fs.readFileSync(command[2], "utf8")).args });
-    const child = spawn(process.execPath, [__filename, "--child", command[2]], { detached: true, stdio: "ignore" });
-    child.unref();
     const saved = JSON.parse(fs.readFileSync(file(args[0]), "utf8"));
-    fs.writeFileSync(file(args[0]), JSON.stringify({ ...saved, pid: child.pid }));
+    if (process.env.TEST_RUN_NOOP === "1") record({ action: "run", pane: args[0] });
+    else {
+      // The shell would run `'node' 'launcher' 'launch.json'`; check it is quoted literal argv.
+      const command = [...args[1].matchAll(/'((?:[^']|'\\'')*)'/g)].map(m => m[1].replace(/'\\''/g, "'"));
+      const assert = require("node:assert/strict");
+      assert.equal(command.length, 3);
+      assert.equal(command[0], process.execPath);
+      assert.equal(path.basename(command[1]), "launch-worker.cjs");
+      record({ action: "run", pane: args[0], args: JSON.parse(fs.readFileSync(command[2], "utf8")).args });
+      const child = spawn(process.execPath, [__filename, "--child", command[2]], { detached: true, stdio: "ignore" });
+      child.unref();
+      fs.writeFileSync(file(args[0]), JSON.stringify({ ...saved, pid: child.pid }));
+    }
+    if (process.env.TEST_RUN_GATE && ["1", saved.label].includes(process.env.TEST_RUN_GATE)) waitForRelease("release-run");
+    ok({});
   } else if (group === "agent" && action === "get") {
     // A pane moved to another workspace: the agent keeps its name, the pane gets a new id.
     const moved = path.join(root, "moved.json");
